@@ -93,6 +93,13 @@ rejected with a descriptive error.
 depends_on:
   - "20260319_create_normalize_name"
 preconditions:
+  - function_exists:
+      name: "normalize_name"
+      signature: "input text -> text"
+      body_hash: "sha256:a1b2c3..."
+  - type_exists:
+      name: "lien_party_entity_types"
+      values_hash: "sha256:d4e5f6..."
   - table_exists: "lien_parties"
   - column_exists:
       table: "lien_parties"
@@ -107,6 +114,8 @@ operations:
 
 ### Available assertions
 
+#### Schema-level (validated against in-memory schema)
+
 | Assertion | Fields | Checks |
 |-----------|--------|--------|
 | `table_exists` | table name (string) | Table is present in schema |
@@ -116,12 +125,31 @@ operations:
 | `index_exists` | `table`, `index` | Named index exists on table |
 | `constraint_exists` | `table`, `constraint` | Named constraint exists (any type: check, unique, FK, exclude) |
 
+#### Database-level (validated by querying the database)
+
+| Assertion | Fields | Checks |
+|-----------|--------|--------|
+| `function_exists` | `name`, optional `schema`, `signature`, `body_hash` | Function exists, optionally with specific signature and/or body hash |
+| `type_exists` | `name`, optional `schema`, `values_hash` | Type exists, optionally with specific enum values hash |
+
+The `body_hash` field uses SHA-256 of the function body as stored in
+`pg_proc.prosrc`. This catches behavioral changes -- if someone
+optimizes `normalize_name()` and the output changes for certain
+inputs, the hash will differ even though the function still exists
+with the same signature.
+
+The `values_hash` field uses SHA-256 of the sorted, comma-joined
+enum labels. This catches enum value additions or removals that
+could affect column type assumptions or data migrations.
+
+Both hash fields use the format `sha256:<hex-digest>`.
+
 ### How it works
 
-Preconditions are validated in `Migration.Validate()`, which runs
-before any DDL operations. The check uses pgroll's in-memory schema
-representation (the same one used for operation validation), so it
-reflects the actual database state at the time of migration.
+Schema-level preconditions are validated against pgroll's in-memory
+schema representation (the same one used for operation validation).
+Database-level preconditions query `pg_proc` and `pg_type` directly.
+Both are checked before any DDL operations run.
 
 Preconditions are checked before operation validation, so a failed
 precondition produces a clear, specific error rather than a
@@ -129,7 +157,7 @@ potentially confusing operation validation failure.
 
 ### Error examples
 
-```
+```text
 precondition failed: table "users" does not exist
 
 precondition failed: column "email" on table "users" has type "text"
@@ -137,6 +165,12 @@ but expected "varchar(255)"
 
 precondition failed: index "users_email_idx" does not exist on
 table "users"
+
+precondition failed: function "public"."normalize_name" body hash
+mismatch: expected "sha256:a1b2...", got "sha256:c3d4..."
+
+precondition failed: enum "public"."status" values hash mismatch:
+expected "sha256:...", got "sha256:..." (values: [active,inactive])
 ```
 
 ## Using both together
@@ -160,6 +194,13 @@ both provides defense in depth:
 depends_on:
   - "20260319_create_normalize_name"
 preconditions:
+  - function_exists:
+      name: "normalize_name"
+      signature: "input text -> text"
+      body_hash: "sha256:a1b2c3..."
+  - type_exists:
+      name: "lien_party_entity_types"
+      values_hash: "sha256:d4e5f6..."
   - column_exists:
       table: "lien_parties"
       column: "entity_type"
@@ -167,8 +208,9 @@ preconditions:
 operations:
   - sql:
       up: |
-        -- This migration assumes normalize_name() exists and
-        -- entity_type is an enum, not a varchar
+        -- This migration assumes normalize_name() exists with a
+        -- specific implementation, entity_type is the expected enum,
+        -- and the column type matches
         ...
 ```
 

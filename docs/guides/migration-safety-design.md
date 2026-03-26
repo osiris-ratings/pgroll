@@ -90,11 +90,17 @@ when migrations are applied individually (outside `pgroll migrate`).
 
 ### Precondition validation (`pkg/migrations/preconditions.go`)
 
-Validates schema STATE before a migration runs. Checked in
-`Migration.Validate()` before operation-level validation.
+Validates schema STATE before a migration runs. Two levels:
+
+**Schema-level** (in `Migration.Validate()`): table, column, index,
+and constraint assertions checked against in-memory `*schema.Schema`.
+
+**Database-level** (in `Roll.Validate()`): function and type
+assertions that query `pg_proc`/`pg_type` directly.
 
 ```
-Precondition: column_exists(users, email, type=text)
+Schema-level:
+  column_exists(users, email, type=text)
                     |
                     v
          schema.GetTable("users")
@@ -104,11 +110,22 @@ Precondition: column_exists(users, email, type=text)
                     |
                     v
          column.Type == "text"  →  pass or fail
+
+Database-level:
+  function_exists(normalize_name, body_hash=sha256:...)
+                    |
+                    v
+         SELECT prosrc FROM pg_proc
+         WHERE proname = 'normalize_name'
+                    |
+                    v
+         sha256(prosrc) == expected  →  pass or fail
 ```
 
-Each assertion maps to a lookup on pgroll's in-memory
-`*schema.Schema`, which is read from the database at validation
-time via `state.ReadSchema()`.
+Schema-level assertions map to lookups on pgroll's in-memory
+`*schema.Schema`. Database-level assertions query `pg_proc` and
+`pg_type` directly via the database connection available in
+`Roll.Validate()`.
 
 ## Data flow
 
@@ -144,8 +161,9 @@ record actual application order.
 |---------|----------|-------------|--------------|
 | Name-set matching | What to apply | `UnappliedMigrations()` | Missing local file error |
 | `depends_on` | Application order | Sort time + `Start()` | Cycle/unknown/unsatisfied dep error |
-| `preconditions` | Schema state contract | `Validate()` | Precondition failed error |
-| Op validation | Operation feasibility | `Validate()` | Table/column does not exist error |
+| Schema preconditions | Schema state contract | `Migration.Validate()` | Table/column/index/constraint error |
+| DB preconditions | Function/type contract | `Roll.Validate()` | Function/type hash mismatch error |
+| Op validation | Operation feasibility | `Migration.Validate()` | Table/column does not exist error |
 
 The layers are complementary:
 - `depends_on` prevents a migration from running before its

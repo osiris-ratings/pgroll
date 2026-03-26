@@ -1187,6 +1187,14 @@
         "constraint_exists": {
           "description": "Assert that a constraint exists on a table",
           "$ref": "#/$defs/PreconditionConstraintRef"
+        },
+        "function_exists": {
+          "description": "Assert that a function exists with a specific signature and optionally a specific body hash",
+          "$ref": "#/$defs/PreconditionFunctionRef"
+        },
+        "type_exists": {
+          "description": "Assert that a type (e.g. ENUM) exists, optionally with specific values or a values hash",
+          "$ref": "#/$defs/PreconditionTypeRef"
         }
       },
       "oneOf": [
@@ -1195,7 +1203,9 @@
         { "required": ["column_exists"] },
         { "required": ["column_not_exists"] },
         { "required": ["index_exists"] },
-        { "required": ["constraint_exists"] }
+        { "required": ["constraint_exists"] },
+        { "required": ["function_exists"] },
+        { "required": ["type_exists"] }
       ]
     },
     "PreconditionColumnExists": {
@@ -1265,6 +1275,52 @@
         }
       },
       "required": ["table", "constraint"]
+    },
+    "PreconditionFunctionRef": {
+      "description": "Function existence assertion with optional signature and body hash",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "description": "Schema containing the function (defaults to public)",
+          "type": "string",
+          "default": "public"
+        },
+        "name": {
+          "description": "Name of the function",
+          "type": "string"
+        },
+        "signature": {
+          "description": "Expected function signature, e.g. '(text) -> text'. Validated only if provided.",
+          "type": "string"
+        },
+        "body_hash": {
+          "description": "Expected SHA-256 hash of the function body prefixed with 'sha256:', e.g. 'sha256:a1b2c3...'. Validated only if provided.",
+          "type": "string"
+        }
+      },
+      "required": ["name"]
+    },
+    "PreconditionTypeRef": {
+      "description": "Type existence assertion with optional values hash for ENUMs",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "description": "Schema containing the type (defaults to public)",
+          "type": "string",
+          "default": "public"
+        },
+        "name": {
+          "description": "Name of the type",
+          "type": "string"
+        },
+        "values_hash": {
+          "description": "Expected SHA-256 hash of the sorted enum values prefixed with 'sha256:', e.g. 'sha256:a1b2c3...'. Validated only if provided.",
+          "type": "string"
+        }
+      },
+      "required": ["name"]
     },
     "PgRollMigration": {
       "additionalProperties": false,
