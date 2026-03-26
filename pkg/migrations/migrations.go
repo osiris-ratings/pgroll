@@ -69,14 +69,18 @@ type RequiresSchemaRefreshOperation interface {
 type (
 	Operations []Operation
 	Migration  struct {
-		Name          string     `json:"-"`
-		VersionSchema string     `json:"version_schema,omitempty"`
-		Operations    Operations `json:"operations"`
+		Name          string         `json:"-"`
+		VersionSchema string         `json:"version_schema,omitempty"`
+		Operations    Operations     `json:"operations"`
+		DependsOn     []string       `json:"depends_on,omitempty"`
+		Preconditions []Precondition `json:"preconditions,omitempty"`
 	}
 	RawMigration struct {
 		Name          string          `json:"-"`
 		VersionSchema string          `json:"version_schema,omitempty"`
 		Operations    json.RawMessage `json:"operations"`
+		DependsOn     []string        `json:"depends_on,omitempty"`
+		Preconditions []Precondition  `json:"preconditions,omitempty"`
 	}
 
 	StartResult struct {
@@ -97,6 +101,10 @@ func (m *Migration) VersionSchemaName() string {
 // Validate will check that the migration can be applied to the given schema
 // returns a descriptive error if the migration is invalid
 func (m *Migration) Validate(ctx context.Context, s *schema.Schema) error {
+	if err := ValidatePreconditions(m.Preconditions, s); err != nil {
+		return err
+	}
+
 	for _, op := range m.Operations {
 		if isolatedOp, ok := op.(IsolatedOperation); ok {
 			if isolatedOp.IsIsolated() && len(m.Operations) > 1 {

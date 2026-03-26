@@ -212,6 +212,10 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return err
 	}
 
+	if err := m.validateDependencies(ctx, migration); err != nil {
+		return err
+	}
+
 	job, err := m.startDDLOperations(ctx, migration, &o)
 	if err != nil {
 		return err
