@@ -3,12 +3,9 @@ on:
   pull_request:
   push:
     branches:
-      - main
-    tags:
-      - 'v*'
+      - baselayer
 permissions:
-  contents: write
-  packages: write
+  contents: read
 jobs:
   cross-build:
     name: cross-platform build
@@ -246,75 +243,3 @@ jobs:
         PGPASSWORD: postgres
         PGROLL_SCHEMA: ${{ matrix.testSchema }}
 
-  release:
-    runs-on: ubuntu-24.04
-    container:
-      image: goreleaser/goreleaser-cross:v1.24
-    needs: [test, lint, examples, license-check, format, code-generation, dead-code-check, check-ledger, cross-build]
-    if: startsWith(github.ref, 'refs/tags/')
-    env:
-      DOCKER_CLI_EXPERIMENTAL: "enabled"
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-
-    # Mark the checkout as 'safe' despite being owned by `root`
-    - run: git config --global --add safe.directory $GITHUB_WORKSPACE 
-
-    - run: git fetch --force --tags
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.repository_owner }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version-file: 'go.mod'
-
-    - name: Run GoReleaser
-      uses: goreleaser/goreleaser-action@v6
-      with:
-        distribution: goreleaser
-        version: 'v2.5.1'
-        args: release --clean
-      env:
-        # We use two GitHub tokens here:
-        # * The actions-bound `GITHUB_TOKEN` with permissions to write packages.
-        # * The org level `GIT_TOKEN` to be able to publish the brew tap file.
-        # See: https://goreleaser.com/errors/resource-not-accessible-by-integration/
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        TAP_GITHUB_TOKEN: ${{ secrets.GIT_TOKEN }}
-        GITHUB_USERNAME: ${{ github.repository_owner }}
-        DOCKER_USERNAME: ghcr.io/${{ github.repository_owner }}
-
-    - name: Set up PostgreSQL client
-      run: |
-        apt-get update
-        apt-get install -y postgresql-client
-
-    - name: Update doc versions on pgroll.com
-      run: |
-        # Insert new doc version
-        psql "$DATABASE_URL" -c "INSERT INTO doc_versions (version, owner, repository, ref, config_path, examples_path) \
-          VALUES ( \
-          '${{ github.ref_name }}', \
-          'xataio', \
-          'pgroll', \
-          '${{ github.ref_name }}', \
-          'docs/config.json', \
-          'examples/')"
-
-        # Update 'latest' row to point to the new tag
-        psql "$DATABASE_URL" -c "UPDATE doc_versions SET ref='${{ github.ref_name }}' WHERE version='latest'"
-
-        echo "Database updated successfully with version ${{ github.ref_name }}"
-      env:
-        DATABASE_URL: ${{ secrets.PGROLL_COM_DATABASE_URL }}

@@ -1,0 +1,119 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the pgroll binary
+    cmds:
+      - go build -o ./bin/pgroll .
+
+  test:
+    desc: Run tests with coverage
+    cmds:
+      - go test -cover ./...
+
+  lint:
+    desc: Run linter
+    cmds:
+      - golangci-lint run --config=.golangci.yml
+
+  release:
+    desc: Create a new Baselayer release
+    summary: |
+      Auto-detects the upstream pgroll version (latest vX.Y.Z tag reachable
+      from HEAD) and the next baselayer pre-release number, producing a tag
+      like v0.16.1-baselayer.3.
+
+      Validates the working tree is clean, updates CHANGELOG.md to stamp
+      the [Unreleased] section, commits, tags, and prints push instructions.
+
+      Usage:
+        task release
+    silent: true
+    preconditions:
+      - sh: '[ -z "$(git status --porcelain)" ]'
+        msg: "Working tree is not clean. Commit or stash changes first."
+      - sh: grep -q '## \[Unreleased\]' CHANGELOG.md
+        msg: "CHANGELOG.md has no [Unreleased] section"
+    cmds:
+      - |
+        set -euo pipefail
+
+        # Find the latest upstream tag (vX.Y.Z without pre-release suffix) reachable from HEAD
+        UPSTREAM=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged HEAD --sort=-v:refname \
+          | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+        if [ -z "$UPSTREAM" ]; then
+          echo "Error: no upstream vX.Y.Z tag found reachable from HEAD"
+          exit 1
+        fi
+
+        # Find the next baselayer pre-release number
+        LAST=$(git tag --list "${UPSTREAM}-baselayer.*" --sort=-v:refname | head -1)
+        if [ -z "$LAST" ]; then
+          NEXT=1
+        else
+          PREV_NUM=${LAST##*baselayer.}
+          NEXT=$((PREV_NUM + 1))
+        fi
+
+        VERSION="${UPSTREAM#v}-baselayer.${NEXT}"
+        TAG="v${VERSION}"
+
+        echo "Upstream base: ${UPSTREAM}"
+        echo "Release tag:   ${TAG}"
+        echo ""
+
+        # Confirm
+        printf "Proceed? [y/N] "
+        read -r CONFIRM
+        if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+          echo "Aborted."
+          exit 1
+        fi
+
+        DATE=$(date +%Y-%m-%d)
+
+        # Stamp CHANGELOG
+        python3 -c "
+        f=open('CHANGELOG.md'); c=f.read(); f.close()
+        c=c.replace('## [Unreleased]','## [Unreleased]\n\n## [${VERSION}] - ${DATE}',1)
+        f=open('CHANGELOG.md','w'); f.write(c); f.close()
+        "
+
+        # Commit and tag
+        git add CHANGELOG.md
+        git commit -m "Release ${TAG}"
+        git tag -a "${TAG}" -m "Release ${TAG} (based on ${UPSTREAM})"
+
+        echo ""
+        echo "Release ${TAG} tagged locally."
+        echo "Push to trigger the release workflow:"
+        echo ""
+        echo "  git push baselayer baselayer --tags"
+
+  release:dry-run:
+    desc: Test the release build locally (no publish)
+    summary: |
+      Validates the goreleaser config and builds the native binary.
+      Full cross-platform builds require the goreleaser-cross Docker
+      image (used in CI).
+    silent: true
+    cmds:
+      - |
+        if ! command -v goreleaser >/dev/null 2>&1; then
+          echo "goreleaser not found. Install: brew install goreleaser"
+          exit 1
+        fi
+        echo "Validating goreleaser config..."
+        goreleaser check
+        echo ""
+        echo "Building native binary..."
+        go build -o ./bin/pgroll -ldflags "-s -w" .
+        echo "Native build successful: ./bin/pgroll"
+        ./bin/pgroll --version
+
+  test:homebrew:
+    desc: Test installation of the Homebrew package
+    cmds:
+      - brew tap | grep -q pgroll && brew untap osiris-ratings/pgroll || true
+      - brew tap osiris-ratings/pgroll git@github.com:osiris-ratings/pgroll.git
+      - HOMEBREW_GITHUB_API_TOKEN=$(gh auth token) brew install osiris-ratings/pgroll/pgroll

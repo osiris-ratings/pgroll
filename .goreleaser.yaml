@@ -7,30 +7,21 @@ before:
     - go mod tidy
 
 builds:
-  - id: build_cgo
+  - id: pgroll
     binary: pgroll
     flags:
       - -tags=netgo,osusergo
     ldflags:
-      - -X github.com/xataio/pgroll/cmd.Version={{ .Version }}
+      - -s -w -X github.com/xataio/pgroll/cmd.Version={{ .Version }}
     env:
       - CGO_ENABLED=1
     goos:
-      - linux
-      - windows
       - darwin
+      - linux
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
     overrides:
-      - goos: windows
-        goarch: amd64
-        env:
-          - CC=x86_64-w64-mingw32-gcc
-          - CGO_LDFLAGS=-lssp -static
       - goos: linux
         goarch: amd64
         env:
@@ -50,25 +41,30 @@ builds:
         env:
           - CC=oa64-clang
 
-release:
-  draft: true
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
 
 brews:
-  - name: pgroll
-    homepage: "https://www.xata.io"
+  - repository:
+      owner: osiris-ratings
+      name: pgroll
+    directory: Formula
+    homepage: "https://github.com/osiris-ratings/pgroll"
     description: "Postgres zero-downtime migrations made easy"
     license: "Apache-2.0"
-    repository:
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-      owner: "{{ .Env.GITHUB_USERNAME }}"
-      name: homebrew-pgroll
+    custom_require: custom_download_strategy
+    download_strategy: GitHubPrivateRepositoryReleaseDownloadStrategy
+    install: |
+      bin.install "pgroll"
+    test: |
+      system "#{bin}/pgroll", "--version"
 
-archives:
-  - format: binary
-    name_template: >-
-      {{ .ProjectName }}.{{ if eq .Os "windows" }}win{{ else if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}.{{ .Arch }}
-    files:
-      - LICENSE*
+checksum:
+  name_template: "checksums.txt"
 
 changelog:
   sort: asc
@@ -76,39 +72,10 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
+      - "^ci:"
+      - "^chore:"
 
-dockers:
-  - image_templates:
-      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Tag }}-amd64"
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-    - --platform=linux/amd64
-    - --label=org.opencontainers.image.title={{ .ProjectName }}
-    - --label=org.opencontainers.image.description={{ .ProjectName }}
-    - --label=org.opencontainers.image.url=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
-    - --label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
-    - --label=org.opencontainers.image.version={{ .Version }}
-    - --label=org.opencontainers.image.created={{ .Date }}
-    - --label=org.opencontainers.image.revision={{ .FullCommit }}
-    - --label=org.opencontainers.image.licenses=AL2.0
-  - image_templates:
-      - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Tag }}-arm64v8"
-    goarch: arm64
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-    - --platform=linux/arm64/v8
-    - --label=org.opencontainers.image.title={{ .ProjectName }}
-    - --label=org.opencontainers.image.description={{ .ProjectName }}
-    - --label=org.opencontainers.image.url=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
-    - --label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_USERNAME }}/{{ .ProjectName }}
-    - --label=org.opencontainers.image.version={{ .Version }}
-    - --label=org.opencontainers.image.created={{ .Date }}
-    - --label=org.opencontainers.image.revision={{ .FullCommit }}
-    - --label=org.opencontainers.image.licenses=AL2.0
-docker_manifests:
-  - name_template: "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Tag }}"
-    image_templates:
-    - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Tag }}-amd64"
-    - "{{ .Env.DOCKER_USERNAME }}/{{ .ProjectName }}:{{ .Tag }}-arm64v8"
+release:
+  github:
+    owner: osiris-ratings
+    name: pgroll
