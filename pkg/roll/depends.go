@@ -46,14 +46,13 @@ func (m *Roll) validateDependencies(ctx context.Context, migration *migrations.M
 	return nil
 }
 
-// topoSortMigrations sorts migrations respecting depends_on constraints,
+// TopoSortMigrations sorts migrations respecting depends_on constraints,
 // using filesystem position as a tiebreaker for migrations with no dependency
 // relationship. Migrations without depends_on preserve their original order.
 //
 // The applied set contains names of migrations already applied to the database;
 // dependencies satisfied by applied migrations are considered met.
-func topoSortMigrations(migs []*migrations.RawMigration, applied map[string]struct{}) ([]*migrations.RawMigration, error) {
-	// Check if any migration has depends_on; if none do, skip sorting entirely
+func TopoSortMigrations(migs []*migrations.RawMigration, applied map[string]struct{}) ([]*migrations.RawMigration, error) {
 	// Check if any migration has depends_on; if none do, skip sorting entirely
 	hasDeps := false
 	for _, m := range migs {

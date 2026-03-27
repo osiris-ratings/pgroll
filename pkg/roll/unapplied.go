@@ -92,5 +92,5 @@ func (m *Roll) UnappliedMigrations(ctx context.Context, dir fs.FS) ([]*migration
 	}
 
 	// Sort respecting depends_on constraints, with filesystem order as tiebreaker
-	return topoSortMigrations(unapplied, applied)
+	return TopoSortMigrations(unapplied, applied)
 }

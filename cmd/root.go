@@ -124,6 +124,7 @@ func Prepare() *cobra.Command {
 	rootCmd.AddCommand(materializeCmd())
 	rootCmd.AddCommand(stampCmd())
 	rootCmd.AddCommand(validateCmd)
+	rootCmd.AddCommand(checkCmd())
 
 	return rootCmd
 }
