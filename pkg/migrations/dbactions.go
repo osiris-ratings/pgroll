@@ -281,9 +281,9 @@ func NewCreateIndexConcurrentlyAction(conn db.DB, table, name, method string, un
 func (a *createIndexConcurrentlyAction) ID() string { return a.id }
 
 func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
-	stmtFmt := "CREATE INDEX CONCURRENTLY %s ON %s"
+	stmtFmt := "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
 	if a.unique {
-		stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s"
+		stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
 	}
 	stmt := fmt.Sprintf(stmtFmt,
 		pq.QuoteIdentifier(a.name),
