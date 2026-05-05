@@ -15,11 +15,8 @@ import (
 // that have not yet been applied to the database. Applying each of the
 // returned migrations in order will bring the database up to date with `dir`.
 //
-// Migrations are matched by name rather than by position, allowing for
-// divergent histories where migrations were applied in a different order
-// than the local filesystem. If a migration exists in the database schema
-// history but has no corresponding local file, an `ErrMismatchedMigration`
-// error is returned.
+// If the local order of migrations does not match the order of migrations in
+// the schema history, an `ErrMismatchedMigration` error is returned.
 func (m *Roll) UnappliedMigrations(ctx context.Context, dir fs.FS) ([]*migrations.RawMigration, error) {
 	history, err := m.State().SchemaHistory(ctx, m.Schema())
 	if err != nil {
@@ -65,30 +62,25 @@ func (m *Roll) UnappliedMigrations(ctx context.Context, dir fs.FS) ([]*migration
 		migsAfterBaseline = append(migsAfterBaseline, migration)
 	}
 
-	// Build a set of applied migration names from the database history
-	applied := make(map[string]struct{}, len(history))
-	for _, h := range history {
-		applied[h.Migration.Name] = struct{}{}
+	// Find the index of the first local migration that has not been applied to
+	// the database and ensure that the order of migrations in the database
+	// matches the order of migrations in the local directory.
+	var appliedCount int
+	for _, m := range migsAfterBaseline {
+		// Stop when we've checked all the migrations in history
+		if appliedCount >= len(history) {
+			break
+		}
+
+		remoteMigration := history[appliedCount].Migration
+		if remoteMigration.Name != m.Name {
+			return nil, fmt.Errorf("%w: remote=%q, local=%q",
+				ErrMismatchedMigration, remoteMigration.Name, m.Name)
+		}
+
+		appliedCount++
 	}
 
-	// Validate: every applied migration must have a corresponding local file
-	localNames := make(map[string]struct{}, len(migsAfterBaseline))
-	for _, m := range migsAfterBaseline {
-		localNames[m.Name] = struct{}{}
-	}
-	for name := range applied {
-		if _, ok := localNames[name]; !ok {
-			return nil, fmt.Errorf("%w: migration %q exists in schema history but not in local migration files",
-				ErrMismatchedMigration, name)
-		}
-	}
-
-	// Return local migrations not yet applied, preserving filesystem order
-	unapplied := make([]*migrations.RawMigration, 0)
-	for _, m := range migsAfterBaseline {
-		if _, ok := applied[m.Name]; !ok {
-			unapplied = append(unapplied, m)
-		}
-	}
-	return unapplied, nil
+	// Return only the migrations that haven't been applied yet
+	return migsAfterBaseline[appliedCount:], nil
 }
