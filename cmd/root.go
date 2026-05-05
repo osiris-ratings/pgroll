@@ -4,6 +4,10 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -21,6 +25,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 	schema := flags.Schema()
 	stateSchema := flags.StateSchema()
 	lockTimeout := flags.LockTimeout()
+	lockRetryTimeout := flags.LockRetryTimeout()
 	role := flags.Role()
 	skipValidation := flags.SkipValidation()
 	verbose := flags.Verbose()
@@ -33,6 +38,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 
 	return roll.New(ctx, pgURL, schema, state,
 		roll.WithLockTimeoutMs(lockTimeout),
+		roll.WithLockRetryTimeout(lockRetryTimeout),
 		roll.WithRole(role),
 		roll.WithSkipValidation(skipValidation),
 		roll.WithLogging(verbose),
@@ -86,6 +92,7 @@ func Prepare() *cobra.Command {
 	rootCmd.PersistentFlags().String("schema", "public", "Postgres schema to use for the migration")
 	rootCmd.PersistentFlags().String("pgroll-schema", "pgroll", "Postgres schema to use for pgroll internal state")
 	rootCmd.PersistentFlags().Int("lock-timeout", 500, "Postgres lock timeout in milliseconds for pgroll DDL operations")
+	rootCmd.PersistentFlags().Duration("lock-retry-timeout", 5*time.Minute, "Total wall-clock budget for retrying lock_timeout errors before giving up (e.g. 5m, 30s); negative disables retries")
 	rootCmd.PersistentFlags().String("role", "", "Optional postgres role to set when executing migrations")
 	rootCmd.PersistentFlags().Bool("use-version-schema", true, "Create version schemas for each migration")
 	rootCmd.PersistentFlags().Bool("verbose", false, "Enable verbose logging")
@@ -94,6 +101,7 @@ func Prepare() *cobra.Command {
 	viper.BindPFlag("SCHEMA", rootCmd.PersistentFlags().Lookup("schema"))
 	viper.BindPFlag("STATE_SCHEMA", rootCmd.PersistentFlags().Lookup("pgroll-schema"))
 	viper.BindPFlag("LOCK_TIMEOUT", rootCmd.PersistentFlags().Lookup("lock-timeout"))
+	viper.BindPFlag("LOCK_RETRY_TIMEOUT", rootCmd.PersistentFlags().Lookup("lock-retry-timeout"))
 	viper.BindPFlag("ROLE", rootCmd.PersistentFlags().Lookup("role"))
 	viper.BindPFlag("USE_VERSION_SCHEMA", rootCmd.PersistentFlags().Lookup("use-version-schema"))
 	viper.BindPFlag("VERBOSE", rootCmd.PersistentFlags().Lookup("verbose"))
@@ -118,7 +126,14 @@ func Prepare() *cobra.Command {
 }
 
 // Execute executes the root command.
+//
+// The root context is cancelled on SIGINT or SIGTERM so in-flight retry loops
+// (see pkg/db.RDB) unwind cleanly and deferred rollback paths run before the
+// process exits. A second signal after stop() is invoked restores default
+// behavior, allowing a hard kill.
 func Execute() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cmd := Prepare()
-	return cmd.Execute()
+	return cmd.ExecuteContext(ctx)
 }

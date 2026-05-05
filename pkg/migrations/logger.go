@@ -2,7 +2,13 @@
 
 package migrations
 
-import "github.com/pterm/pterm"
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/pterm/pterm"
+)
 
 // Logger is responsible for logging all migration steps.
 type Logger interface {
@@ -17,8 +23,15 @@ type Logger interface {
 
 	LogBackfillStart(table string)
 	LogBackfillComplete(table string)
+	LogBackfillProgress(table string, rowsProcessed, total int64, elapsed time.Duration)
 	LogSchemaCreation(migration, schema string)
 	LogSchemaDeletion(migration, schema string)
+
+	LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration)
+	LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)
+	LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)
+
+	LogRollbackOnFailure(reason string)
 
 	Info(msg string, args ...any)
 }
@@ -71,6 +84,52 @@ func (l *migrationLogger) LogBackfillStart(table string) {
 
 func (l *migrationLogger) LogBackfillComplete(table string) {
 	l.logger.Info("backfilling completed", l.logger.Args("table", table))
+}
+
+func (l *migrationLogger) LogBackfillProgress(table string, rowsProcessed, total int64, elapsed time.Duration) {
+	if total > 0 {
+		l.logger.Info("backfill progress", l.logger.Args(
+			"table", table,
+			"rows_processed", rowsProcessed,
+			"total_estimate", total,
+			"percent", fmt.Sprintf("%.1f", 100*float64(rowsProcessed)/float64(total)),
+			"elapsed", elapsed.Round(time.Second).String(),
+		))
+		return
+	}
+	l.logger.Info("backfill progress", l.logger.Args(
+		"table", table,
+		"rows_processed", rowsProcessed,
+		"elapsed", elapsed.Round(time.Second).String(),
+	))
+}
+
+func (l *migrationLogger) LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration) {
+	l.logger.Warn("lock_timeout hit; retrying", l.logger.Args(
+		"query", truncateQuery(query),
+		"attempt", attempt,
+		"sleep", sleep.Round(time.Millisecond).String(),
+		"elapsed", elapsed.Round(time.Millisecond).String(),
+		"retry_budget", budget.String(),
+	))
+}
+
+func (l *migrationLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration) {
+	l.logger.Error("lock_timeout retry budget exhausted; giving up", l.logger.Args(
+		"attempts", attempts,
+		"elapsed", elapsed.Round(time.Millisecond).String(),
+	))
+}
+
+func (l *migrationLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration) {
+	l.logger.Warn("interrupted while waiting on lock; cleaning up", l.logger.Args(
+		"attempts", attempts,
+		"elapsed", elapsed.Round(time.Millisecond).String(),
+	))
+}
+
+func (l *migrationLogger) LogRollbackOnFailure(reason string) {
+	l.logger.Warn("rolling back partial migration after failure", l.logger.Args("reason", reason))
 }
 
 func (l *migrationLogger) LogSchemaCreation(migration, schema string) {
@@ -275,15 +334,33 @@ func getConstraintNames(cons []Constraint) []string {
 	return constraints
 }
 
-func (l *noopLogger) LogMigrationStart(m *Migration)             {}
-func (l *noopLogger) LogMigrationComplete(m *Migration)          {}
-func (l *noopLogger) LogMigrationRollback(m *Migration)          {}
-func (l *noopLogger) LogMigrationRollbackComplete(m *Migration)  {}
-func (l *noopLogger) LogBackfillStart(table string)              {}
-func (l *noopLogger) LogBackfillComplete(table string)           {}
-func (l *noopLogger) LogSchemaCreation(migration, schema string) {}
-func (l *noopLogger) LogSchemaDeletion(migration, schema string) {}
-func (l *noopLogger) LogOperationStart(op Operation)             {}
-func (l *noopLogger) LogOperationComplete(op Operation)          {}
-func (l *noopLogger) LogOperationRollback(op Operation)          {}
-func (l *noopLogger) Info(msg string, args ...any)               {}
+func (l *noopLogger) LogMigrationStart(m *Migration)                                              {}
+func (l *noopLogger) LogMigrationComplete(m *Migration)                                           {}
+func (l *noopLogger) LogMigrationRollback(m *Migration)                                           {}
+func (l *noopLogger) LogMigrationRollbackComplete(m *Migration)                                   {}
+func (l *noopLogger) LogBackfillStart(table string)                                               {}
+func (l *noopLogger) LogBackfillComplete(table string)                                            {}
+func (l *noopLogger) LogBackfillProgress(table string, rowsProcessed, total int64, elapsed time.Duration) {
+}
+func (l *noopLogger) LogSchemaCreation(migration, schema string)                                  {}
+func (l *noopLogger) LogSchemaDeletion(migration, schema string)                                  {}
+func (l *noopLogger) LogOperationStart(op Operation)                                              {}
+func (l *noopLogger) LogOperationComplete(op Operation)                                           {}
+func (l *noopLogger) LogOperationRollback(op Operation)                                           {}
+func (l *noopLogger) LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration) {
+}
+func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)       {}
+func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)  {}
+func (l *noopLogger) LogRollbackOnFailure(reason string)                             {}
+func (l *noopLogger) Info(msg string, args ...any)                                   {}
+
+// truncateQuery returns a single-line, length-bounded form of a SQL query
+// suitable for logging without flooding the terminal.
+func truncateQuery(q string) string {
+	const maxLen = 200
+	q = strings.Join(strings.Fields(q), " ")
+	if len(q) > maxLen {
+		return q[:maxLen] + "..."
+	}
+	return q
+}

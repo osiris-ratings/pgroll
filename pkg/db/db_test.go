@@ -62,6 +62,52 @@ func TestExecContextWhenContextCancelled(t *testing.T) {
 	})
 }
 
+func TestExecContextRetryBudgetExhausted(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithConnectionToContainer(t, func(conn *sql.DB, connStr string) {
+		ctx := context.Background()
+
+		// hold the lock far longer than the retry budget
+		setupTableLock(t, connStr, 5*time.Second)
+
+		// short lock_timeout so each attempt fails quickly
+		ensureLockTimeout(t, conn, 100)
+
+		// retry budget shorter than the lock hold time forces give-up
+		rdb := &db.RDB{DB: conn, LockRetryTimeout: 500 * time.Millisecond}
+
+		start := time.Now()
+		_, err := rdb.ExecContext(ctx, "INSERT INTO test(id) VALUES (1)")
+		elapsed := time.Since(start)
+
+		require.Error(t, err, "expected lock_timeout error after retry budget exhausted")
+		assert.Contains(t, err.Error(), "lock timeout", "expected lock_timeout error, got: %v", err)
+		assert.Less(t, elapsed, 3*time.Second, "should have given up well before lock was released")
+	})
+}
+
+func TestExecContextRetriesDisabled(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithConnectionToContainer(t, func(conn *sql.DB, connStr string) {
+		ctx := context.Background()
+
+		setupTableLock(t, connStr, 5*time.Second)
+		ensureLockTimeout(t, conn, 100)
+
+		// negative budget disables retries entirely
+		rdb := &db.RDB{DB: conn, LockRetryTimeout: -1}
+
+		start := time.Now()
+		_, err := rdb.ExecContext(ctx, "INSERT INTO test(id) VALUES (1)")
+		elapsed := time.Since(start)
+
+		require.Error(t, err)
+		assert.Less(t, elapsed, 1*time.Second, "should have failed on first lock_timeout without sleeping")
+	})
+}
+
 func TestQueryContext(t *testing.T) {
 	t.Parallel()
 
