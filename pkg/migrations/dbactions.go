@@ -281,9 +281,52 @@ func NewCreateIndexConcurrentlyAction(conn db.DB, table, name, method string, un
 func (a *createIndexConcurrentlyAction) ID() string { return a.id }
 
 func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
-	stmtFmt := "CREATE INDEX CONCURRENTLY %s ON %s"
+	quotedIndexName := pq.QuoteIdentifier(a.name)
+
+	for range 5 {
+		createSQL := a.buildCreateIndexSQL()
+		if _, err := a.conn.ExecContext(ctx, createSQL); err != nil {
+			return fmt.Errorf("failed to create index %q: %w", a.name, err)
+		}
+
+		// Wait for concurrent index creation to finish
+		inProgress, err := isIndexInProgress(ctx, a.conn, quotedIndexName)
+		if err != nil {
+			return err
+		}
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for inProgress {
+			<-ticker.C
+			inProgress, err = isIndexInProgress(ctx, a.conn, quotedIndexName)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Check if the index is valid — CREATE INDEX CONCURRENTLY can leave
+		// behind an INVALID index on failure since it runs outside a transaction.
+		valid, err := isIndexValid(ctx, a.conn, quotedIndexName)
+		if err != nil {
+			return err
+		}
+		if valid {
+			return nil
+		}
+
+		// Invalid index will remain invalid forever. Drop and retry.
+		if _, err := a.conn.ExecContext(ctx, fmt.Sprintf("DROP INDEX IF EXISTS %s", quotedIndexName)); err != nil {
+			return fmt.Errorf("failed to drop invalid index %q: %w", a.name, err)
+		}
+	}
+
+	return fmt.Errorf("failed to create index %q after 5 attempts", a.name)
+}
+
+func (a *createIndexConcurrentlyAction) buildCreateIndexSQL() string {
+	stmtFmt := "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
 	if a.unique {
-		stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s"
+		stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
 	}
 	stmt := fmt.Sprintf(stmtFmt,
 		pq.QuoteIdentifier(a.name),
@@ -296,22 +339,18 @@ func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
 	colSQLs := make([]string, 0, len(a.columns))
 	for _, settings := range a.columns {
 		colSQL := pq.QuoteIdentifier(settings.Column)
-		// deparse collations
 		if settings.Collate != "" {
 			colSQL += " COLLATE " + settings.Collate
 		}
-		// deparse operator classes and their parameters
 		if settings.Opclass != nil {
 			colSQL += " " + settings.Opclass.Name
 			if len(settings.Opclass.Params) > 0 {
 				colSQL += " " + strings.Join(settings.Opclass.Params, ", ")
 			}
 		}
-		// deparse sort order of the index column
 		if settings.Sort != "" {
 			colSQL += " " + string(settings.Sort)
 		}
-		// deparse nulls order of the index column
 		if settings.Nulls != nil {
 			colSQL += " " + string(*settings.Nulls)
 		}
@@ -326,8 +365,8 @@ func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
 	if a.predicate != "" {
 		stmt += fmt.Sprintf(" WHERE %s", a.predicate)
 	}
-	_, err := a.conn.ExecContext(ctx, stmt)
-	return err
+
+	return stmt
 }
 
 // commentColumnAction is a DBAction that adds a comment to a column in a table.
@@ -432,7 +471,7 @@ func (a *createUniqueIndexConcurrentlyAction) Execute(ctx context.Context) error
 		}
 
 		// Make sure Postgres is done creating the index
-		isInProgress, err := a.isIndexInProgress(ctx, quotedQualifiedIndexName)
+		isInProgress, err := isIndexInProgress(ctx, a.conn, quotedQualifiedIndexName)
 		if err != nil {
 			return err
 		}
@@ -441,14 +480,14 @@ func (a *createUniqueIndexConcurrentlyAction) Execute(ctx context.Context) error
 		defer ticker.Stop()
 		for isInProgress {
 			<-ticker.C
-			isInProgress, err = a.isIndexInProgress(ctx, quotedQualifiedIndexName)
+			isInProgress, err = isIndexInProgress(ctx, a.conn, quotedQualifiedIndexName)
 			if err != nil {
 				return err
 			}
 		}
 
 		// Check pg_index to see if it's valid or not. Break if it's valid.
-		isValid, err := a.isIndexValid(ctx, quotedQualifiedIndexName)
+		isValid, err := isIndexValid(ctx, a.conn, quotedQualifiedIndexName)
 		if err != nil {
 			return err
 		}
@@ -487,8 +526,9 @@ func (a *createUniqueIndexConcurrentlyAction) getCreateUniqueIndexConcurrentlySQ
 	return indexQuery
 }
 
-func (a *createUniqueIndexConcurrentlyAction) isIndexInProgress(ctx context.Context, quotedQualifiedIndexName string) (bool, error) {
-	rows, err := a.conn.QueryContext(ctx, `SELECT EXISTS(
+// isIndexInProgress checks whether a concurrent index creation is still running.
+func isIndexInProgress(ctx context.Context, conn db.DB, quotedQualifiedIndexName string) (bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT EXISTS(
 			SELECT * FROM pg_catalog.pg_stat_progress_create_index
 			WHERE index_relid = $1::regclass
 			)`, quotedQualifiedIndexName)
@@ -510,8 +550,10 @@ func (a *createUniqueIndexConcurrentlyAction) isIndexInProgress(ctx context.Cont
 	return isInProgress, nil
 }
 
-func (a *createUniqueIndexConcurrentlyAction) isIndexValid(ctx context.Context, quotedQualifiedIndexName string) (bool, error) {
-	rows, err := a.conn.QueryContext(ctx, `SELECT indisvalid
+// isIndexValid checks whether an index is valid (not left invalid by a failed
+// CREATE INDEX CONCURRENTLY).
+func isIndexValid(ctx context.Context, conn db.DB, quotedQualifiedIndexName string) (bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT indisvalid
 		FROM pg_catalog.pg_index
 		WHERE indexrelid = $1::regclass`,
 		quotedQualifiedIndexName)
