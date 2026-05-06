@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 
@@ -14,6 +15,26 @@ import (
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/schema"
 )
+
+// rollbackCleanupTimeout caps best-effort cleanup when the parent context has
+// already been cancelled (e.g. by SIGINT). A bounded fresh context lets us
+// still attempt to drop the new version schema and clear the migration row
+// before exiting, instead of leaving the run dirty for `pgroll rollback`.
+const rollbackCleanupTimeout = 30 * time.Second
+
+// rollbackContext returns a context appropriate for running cleanup after a
+// failure. If the parent context is still alive (e.g. lock_timeout retry
+// budget exhausted), it is returned as-is so the caller's deadline applies.
+// If the parent has been cancelled (e.g. SIGINT), a fresh background context
+// with rollbackCleanupTimeout is returned so the rollback can still complete.
+func (m *Roll) rollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent.Err() == nil {
+		return parent, func() {}
+	}
+	m.logger.Info("parent context cancelled; running cleanup with fresh context",
+		"timeout", rollbackCleanupTimeout.String())
+	return context.WithTimeout(context.Background(), rollbackCleanupTimeout)
+}
 
 func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) error {
 	if m.skipValidation {
@@ -111,11 +132,15 @@ func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Mig
 
 		coordinator := migrations.NewCoordinator(startOp.Actions)
 		if err := coordinator.Execute(ctx); err != nil {
-			errRollback := m.Rollback(ctx)
+			m.logger.LogRollbackOnFailure(fmt.Sprintf("start operation of %q failed: %v", migration.Name, err))
+			cleanupCtx, cancel := m.rollbackContext(ctx)
+			errRollback := m.Rollback(cleanupCtx)
+			cancel()
 			if errRollback != nil {
 				return nil, errors.Join(
 					fmt.Errorf("unable to execute start operation of %q: %w", migration.Name, err),
-					fmt.Errorf("unable to roll back failed operation: %w", errRollback))
+					fmt.Errorf("unable to roll back failed operation: %w", errRollback),
+				)
 			}
 			return nil, fmt.Errorf("failed to start %q migration, changes rolled back: %w", migration.Name, err)
 		}
@@ -388,6 +413,10 @@ func (m *Roll) ensureView(ctx context.Context, version, name string, table *sche
 }
 
 func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *backfill.Config) error {
+	// Inject the Roll's logger so backfill progress events surface to the
+	// operator without requiring callers of NewConfig to opt in.
+	backfill.WithLogger(m.logger)(cfg)
+
 	bf := backfill.New(m.pgConn, cfg)
 
 	bf.CreateTriggers(ctx, job)
@@ -396,11 +425,15 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 		m.logger.LogBackfillStart(table.Name)
 
 		if err := bf.Start(ctx, table); err != nil {
-			errRollback := m.Rollback(ctx)
+			m.logger.LogRollbackOnFailure(fmt.Sprintf("backfill of table %q failed: %v", table.Name, err))
+			cleanupCtx, cancel := m.rollbackContext(ctx)
+			errRollback := m.Rollback(cleanupCtx)
+			cancel()
 
 			return errors.Join(
 				fmt.Errorf("unable to backfill table %q: %w", table.Name, err),
-				errRollback)
+				errRollback,
+			)
 		}
 
 		m.logger.LogBackfillComplete(table.Name)

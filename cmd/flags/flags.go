@@ -3,6 +3,8 @@
 package flags
 
 import (
+	"time"
+
 	"github.com/spf13/viper"
 )
 
@@ -20,6 +22,10 @@ func StateSchema() string {
 
 func LockTimeout() int {
 	return viper.GetInt("LOCK_TIMEOUT")
+}
+
+func LockRetryTimeout() time.Duration {
+	return viper.GetDuration("LOCK_RETRY_TIMEOUT")
 }
 
 func SkipValidation() bool { return viper.GetBool("SKIP_VALIDATION") }

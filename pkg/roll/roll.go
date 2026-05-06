@@ -59,10 +59,11 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 		return nil, err
 	}
 
-	logger := migrations.NewNoopLogger()
-	if rollOpts.verbose {
-		logger = migrations.NewLogger()
-	}
+	// Always use the real logger so operators see migration progress and
+	// lock_timeout/retry events without needing to opt in. The --verbose flag
+	// is reserved for future debug-level output and currently has no effect.
+	_ = rollOpts.verbose
+	logger := migrations.NewLogger()
 
 	var pgMajorVersion PGVersion
 	err = conn.QueryRowContext(ctx, "SELECT substring(split_part(version(), ' ', 2) from '^[0-9]+')").Scan(&pgMajorVersion)
@@ -71,7 +72,11 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 	}
 
 	return &Roll{
-		pgConn:                &db.RDB{DB: conn},
+		pgConn: &db.RDB{
+			DB:               conn,
+			LockRetryTimeout: rollOpts.lockRetryTimeout,
+			Logger:           logger,
+		},
 		logger:                logger,
 		schema:                schema,
 		state:                 state,

@@ -2,9 +2,14 @@
 
 package roll
 
+import "time"
+
 type options struct {
 	// lock timeout in milliseconds for pgroll DDL operations
 	lockTimeoutMs int
+
+	// total wall-clock budget for retrying lock_timeout errors before giving up
+	lockRetryTimeout time.Duration
 
 	// optional role to set before executing migrations
 	role string
@@ -42,6 +47,17 @@ type Option func(*options)
 func WithLockTimeoutMs(lockTimeoutMs int) Option {
 	return func(o *options) {
 		o.lockTimeoutMs = lockTimeoutMs
+	}
+}
+
+// WithLockRetryTimeout sets the total wall-clock budget for retrying queries
+// that fail with a lock_timeout error (SQLSTATE 55P03). When the budget is
+// exhausted the underlying lock_timeout error is returned so the caller can
+// run cleanup. Zero uses the default (5 minutes); a negative value disables
+// retries entirely.
+func WithLockRetryTimeout(d time.Duration) Option {
+	return func(o *options) {
+		o.lockRetryTimeout = d
 	}
 }
 

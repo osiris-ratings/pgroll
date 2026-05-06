@@ -295,6 +295,11 @@
   ],
   "flags": [
     {
+      "name": "lock-retry-timeout",
+      "description": "Total wall-clock budget for retrying lock_timeout errors before giving up (e.g. 5m, 30s); negative disables retries",
+      "default": "5m0s"
+    },
+    {
       "name": "lock-timeout",
       "description": "Postgres lock timeout in milliseconds for pgroll DDL operations",
       "default": "500"

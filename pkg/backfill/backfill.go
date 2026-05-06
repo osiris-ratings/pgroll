@@ -75,7 +75,8 @@ func (j *Job) AddTask(t *Task) {
 			// CASE WHEN "review" = 'bad' THEN 'bad review' ELSE 'good review' END, it must be rewritten to:
 			// CASE WHEN NEW."_pgroll_new_review" = 'bad' THEN 'bad review' ELSE 'good review' END.
 			// Otherwise, the trigger will not work correctly because it will reference the old column name.
-			tg.SQL = append(tg.SQL,
+			tg.SQL = append(
+				tg.SQL,
 				rewriteTriggerSQL(trigger.SQL, findColumnName(trigger.Columns, trigger.PhysicalColumn), trigger.PhysicalColumn),
 			)
 			j.triggers[trigger.Name] = tg
@@ -173,6 +174,9 @@ func (bf *Backfill) Start(ctx context.Context, table *schema.Table) error {
 		return fmt.Errorf("get row count for %q: %w", table.Name, err)
 	}
 
+	startTime := time.Now()
+	lastProgress := startTime
+
 	// Update each batch of rows, invoking callbacks for each one.
 	for batch := 0; ; batch++ {
 		for _, cb := range bf.callbacks {
@@ -184,6 +188,13 @@ func (bf *Backfill) Start(ctx context.Context, table *schema.Table) error {
 				break
 			}
 			return err
+		}
+
+		// Emit a progress log periodically so operators can see long-running
+		// backfills are still making forward progress.
+		if batch > 0 && batch%bf.progressEvery == 0 && time.Since(lastProgress) >= bf.progressMinTime {
+			bf.logger.LogBackfillProgress(table.Name, int64(batch*bf.batchSize), total, time.Since(startTime))
+			lastProgress = time.Now()
 		}
 
 		select {
