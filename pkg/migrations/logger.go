@@ -334,25 +334,25 @@ func getConstraintNames(cons []Constraint) []string {
 	return constraints
 }
 
-func (l *noopLogger) LogMigrationStart(m *Migration)                                              {}
-func (l *noopLogger) LogMigrationComplete(m *Migration)                                           {}
-func (l *noopLogger) LogMigrationRollback(m *Migration)                                           {}
-func (l *noopLogger) LogMigrationRollbackComplete(m *Migration)                                   {}
-func (l *noopLogger) LogBackfillStart(table string)                                               {}
-func (l *noopLogger) LogBackfillComplete(table string)                                            {}
+func (l *noopLogger) LogMigrationStart(m *Migration)            {}
+func (l *noopLogger) LogMigrationComplete(m *Migration)         {}
+func (l *noopLogger) LogMigrationRollback(m *Migration)         {}
+func (l *noopLogger) LogMigrationRollbackComplete(m *Migration) {}
+func (l *noopLogger) LogBackfillStart(table string)             {}
+func (l *noopLogger) LogBackfillComplete(table string)          {}
 func (l *noopLogger) LogBackfillProgress(table string, rowsProcessed, total int64, elapsed time.Duration) {
 }
-func (l *noopLogger) LogSchemaCreation(migration, schema string)                                  {}
-func (l *noopLogger) LogSchemaDeletion(migration, schema string)                                  {}
-func (l *noopLogger) LogOperationStart(op Operation)                                              {}
-func (l *noopLogger) LogOperationComplete(op Operation)                                           {}
-func (l *noopLogger) LogOperationRollback(op Operation)                                           {}
+func (l *noopLogger) LogSchemaCreation(migration, schema string) {}
+func (l *noopLogger) LogSchemaDeletion(migration, schema string) {}
+func (l *noopLogger) LogOperationStart(op Operation)             {}
+func (l *noopLogger) LogOperationComplete(op Operation)          {}
+func (l *noopLogger) LogOperationRollback(op Operation)          {}
 func (l *noopLogger) LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration) {
 }
-func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)       {}
-func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)  {}
-func (l *noopLogger) LogRollbackOnFailure(reason string)                             {}
-func (l *noopLogger) Info(msg string, args ...any)                                   {}
+func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)      {}
+func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration) {}
+func (l *noopLogger) LogRollbackOnFailure(reason string)                            {}
+func (l *noopLogger) Info(msg string, args ...any)                                  {}
 
 // truncateQuery returns a single-line, length-bounded form of a SQL query
 // suitable for logging without flooding the terminal.

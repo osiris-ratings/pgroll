@@ -52,7 +52,8 @@ func migrateCmd() *cobra.Command {
 						"this usually means a previous run was interrupted "+
 						"(e.g. lock_timeout under contention or SIGINT). "+
 						"Run `pgroll rollback` to clean up before retrying",
-					*latestMigration)
+					*latestMigration,
+				)
 			}
 
 			info, err := os.Stat(migrationsDir)

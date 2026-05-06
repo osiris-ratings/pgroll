@@ -139,7 +139,8 @@ func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Mig
 			if errRollback != nil {
 				return nil, errors.Join(
 					fmt.Errorf("unable to execute start operation of %q: %w", migration.Name, err),
-					fmt.Errorf("unable to roll back failed operation: %w", errRollback))
+					fmt.Errorf("unable to roll back failed operation: %w", errRollback),
+				)
 			}
 			return nil, fmt.Errorf("failed to start %q migration, changes rolled back: %w", migration.Name, err)
 		}
@@ -431,7 +432,8 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 
 			return errors.Join(
 				fmt.Errorf("unable to backfill table %q: %w", table.Name, err),
-				errRollback)
+				errRollback,
+			)
 		}
 
 		m.logger.LogBackfillComplete(table.Name)
