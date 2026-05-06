@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1-baselayer.1] - 2026-05-05
+
 ### Added
 - Private GoReleaser + Homebrew release workflow for Baselayer fork
 - Taskfile with release, dry-run, and homebrew test tasks
