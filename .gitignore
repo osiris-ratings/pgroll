@@ -7,3 +7,5 @@ pgroll
 coverage.out
 
 dist/
+
+.claude/settings.local.json
