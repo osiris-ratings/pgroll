@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ func migrateCmd() *cobra.Command {
 	var complete, expectOne bool
 	var batchSize int
 	var batchDelay time.Duration
+	var preserveVersions []string
 
 	migrateCmd := &cobra.Command{
 		Use:       "migrate <directory>",
@@ -122,7 +124,10 @@ func migrateCmd() *cobra.Command {
 			}
 
 			// Clean up intermediate version schemas, keeping only the original
-			// (for zero-downtime) and the latest active version.
+			// (for zero-downtime), the latest active version, and any versions
+			// the caller explicitly asked to preserve (typically the
+			// DB_SEARCH_PATH the running application is currently using, which
+			// may lag behind the latest completed migration).
 			keepSchemas := []string{}
 			if originalVersion != nil {
 				keepSchemas = append(keepSchemas, *originalVersion)
@@ -134,6 +139,7 @@ func migrateCmd() *cobra.Command {
 			if latestVersion != nil {
 				keepSchemas = append(keepSchemas, *latestVersion)
 			}
+			keepSchemas = append(keepSchemas, normalizePreserveVersions(m.Schema(), preserveVersions)...)
 			if err := m.DropVersionSchemasExcept(ctx, keepSchemas...); err != nil {
 				return fmt.Errorf("failed to clean up intermediate schemas: %w", err)
 			}
@@ -146,8 +152,21 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().StringSliceVar(&preserveVersions, "preserve-version", nil, "Version schema(s) to preserve during cleanup, in addition to the original and latest. Repeat or comma-separate. Accepts either the bare version name (e.g. 20260429150953_add_queue_priority) or the full schema name (e.g. public_20260429150953_add_queue_priority). Use this when the running application is pointed at an older version than pgroll's latest completed migration.")
 
 	return migrateCmd
+}
+
+// normalizePreserveVersions strips the `<schema>_` prefix from any
+// preserve-version entry that was supplied as a full version-schema name (e.g.
+// `public_20260429150953_foo`), so callers can pass either form.
+func normalizePreserveVersions(schemaName string, preserveVersions []string) []string {
+	prefix := schemaName + "_"
+	out := make([]string, 0, len(preserveVersions))
+	for _, v := range preserveVersions {
+		out = append(out, strings.TrimPrefix(v, prefix))
+	}
+	return out
 }
 
 // parseMigrations tries to parse all RawMigrations and collects all the errors

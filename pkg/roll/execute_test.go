@@ -1128,6 +1128,108 @@ func TestDropVersionSchemasExceptKeepsSpecifiedSchemas(t *testing.T) {
 	})
 }
 
+// TestDropVersionSchemasExceptPreservesLaggingAppVersion exercises the
+// scenario behind the `--preserve-version` flag on `pgroll migrate`. The
+// running application is pinned to an older version schema than pgroll's
+// `LatestVersion` at the moment the next migrate batch runs (because the
+// previous batch advanced the DB forward but the new image hadn't yet rolled
+// out). Without explicitly preserving the lagging version it would be dropped
+// out from under the live services.
+func TestDropVersionSchemasExceptPreservesLaggingAppVersion(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		const (
+			appVersion        = "1_create_table"  // app's DB_SEARCH_PATH points here
+			latestBefore      = "2_create_table2" // pgroll's LatestVersion at batch start
+			batchIntermediate = "3_create_table3" // intermediate left from cleanup
+			batchPenultimate  = "4_create_table4" // dropped as previous-of-final by Complete
+			batchFinal        = "5_create_table5"
+		)
+
+		// Apply v1 normally, then v2 with WithSkipSchemaDrop so v1 lingers as
+		// the schema the running services are still pointed at while pgroll's
+		// LatestVersion advances to v2.
+		err := mig.Start(ctx, &migrations.Migration{
+			Name:       appVersion,
+			Operations: migrations.Operations{createTableOp("table1")},
+		}, backfill.NewConfig())
+		require.NoError(t, err)
+		err = mig.Complete(ctx)
+		require.NoError(t, err)
+
+		err = mig.Start(ctx, &migrations.Migration{
+			Name:       latestBefore,
+			Operations: migrations.Operations{createTableOp("table2")},
+		}, backfill.NewConfig())
+		require.NoError(t, err)
+		err = mig.Complete(ctx, roll.WithSkipSchemaDrop())
+		require.NoError(t, err)
+
+		// Sanity: services hypothetically still pointed at appVersion.
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, appVersion)))
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, latestBefore)))
+
+		// Simulate the next migrate batch: two intermediates (skip drop) and a
+		// final migration completed normally. After this, batchPenultimate's
+		// schema is dropped by the final Complete, but batchIntermediate
+		// survives and is exactly what DropVersionSchemasExcept must clean up.
+		for _, m := range []struct {
+			name  string
+			table string
+		}{
+			{batchIntermediate, "table3"},
+			{batchPenultimate, "table4"},
+		} {
+			err = mig.Start(ctx, &migrations.Migration{
+				Name:       m.name,
+				Operations: migrations.Operations{createTableOp(m.table)},
+			}, backfill.NewConfig())
+			require.NoError(t, err)
+			err = mig.Complete(ctx, roll.WithSkipSchemaDrop())
+			require.NoError(t, err)
+		}
+
+		err = mig.Start(ctx, &migrations.Migration{
+			Name:       batchFinal,
+			Operations: migrations.Operations{createTableOp("table5")},
+		}, backfill.NewConfig())
+		require.NoError(t, err)
+		err = mig.Complete(ctx)
+		require.NoError(t, err)
+
+		// Pre-cleanup state: batchIntermediate is a real leftover that
+		// DropVersionSchemasExcept will see and decide on.
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, appVersion)))
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, latestBefore)))
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, batchIntermediate)))
+		require.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, batchPenultimate)),
+			"penultimate schema should already have been dropped by final Complete")
+		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, batchFinal)))
+
+		// Build the keep set the way `cmd/migrate` does when given
+		// `--preserve-version <appVersion>`: original (LatestVersion captured
+		// before the batch), the new latest, plus the explicitly-preserved
+		// lagging app version.
+		err = mig.DropVersionSchemasExcept(ctx, latestBefore, batchFinal, appVersion)
+		require.NoError(t, err)
+
+		// The lagging app version must survive — this is the regression we
+		// are guarding against.
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, appVersion)),
+			"lagging app version schema %q must be preserved when passed to DropVersionSchemasExcept", appVersion)
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, latestBefore)),
+			"original (pre-batch latest) schema %q should be preserved", latestBefore)
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, batchFinal)),
+			"new latest schema %q should be preserved", batchFinal)
+
+		// The leftover intermediate should be cleaned up.
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, batchIntermediate)),
+			"intermediate batch schema %q should be dropped by cleanup", batchIntermediate)
+	})
+}
+
 func TestSingleMigrationCompleteStillDropsPreviousSchema(t *testing.T) {
 	t.Parallel()
 
