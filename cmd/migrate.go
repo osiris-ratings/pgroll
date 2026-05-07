@@ -100,42 +100,25 @@ func migrateCmd() *cobra.Command {
 				backfill.WithBatchDelay(batchDelay),
 			)
 
-			// Record the schema version the app is currently using so we can
-			// preserve it throughout the batch.
-			originalVersion, err := m.State().LatestVersion(ctx, m.Schema())
-			if err != nil {
-				return fmt.Errorf("unable to get original version: %w", err)
-			}
-
-			// Run all migrations after the latest version up to the final migration,
-			// completing each one but skipping schema drops to preserve the
-			// original version schema that applications may still be using.
+			// Apply each migration in sequence. Intermediate migrations are
+			// completed but pass WithSkipSchemaDrop so no version schemas are
+			// dropped during the run. All cleanup is deferred to the final
+			// Complete (triggered by --complete here, or by a subsequent
+			// `pgroll complete` invocation).
 			for _, mig := range migs[:len(migs)-1] {
 				if err := runMigration(ctx, m, mig, true, backfillConfig, roll.WithSkipSchemaDrop()); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}
 			}
 
-			// Run the final migration, completing it only if requested.
+			// Run the final migration. If --complete is set, the final
+			// migration's Complete() will reap every prior version schema,
+			// keeping only the just-completed version. If --complete is
+			// not set, the final migration is left in-progress and all
+			// version schemas remain in place until the operator runs
+			// `pgroll complete` after deploying apps to the new schema.
 			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
 				return err
-			}
-
-			// Clean up intermediate version schemas, keeping only the original
-			// (for zero-downtime) and the latest active version.
-			keepSchemas := []string{}
-			if originalVersion != nil {
-				keepSchemas = append(keepSchemas, *originalVersion)
-			}
-			latestVersion, err := m.State().LatestVersion(ctx, m.Schema())
-			if err != nil {
-				return fmt.Errorf("unable to get latest version: %w", err)
-			}
-			if latestVersion != nil {
-				keepSchemas = append(keepSchemas, *latestVersion)
-			}
-			if err := m.DropVersionSchemasExcept(ctx, keepSchemas...); err != nil {
-				return fmt.Errorf("failed to clean up intermediate schemas: %w", err)
 			}
 
 			return nil

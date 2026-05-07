@@ -201,9 +201,11 @@ type completeOptions struct {
 // CompleteOption is a functional option for the Complete method.
 type CompleteOption func(*completeOptions)
 
-// WithSkipSchemaDrop returns a CompleteOption that skips dropping the previous
-// version schema during Complete. This is used during multi-migration batches
-// to preserve schemas that applications may still be connected to.
+// WithSkipSchemaDrop returns a CompleteOption that skips dropping old version
+// schemas during Complete. This is used by `pgroll migrate` for intermediate
+// migrations in a multi-migration batch, so cleanup is deferred until the final
+// migration is completed (either by `--complete` on migrate, or by a
+// subsequent `pgroll complete`).
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
 }
@@ -222,21 +224,22 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 
 	m.logger.LogMigrationComplete(migration)
 
-	// Drop the old version schema if there is one (unless skip is requested)
-	if !o.skipSchemaDrop {
-		prevVersion, err := m.state.PreviousVersion(ctx, m.schema)
-		if err != nil {
-			return fmt.Errorf("unable to get name of previous version: %w", err)
+	// Drop every other version schema, keeping only the version being
+	// completed. This must happen before the operations execute so views in
+	// old schemas don't block DDL like DROP COLUMN. This is the single
+	// cleanup point in pgroll's lifecycle: `pgroll migrate` accumulates
+	// schemas without dropping anything; the final `Complete()` (whether
+	// triggered by `--complete` on migrate or by a subsequent `pgroll
+	// complete`) reaps every prior version. This avoids the heuristic-based
+	// "originalVersion" detection that previously could drop a schema apps
+	// were still connected to when pgroll's state had drifted from
+	// production deployment.
+	if !o.skipSchemaDrop && !m.disableVersionSchemas {
+		if err := m.DropVersionSchemasExcept(ctx, migration.VersionSchemaName()); err != nil {
+			return fmt.Errorf("unable to drop old version schemas: %w", err)
 		}
-		if prevVersion != nil {
-			versionSchema := VersionedSchemaName(m.schema, *prevVersion)
-			_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
-			if err != nil {
-				return fmt.Errorf("unable to drop previous version: %w", err)
-			}
-		}
-	} else {
-		m.logger.Info("skipping previous version schema drop (deferred cleanup)", "migration", migration.Name)
+	} else if o.skipSchemaDrop {
+		m.logger.Info("skipping old version schema cleanup (deferred to next Complete)", "migration", migration.Name)
 	}
 
 	// read the current schema
