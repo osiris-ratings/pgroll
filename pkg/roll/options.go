@@ -110,3 +110,20 @@ func WithLogging(enabled bool) Option {
 		}
 	}
 }
+
+// startOptions holds options for a single Start invocation.
+type startOptions struct {
+	skipVersionSchema bool
+}
+
+// StartOption is a functional option for the Start method.
+type StartOption func(*startOptions)
+
+// WithoutVersionSchema returns a StartOption that disables version schema
+// creation for this Start call. Used by `pgroll migrate` for intermediate
+// migrations in a batch — no apps will ever connect to an intermediate
+// version, so projecting it wastes a schema and (more importantly) creates
+// view dependencies that block destructive operations later in the batch.
+func WithoutVersionSchema() StartOption {
+	return func(o *startOptions) { o.skipVersionSchema = true }
+}

@@ -385,10 +385,11 @@ func TestSchemaOptionIsRespected(t *testing.T) {
 		}
 
 		// Apply another migration to the same schema
-		if err := mig.Start(ctx, &migrations.Migration{
-			Name:       version2,
-			Operations: migrations.Operations{createTableOp("table2")},
-		},
+		if err := mig.Start(
+			ctx, &migrations.Migration{
+				Name:       version2,
+				Operations: migrations.Operations{createTableOp("table2")},
+			},
 			backfill.NewConfig(),
 		); err != nil {
 			t.Fatalf("Failed to start migration: %v", err)
@@ -1027,7 +1028,7 @@ func TestMultiMigrationBatchPreservesOriginalSchema(t *testing.T) {
 			version4 = "4_create_table4"
 		)
 
-		// Apply the first migration normally (this is the "app's current version")
+		// Apply the first migration normally (this is the "app's current version").
 		err := mig.Start(ctx, &migrations.Migration{
 			Name:       version1,
 			Operations: migrations.Operations{createTableOp("table1")},
@@ -1036,10 +1037,12 @@ func TestMultiMigrationBatchPreservesOriginalSchema(t *testing.T) {
 		err = mig.Complete(ctx)
 		require.NoError(t, err)
 
-		// Verify the original schema exists
+		// Verify the original schema exists.
 		require.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version1)))
 
-		// Simulate a multi-migration batch: apply intermediates with WithSkipSchemaDrop
+		// Simulate a multi-migration batch: apply intermediates with both
+		// WithoutVersionSchema (Start) and WithSkipSchemaDrop (Complete).
+		// This is what `pgroll migrate` now does in its loop.
 		for _, v := range []struct {
 			name  string
 			table string
@@ -1050,41 +1053,44 @@ func TestMultiMigrationBatchPreservesOriginalSchema(t *testing.T) {
 			err = mig.Start(ctx, &migrations.Migration{
 				Name:       v.name,
 				Operations: migrations.Operations{createTableOp(v.table)},
-			}, backfill.NewConfig())
+			}, backfill.NewConfig(), roll.WithoutVersionSchema())
 			require.NoError(t, err)
 			err = mig.Complete(ctx, roll.WithSkipSchemaDrop())
 			require.NoError(t, err)
 
-			// Original schema should still exist after each intermediate
+			// Original schema should still exist after each intermediate.
 			assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version1)),
 				"Original schema should persist during intermediate migration %s", v.name)
+
+			// Intermediates do not project a version schema — this is the
+			// load-bearing assertion of the new model. No orphan schemas
+			// can accumulate during the batch.
+			assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, v.name)),
+				"intermediate %s must not have a version schema", v.name)
 		}
 
-		// Apply the final migration normally (no skip)
+		// Apply the final migration normally (Start projects the new target).
 		err = mig.Start(ctx, &migrations.Migration{
 			Name:       version4,
 			Operations: migrations.Operations{createTableOp("table4")},
 		}, backfill.NewConfig())
 		require.NoError(t, err)
 
-		// Original schema should still exist (final migration is left active, not completed)
+		// At this moment exactly two version schemas exist: the original
+		// (V1, apps' active version) and the final target (V4).
 		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version1)))
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version4)))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version2)))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version3)))
 
-		// Clean up intermediate schemas, keeping original and latest
-		err = mig.DropVersionSchemasExcept(ctx, version1, version4)
-		require.NoError(t, err)
+		// Run final Complete (the standalone `pgroll complete` step). This
+		// reaps the original V1 schema and leaves only V4 standing.
+		require.NoError(t, mig.Complete(ctx))
 
-		// Original and latest should still exist
-		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version1)),
-			"Original schema should be preserved after cleanup")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version1)),
+			"original schema reaped by final Complete after deploy")
 		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version4)),
-			"Latest schema should be preserved after cleanup")
-
-		// Intermediate schemas should be cleaned up
-		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version2)),
-			"Intermediate schema v2 should be dropped after cleanup")
-		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, version3)),
-			"Intermediate schema v3 should be dropped after cleanup")
+			"final target schema remains")
 	})
 }
 
@@ -1125,6 +1131,342 @@ func TestDropVersionSchemasExceptKeepsSpecifiedSchemas(t *testing.T) {
 		// v2 and v3 should be dropped
 		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v2")))
 		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v3")))
+	})
+}
+
+// TestDependentMigrationsResolveWithDeferredCleanup mirrors the production
+// pgroll-migrate flow: a stack of additive migrations where each one uses
+// objects created by previous migrations. It proves that intermediate
+// completion (running operations + state.Complete) and schema cleanup are
+// severable for additive operations — every migration's effects are visible
+// to the next even though no version schemas are dropped until the final
+// Complete.
+//
+// Migration chain:
+//
+//	A: CREATE TABLE products (id, name)
+//	B: CREATE FUNCTION greet(text) -> text  (depends on nothing in pgroll, just exists in public)
+//	C: ALTER TABLE products ADD COLUMN greeting text DEFAULT greet('default')
+//	   (depends on A's table + B's function)
+func TestDependentMigrationsResolveWithDeferredCleanup(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		const (
+			vA = "01_create_products_table"
+			vB = "02_create_greet_function"
+			vC = "03_add_greeting_column"
+		)
+
+		// Migration A: create the products table.
+		migA := &migrations.Migration{
+			Name: vA,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE products (id integer PRIMARY KEY, name text NOT NULL)`,
+					Down: `DROP TABLE products`,
+				},
+			},
+		}
+		require.NoError(t, mig.Start(ctx, migA, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// Intermediate migrations don't project version schemas.
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vA)),
+			"intermediate A should not have a version schema")
+
+		// Migration B: create a function. Depends on B running in a context
+		// where A has already physically applied its DDL.
+		migB := &migrations.Migration{
+			Name: vB,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `CREATE FUNCTION greet(name text) RETURNS text
+						   LANGUAGE sql IMMUTABLE
+						   AS $$ SELECT 'Hello, ' || name $$`,
+					Down: `DROP FUNCTION greet(text)`,
+				},
+			},
+		}
+		require.NoError(t, mig.Start(ctx, migB, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vB)),
+			"intermediate B should not have a version schema")
+
+		// Migration C: add a column whose DEFAULT calls greet() and references
+		// the products table. This will fail unless both A and B have been
+		// effectively applied (their operations actually executed against the
+		// underlying schema), so this is the load-bearing assertion.
+		migC := &migrations.Migration{
+			Name: vC,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `ALTER TABLE products
+						   ADD COLUMN greeting text NOT NULL DEFAULT greet('world')`,
+					Down: `ALTER TABLE products DROP COLUMN greeting`,
+				},
+			},
+		}
+		// Final migration projects the new target schema.
+		require.NoError(t, mig.Start(ctx, migC, backfill.NewConfig()))
+
+		// Final completion (no skip).
+		require.NoError(t, mig.Complete(ctx))
+
+		// Underlying objects all exist and the dependency chain resolved.
+		var greeting string
+		_, err := db.ExecContext(ctx, `INSERT INTO products(id, name) VALUES (1, 'pgroll')`)
+		require.NoError(t, err, "insert into products should succeed (table from A exists, default from B was applied during C)")
+
+		err = db.QueryRowContext(ctx, `SELECT greeting FROM products WHERE id = 1`).Scan(&greeting)
+		require.NoError(t, err)
+		assert.Equal(t, "Hello, world", greeting,
+			"greet() default applied to new column proves B's function is callable from C's DDL")
+
+		// Only C's version schema remains.
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vA)))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vB)))
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vC)),
+			"version schema for C should remain after final Complete")
+	})
+}
+
+// TestDestructiveContractOpFailsAsIntermediate pins down the safety
+// *boundary* of the deferred-cleanup model. A migration whose contract
+// (OnComplete) operation drops or alters something referenced by views in
+// prior version schemas cannot run as an intermediate (with
+// WithSkipSchemaDrop) — Postgres rejects the DDL with "other objects depend
+// on it" because the prev-version views haven't been reaped.
+//
+// This is a fundamental property of pgroll's multi-migration batch model,
+// not a quirk of the current cleanup design. The same failure occurs under
+// any cleanup scheme that keeps WithSkipSchemaDrop's contract: don't drop
+// prev-version mid-batch (so apps still connected to it aren't rugged).
+// Both the "--protect-version + end-of-migrate cleanup" alternative and
+// the cleanup-on-Complete design preserve that contract, so both produce
+// this failure for destructive intermediates.
+//
+// Operational pattern: destructive migrations must be the *final*
+// migration of a batch (where they run without WithSkipSchemaDrop), or be
+// applied as a standalone `pgroll start`/`pgroll complete` cycle between
+// deploy windows.
+func TestDestructiveContractOpFailsAsIntermediate(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		// A: create users(id, email). Completed normally (would have been
+		// the previous batch's end-state in production).
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// B: destructive contract — DROP COLUMN runs at Complete time
+		// (OnComplete: true). The view in public_01_create_users still
+		// projects users.email, so the DDL must fail unless we drop that
+		// schema first.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:         `ALTER TABLE users DROP COLUMN email`,
+					OnComplete: true,
+				},
+			},
+		}, backfill.NewConfig()))
+
+		// Intermediate Complete (the migrate-loop position): WithSkipSchemaDrop
+		// preserves prev-version → DROP COLUMN fails on the dependent view.
+		err := mig.Complete(ctx, roll.WithSkipSchemaDrop())
+		require.Error(t, err, "destructive intermediate must fail; prev-version views block the drop")
+		assert.Contains(t, err.Error(), "depend on it",
+			"expected Postgres dependency error, got: %v", err)
+	})
+}
+
+// TestAbortedBatchLeavesNoOrphanSchemas proves the recovery property of
+// the no-intermediate-schemas model: when `pgroll migrate` aborts partway
+// through a batch, the database is left with exactly the production-active
+// version schema and nothing else. Operators can identify the active
+// schema from `\dn` alone — no reasoning across pgroll.migrations state +
+// orphan schemas + DB_SEARCH_PATH config.
+func TestAbortedBatchLeavesNoOrphanSchemas(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		const (
+			vProd = "00_create_users"
+			vMid  = "01_add_email"
+			vBad  = "02_invalid_sql"
+		)
+
+		// Production-active version: completed normally with a version schema.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: vProd,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, name text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// Successful intermediate (no version schema projected).
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: vMid,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN email text`,
+					Down: `ALTER TABLE users DROP COLUMN email`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// Failing intermediate: invalid SQL aborts Start. Rollback runs.
+		err := mig.Start(ctx, &migrations.Migration{
+			Name: vBad,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE this_is_invalid_sql (`,
+					Down: `DROP TABLE this_is_invalid_sql`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema())
+		require.Error(t, err, "Start of invalid SQL must fail")
+
+		// After the abort: only the production-active version schema exists.
+		// The successful intermediate left no schema (WithoutVersionSchema)
+		// and the failing intermediate's Rollback cleaned up its own row.
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vProd)),
+			"production-active version schema must survive an aborted batch")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vMid)),
+			"successful intermediate must leave no version schema")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vBad)),
+			"failing intermediate must leave no version schema")
+	})
+}
+
+// TestDestructiveOpAgainstNonV0ColumnSucceedsAsIntermediate proves the
+// destructive-case lift: when intermediate migrations don't project version
+// schemas, a destructive contract op against a column the production-active
+// schema doesn't reference now succeeds — even mid-batch. Under the prior
+// model (PR #13's deferred-cleanup), the intermediate-V1 schema's view
+// would have referenced the column and blocked the drop. With no
+// intermediate schemas to project, the only remaining blocker is V0 — and
+// V0's view never knew about the column being dropped.
+func TestDestructiveOpAgainstNonV0ColumnSucceedsAsIntermediate(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0: production-active. View projects (id, name) — no email column.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, name text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// V1 (intermediate): adds an email column. No version schema; no view
+		// in any pgroll-managed schema references email.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_add_email",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN email text`,
+					Down: `ALTER TABLE users DROP COLUMN email`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// V2 (intermediate, destructive contract): DROP COLUMN email at
+		// Complete time. V0's view doesn't reference email; V1 has no
+		// schema. Nothing blocks the drop.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:         `ALTER TABLE users DROP COLUMN email`,
+					OnComplete: true,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+
+		err := mig.Complete(ctx, roll.WithSkipSchemaDrop())
+		require.NoError(t, err,
+			"destructive intermediate must succeed when V0's view doesn't reference the dropped column")
+
+		// Verify the column is actually gone from the underlying table.
+		var exists bool
+		err = db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_name = 'users' AND column_name = 'email'
+			)`).Scan(&exists)
+		require.NoError(t, err)
+		assert.False(t, exists, "email column should be dropped")
+	})
+}
+
+// TestExistingVersionSchemas covers the helper used by the migrate command's
+// pre-flight summary: it must list every `<schema>_*` schema that exists,
+// in stable order, regardless of whether they correspond to the current
+// pgroll state.
+func TestExistingVersionSchemas(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		// Empty initial state.
+		schemas, err := mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, schemas)
+
+		// One schema after applying a migration.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "01_first",
+			Operations: migrations.Operations{createTableOp("t1")},
+		}, backfill.NewConfig()))
+
+		schemas, err = mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{roll.VersionedSchemaName(cSchema, "01_first")}, schemas)
+
+		require.NoError(t, mig.Complete(ctx))
+
+		// Two schemas exist briefly between Start and Complete of the second.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "02_second",
+			Operations: migrations.Operations{createTableOp("t2")},
+		}, backfill.NewConfig()))
+
+		schemas, err = mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{
+			roll.VersionedSchemaName(cSchema, "01_first"),
+			roll.VersionedSchemaName(cSchema, "02_second"),
+		}, schemas)
 	})
 }
 

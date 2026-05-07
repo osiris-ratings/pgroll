@@ -52,7 +52,12 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 }
 
 // Start will apply the required changes to enable supporting the new schema version
-func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *backfill.Config) error {
+func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *backfill.Config, opts ...StartOption) error {
+	var o startOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// Fail early if we have existing schema without migration history
 	hasExistingSchema, err := m.state.HasExistingSchemaWithoutHistory(ctx, m.schema)
 	if err != nil {
@@ -68,7 +73,7 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return err
 	}
 
-	job, err := m.StartDDLOperations(ctx, migration)
+	job, err := m.startDDLOperations(ctx, migration, &o)
 	if err != nil {
 		return err
 	}
@@ -79,7 +84,15 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 
 // StartDDLOperations performs the DDL operations for the migration. This does
 // not include running backfills for any modified tables.
+//
+// Exported for callers that want fine-grained control of the Start phase
+// without backfills. Equivalent to the internal startDDLOperations with
+// default options.
 func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Migration) (*backfill.Job, error) {
+	return m.startDDLOperations(ctx, migration, &startOptions{})
+}
+
+func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Migration, o *startOptions) (*backfill.Job, error) {
 	// check if there is an active migration, create one otherwise
 	active, err := m.state.IsActiveMigrationPeriod(ctx, m.schema)
 	if err != nil {
@@ -160,8 +173,13 @@ func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Mig
 		}
 	}
 
-	// create views for the new version
-	if !m.disableVersionSchemas {
+	// Create views for the new version unless either:
+	//   - the Roll instance has version schemas globally disabled, or
+	//   - this Start call passed WithoutVersionSchema (used by `pgroll
+	//     migrate` for intermediate migrations to avoid projecting schemas
+	//     that no apps will connect to and that would otherwise create view
+	//     dependencies blocking destructive ops later in the batch).
+	if !o.skipVersionSchema && !m.disableVersionSchemas {
 		if err := m.ensureViews(ctx, newSchema, migration); err != nil {
 			return nil, err
 		}
@@ -201,9 +219,11 @@ type completeOptions struct {
 // CompleteOption is a functional option for the Complete method.
 type CompleteOption func(*completeOptions)
 
-// WithSkipSchemaDrop returns a CompleteOption that skips dropping the previous
-// version schema during Complete. This is used during multi-migration batches
-// to preserve schemas that applications may still be connected to.
+// WithSkipSchemaDrop returns a CompleteOption that skips dropping old version
+// schemas during Complete. This is used by `pgroll migrate` for intermediate
+// migrations in a multi-migration batch, so cleanup is deferred until the final
+// migration is completed (either by `--complete` on migrate, or by a
+// subsequent `pgroll complete`).
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
 }
@@ -222,21 +242,22 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 
 	m.logger.LogMigrationComplete(migration)
 
-	// Drop the old version schema if there is one (unless skip is requested)
-	if !o.skipSchemaDrop {
-		prevVersion, err := m.state.PreviousVersion(ctx, m.schema)
-		if err != nil {
-			return fmt.Errorf("unable to get name of previous version: %w", err)
+	// Drop every other version schema, keeping only the version being
+	// completed. This must happen before the operations execute so views in
+	// old schemas don't block DDL like DROP COLUMN. This is the single
+	// cleanup point in pgroll's lifecycle: `pgroll migrate` accumulates
+	// schemas without dropping anything; the final `Complete()` (whether
+	// triggered by `--complete` on migrate or by a subsequent `pgroll
+	// complete`) reaps every prior version. This avoids the heuristic-based
+	// "originalVersion" detection that previously could drop a schema apps
+	// were still connected to when pgroll's state had drifted from
+	// production deployment.
+	if !o.skipSchemaDrop && !m.disableVersionSchemas {
+		if err := m.DropVersionSchemasExcept(ctx, migration.VersionSchemaName()); err != nil {
+			return fmt.Errorf("unable to drop old version schemas: %w", err)
 		}
-		if prevVersion != nil {
-			versionSchema := VersionedSchemaName(m.schema, *prevVersion)
-			_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
-			if err != nil {
-				return fmt.Errorf("unable to drop previous version: %w", err)
-			}
-		}
-	} else {
-		m.logger.Info("skipping previous version schema drop (deferred cleanup)", "migration", migration.Name)
+	} else if o.skipSchemaDrop {
+		m.logger.Info("skipping old version schema cleanup (deferred to next Complete)", "migration", migration.Name)
 	}
 
 	// read the current schema
@@ -277,8 +298,12 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
 	}
 
-	// recreate views for the new version (if some operations require it, ie SQL)
-	if refreshViews && !m.disableVersionSchemas {
+	// Recreate views for the new version (if some operations require it, ie
+	// SQL). Skipped under WithSkipSchemaDrop because that flag signals an
+	// intermediate migration in a `pgroll migrate` batch — those don't
+	// project a version schema in Start, and shouldn't materialize one
+	// here in Complete either.
+	if refreshViews && !o.skipSchemaDrop && !m.disableVersionSchemas {
 		currentSchema, err = m.state.ReadSchema(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)
@@ -440,6 +465,35 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 	}
 
 	return nil
+}
+
+// ExistingVersionSchemas returns the names of all version schemas that
+// currently exist for the Roll's underlying schema, ordered ascending by
+// schema name. Version schemas are identified by their prefix
+// (schema + "_"). Useful for pre-flight diagnostics — operators want to
+// see exactly which schemas exist before a migrate run begins.
+func (m *Roll) ExistingVersionSchemas(ctx context.Context) ([]string, error) {
+	prefix := m.schema + "_"
+	rows, err := m.pgConn.QueryContext(ctx,
+		"SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1 ORDER BY schema_name",
+		prefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("unable to list version schemas: %w", err)
+	}
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("unable to scan schema name: %w", err)
+		}
+		schemas = append(schemas, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating version schemas: %w", err)
+	}
+	return schemas, nil
 }
 
 // DropVersionSchemasExcept drops all version schemas for the given schema
