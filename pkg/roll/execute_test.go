@@ -1128,6 +1128,103 @@ func TestDropVersionSchemasExceptKeepsSpecifiedSchemas(t *testing.T) {
 	})
 }
 
+// TestDependentMigrationsResolveWithDeferredCleanup mirrors the production
+// pgroll-migrate flow: a stack of additive migrations where each one uses
+// objects created by previous migrations. It proves that intermediate
+// completion (running operations + state.Complete) and schema cleanup are
+// severable for additive operations — every migration's effects are visible
+// to the next even though no version schemas are dropped until the final
+// Complete.
+//
+// Migration chain:
+//
+//	A: CREATE TABLE products (id, name)
+//	B: CREATE FUNCTION greet(text) -> text  (depends on nothing in pgroll, just exists in public)
+//	C: ALTER TABLE products ADD COLUMN greeting text DEFAULT greet('default')
+//	   (depends on A's table + B's function)
+func TestDependentMigrationsResolveWithDeferredCleanup(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		const (
+			vA = "01_create_products_table"
+			vB = "02_create_greet_function"
+			vC = "03_add_greeting_column"
+		)
+
+		// Migration A: create the products table.
+		migA := &migrations.Migration{
+			Name: vA,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE products (id integer PRIMARY KEY, name text NOT NULL)`,
+					Down: `DROP TABLE products`,
+				},
+			},
+		}
+		require.NoError(t, mig.Start(ctx, migA, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// Migration B: create a function. Depends on B running in a context
+		// where A has already physically applied its DDL.
+		migB := &migrations.Migration{
+			Name: vB,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `CREATE FUNCTION greet(name text) RETURNS text
+						   LANGUAGE sql IMMUTABLE
+						   AS $$ SELECT 'Hello, ' || name $$`,
+					Down: `DROP FUNCTION greet(text)`,
+				},
+			},
+		}
+		require.NoError(t, mig.Start(ctx, migB, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// Migration C: add a column whose DEFAULT calls greet() and references
+		// the products table. This will fail unless both A and B have been
+		// effectively applied (their operations actually executed against the
+		// underlying schema), so this is the load-bearing assertion.
+		migC := &migrations.Migration{
+			Name: vC,
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `ALTER TABLE products
+						   ADD COLUMN greeting text NOT NULL DEFAULT greet('world')`,
+					Down: `ALTER TABLE products DROP COLUMN greeting`,
+				},
+			},
+		}
+		require.NoError(t, mig.Start(ctx, migC, backfill.NewConfig()))
+
+		// Final completion (no skip): this is the cleanup point. With my
+		// change it should drop the version schemas for A and B and leave
+		// only C's version schema standing.
+		require.NoError(t, mig.Complete(ctx))
+
+		// Underlying objects all exist and the dependency chain resolved.
+		var greeting string
+		_, err := db.ExecContext(ctx, `INSERT INTO products(id, name) VALUES (1, 'pgroll')`)
+		require.NoError(t, err, "insert into products should succeed (table from A exists, default from B was applied during C)")
+
+		err = db.QueryRowContext(ctx, `SELECT greeting FROM products WHERE id = 1`).Scan(&greeting)
+		require.NoError(t, err)
+		assert.Equal(t, "Hello, world", greeting,
+			"greet() default applied to new column proves B's function is callable from C's DDL")
+
+		// Schema cleanup happened only at the final Complete: A and B's
+		// version schemas are gone; only C's remains.
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vA)),
+			"version schema for A should be reaped by final Complete")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vB)),
+			"version schema for B should be reaped by final Complete")
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, vC)),
+			"version schema for C should remain after final Complete")
+	})
+}
+
 func TestSingleMigrationCompleteStillDropsPreviousSchema(t *testing.T) {
 	t.Parallel()
 
