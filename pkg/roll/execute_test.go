@@ -1428,6 +1428,48 @@ func TestDestructiveOpAgainstNonV0ColumnSucceedsAsIntermediate(t *testing.T) {
 	})
 }
 
+// TestExistingVersionSchemas covers the helper used by the migrate command's
+// pre-flight summary: it must list every `<schema>_*` schema that exists,
+// in stable order, regardless of whether they correspond to the current
+// pgroll state.
+func TestExistingVersionSchemas(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		// Empty initial state.
+		schemas, err := mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, schemas)
+
+		// One schema after applying a migration.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "01_first",
+			Operations: migrations.Operations{createTableOp("t1")},
+		}, backfill.NewConfig()))
+
+		schemas, err = mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{roll.VersionedSchemaName(cSchema, "01_first")}, schemas)
+
+		require.NoError(t, mig.Complete(ctx))
+
+		// Two schemas exist briefly between Start and Complete of the second.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "02_second",
+			Operations: migrations.Operations{createTableOp("t2")},
+		}, backfill.NewConfig()))
+
+		schemas, err = mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{
+			roll.VersionedSchemaName(cSchema, "01_first"),
+			roll.VersionedSchemaName(cSchema, "02_second"),
+		}, schemas)
+	})
+}
+
 func TestSingleMigrationCompleteStillDropsPreviousSchema(t *testing.T) {
 	t.Parallel()
 

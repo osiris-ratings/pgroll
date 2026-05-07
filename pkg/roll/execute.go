@@ -467,6 +467,35 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 	return nil
 }
 
+// ExistingVersionSchemas returns the names of all version schemas that
+// currently exist for the Roll's underlying schema, ordered ascending by
+// schema name. Version schemas are identified by their prefix
+// (schema + "_"). Useful for pre-flight diagnostics — operators want to
+// see exactly which schemas exist before a migrate run begins.
+func (m *Roll) ExistingVersionSchemas(ctx context.Context) ([]string, error) {
+	prefix := m.schema + "_"
+	rows, err := m.pgConn.QueryContext(ctx,
+		"SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1 ORDER BY schema_name",
+		prefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("unable to list version schemas: %w", err)
+	}
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("unable to scan schema name: %w", err)
+		}
+		schemas = append(schemas, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating version schemas: %w", err)
+	}
+	return schemas, nil
+}
+
 // DropVersionSchemasExcept drops all version schemas for the given schema
 // except those whose version name is in the keep list. Version schemas are
 // identified by their prefix (schema + "_") and cross-referenced with the
