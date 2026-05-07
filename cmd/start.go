@@ -136,12 +136,21 @@ func runMigration(ctx context.Context, m *roll.Roll, migration *migrations.Migra
 		}
 	}
 
+	// A version schema is projected only when (a) the Roll instance has
+	// version schemas enabled globally and (b) this Start call did not
+	// pass WithoutVersionSchema. Intermediate migrations in `pgroll
+	// migrate` batches pass WithoutVersionSchema and therefore do NOT
+	// produce a version schema — the spinner message must reflect that
+	// truthfully so we don't tell operators a schema is available when
+	// it isn't.
+	projectedSchema := m.UseVersionSchema() && !roll.StartOptionsSkipVersionSchema(startOpts...)
+
 	var msg string
-	if m.UseVersionSchema() {
+	if projectedSchema {
 		viewName := roll.VersionedSchemaName(flags.Schema(), migration.VersionSchemaName())
 		msg = fmt.Sprintf("New version of the schema available under the postgres %q schema", viewName)
 	} else {
-		msg = fmt.Sprintf("Migration %q started successfully", migration.Name)
+		msg = fmt.Sprintf("Migration %q applied", migration.Name)
 	}
 
 	sp.Success(msg)

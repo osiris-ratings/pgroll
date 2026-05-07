@@ -127,3 +127,15 @@ type StartOption func(*startOptions)
 func WithoutVersionSchema() StartOption {
 	return func(o *startOptions) { o.skipVersionSchema = true }
 }
+
+// StartOptionsSkipVersionSchema reports whether the given StartOption set
+// would suppress version schema creation. Used by callers (e.g. the
+// `pgroll migrate` command) to tailor user-facing output to whether a
+// schema was actually projected.
+func StartOptionsSkipVersionSchema(opts ...StartOption) bool {
+	var o startOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o.skipVersionSchema
+}
