@@ -52,7 +52,12 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 }
 
 // Start will apply the required changes to enable supporting the new schema version
-func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *backfill.Config) error {
+func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *backfill.Config, opts ...StartOption) error {
+	var o startOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// Fail early if we have existing schema without migration history
 	hasExistingSchema, err := m.state.HasExistingSchemaWithoutHistory(ctx, m.schema)
 	if err != nil {
@@ -68,7 +73,7 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return err
 	}
 
-	job, err := m.StartDDLOperations(ctx, migration)
+	job, err := m.startDDLOperations(ctx, migration, &o)
 	if err != nil {
 		return err
 	}
@@ -79,7 +84,15 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 
 // StartDDLOperations performs the DDL operations for the migration. This does
 // not include running backfills for any modified tables.
+//
+// Exported for callers that want fine-grained control of the Start phase
+// without backfills. Equivalent to the internal startDDLOperations with
+// default options.
 func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Migration) (*backfill.Job, error) {
+	return m.startDDLOperations(ctx, migration, &startOptions{})
+}
+
+func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Migration, o *startOptions) (*backfill.Job, error) {
 	// check if there is an active migration, create one otherwise
 	active, err := m.state.IsActiveMigrationPeriod(ctx, m.schema)
 	if err != nil {
@@ -160,8 +173,13 @@ func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Mig
 		}
 	}
 
-	// create views for the new version
-	if !m.disableVersionSchemas {
+	// Create views for the new version unless either:
+	//   - the Roll instance has version schemas globally disabled, or
+	//   - this Start call passed WithoutVersionSchema (used by `pgroll
+	//     migrate` for intermediate migrations to avoid projecting schemas
+	//     that no apps will connect to and that would otherwise create view
+	//     dependencies blocking destructive ops later in the batch).
+	if !o.skipVersionSchema && !m.disableVersionSchemas {
 		if err := m.ensureViews(ctx, newSchema, migration); err != nil {
 			return nil, err
 		}
@@ -280,8 +298,12 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
 	}
 
-	// recreate views for the new version (if some operations require it, ie SQL)
-	if refreshViews && !m.disableVersionSchemas {
+	// Recreate views for the new version (if some operations require it, ie
+	// SQL). Skipped under WithSkipSchemaDrop because that flag signals an
+	// intermediate migration in a `pgroll migrate` batch — those don't
+	// project a version schema in Start, and shouldn't materialize one
+	// here in Complete either.
+	if refreshViews && !o.skipSchemaDrop && !m.disableVersionSchemas {
 		currentSchema, err = m.state.ReadSchema(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)

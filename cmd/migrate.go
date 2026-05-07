@@ -100,23 +100,32 @@ func migrateCmd() *cobra.Command {
 				backfill.WithBatchDelay(batchDelay),
 			)
 
-			// Apply each migration in sequence. Intermediate migrations are
-			// completed but pass WithSkipSchemaDrop so no version schemas are
-			// dropped during the run. All cleanup is deferred to the final
-			// Complete (triggered by --complete here, or by a subsequent
-			// `pgroll complete` invocation).
+			// Apply each intermediate migration without projecting a version
+			// schema. No apps will ever connect to an intermediate version, so
+			// projecting it would just waste a schema and create view
+			// dependencies that block destructive operations later in the
+			// batch. WithSkipSchemaDrop on Complete prevents the intermediate
+			// from dropping the production-active version schema. Net effect:
+			// at any point during the run, the only version schema that
+			// exists is the production-active one — until the final
+			// migration's Start creates the new target.
 			for _, mig := range migs[:len(migs)-1] {
-				if err := runMigration(ctx, m, mig, true, backfillConfig, roll.WithSkipSchemaDrop()); err != nil {
+				if err := runMigration(
+					ctx, m, mig, true, backfillConfig,
+					AsStartOption(roll.WithoutVersionSchema()),
+					AsCompleteOption(roll.WithSkipSchemaDrop()),
+				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}
 			}
 
-			// Run the final migration. If --complete is set, the final
-			// migration's Complete() will reap every prior version schema,
-			// keeping only the just-completed version. If --complete is
-			// not set, the final migration is left in-progress and all
-			// version schemas remain in place until the operator runs
-			// `pgroll complete` after deploying apps to the new schema.
+			// Run the final migration. Its Start projects the new target
+			// version schema. If --complete is set, the final Complete()
+			// reaps every other version schema (the production-active
+			// version goes away). If --complete is not set, the final
+			// migration is left in-progress; the production-active version
+			// schema is preserved until the operator runs `pgroll complete`
+			// after deploying apps to the new target.
 			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
 				return err
 			}

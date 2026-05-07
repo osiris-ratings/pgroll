@@ -79,7 +79,38 @@ func runMigrationFromFile(ctx context.Context, m *roll.Roll, fileName string, co
 	return runMigration(ctx, m, migration, complete, c)
 }
 
-func runMigration(ctx context.Context, m *roll.Roll, migration *migrations.Migration, complete bool, c *backfill.Config, completeOpts ...roll.CompleteOption) error {
+// migrationOption is the union of Start- and Complete-phase options that
+// runMigration accepts. Letting the caller mix freely is cleaner than two
+// variadic slices because most call sites (e.g. cmd/migrate.go) want to
+// configure both phases at once.
+type migrationOption interface{ migrationOptionMarker() }
+
+type startOpt struct{ opt roll.StartOption }
+
+func (startOpt) migrationOptionMarker() {}
+
+type completeOpt struct{ opt roll.CompleteOption }
+
+func (completeOpt) migrationOptionMarker() {}
+
+// AsStartOption wraps a roll.StartOption for runMigration.
+func AsStartOption(o roll.StartOption) migrationOption { return startOpt{o} }
+
+// AsCompleteOption wraps a roll.CompleteOption for runMigration.
+func AsCompleteOption(o roll.CompleteOption) migrationOption { return completeOpt{o} }
+
+func runMigration(ctx context.Context, m *roll.Roll, migration *migrations.Migration, complete bool, c *backfill.Config, opts ...migrationOption) error {
+	var startOpts []roll.StartOption
+	var completeOpts []roll.CompleteOption
+	for _, o := range opts {
+		switch v := o.(type) {
+		case startOpt:
+			startOpts = append(startOpts, v.opt)
+		case completeOpt:
+			completeOpts = append(completeOpts, v.opt)
+		}
+	}
+
 	sp, _ := pterm.DefaultSpinner.WithText("Starting migration...").Start()
 	c.AddCallback(func(n int64, total int64) {
 		if total > 0 {
@@ -92,7 +123,7 @@ func runMigration(ctx context.Context, m *roll.Roll, migration *migrations.Migra
 		}
 	})
 
-	err := m.Start(ctx, migration, c)
+	err := m.Start(ctx, migration, c, startOpts...)
 	if err != nil {
 		sp.Fail(fmt.Sprintf("Failed to start migration: %s", err))
 		return err
