@@ -21,7 +21,7 @@ func TestCheckConstraintValidate(t *testing.T) {
 	})
 	t.Run("Name length", func(t *testing.T) {
 		check := &CheckConstraint{
-			Name: strings.Repeat("x", maxIdentifierLength+1),
+			Name: strings.Repeat("x", MaxIdentifierLength+1),
 		}
 		err := check.Validate()
 		assert.EqualError(t, err, `length of "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" (64) exceeds maximum length of 63`)
