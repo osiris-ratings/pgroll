@@ -1225,6 +1225,67 @@ func TestDependentMigrationsResolveWithDeferredCleanup(t *testing.T) {
 	})
 }
 
+// TestDestructiveContractOpFailsAsIntermediate pins down the safety
+// *boundary* of the deferred-cleanup model. A migration whose contract
+// (OnComplete) operation drops or alters something referenced by views in
+// prior version schemas cannot run as an intermediate (with
+// WithSkipSchemaDrop) — Postgres rejects the DDL with "other objects depend
+// on it" because the prev-version views haven't been reaped.
+//
+// This is a fundamental property of pgroll's multi-migration batch model,
+// not a quirk of the current cleanup design. The same failure occurs under
+// any cleanup scheme that keeps WithSkipSchemaDrop's contract: don't drop
+// prev-version mid-batch (so apps still connected to it aren't rugged).
+// Both the "--protect-version + end-of-migrate cleanup" alternative and
+// the cleanup-on-Complete design preserve that contract, so both produce
+// this failure for destructive intermediates.
+//
+// Operational pattern: destructive migrations must be the *final*
+// migration of a batch (where they run without WithSkipSchemaDrop), or be
+// applied as a standalone `pgroll start`/`pgroll complete` cycle between
+// deploy windows.
+func TestDestructiveContractOpFailsAsIntermediate(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		// A: create users(id, email). Completed normally (would have been
+		// the previous batch's end-state in production).
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// B: destructive contract — DROP COLUMN runs at Complete time
+		// (OnComplete: true). The view in public_01_create_users still
+		// projects users.email, so the DDL must fail unless we drop that
+		// schema first.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:         `ALTER TABLE users DROP COLUMN email`,
+					OnComplete: true,
+				},
+			},
+		}, backfill.NewConfig()))
+
+		// Intermediate Complete (the migrate-loop position): WithSkipSchemaDrop
+		// preserves prev-version → DROP COLUMN fails on the dependent view.
+		err := mig.Complete(ctx, roll.WithSkipSchemaDrop())
+		require.Error(t, err, "destructive intermediate must fail; prev-version views block the drop")
+		assert.Contains(t, err.Error(), "depend on it",
+			"expected Postgres dependency error, got: %v", err)
+	})
+}
+
 func TestSingleMigrationCompleteStillDropsPreviousSchema(t *testing.T) {
 	t.Parallel()
 
