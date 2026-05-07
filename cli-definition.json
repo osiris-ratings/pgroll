@@ -186,6 +186,11 @@
           "name": "expect-one",
           "description": "Abort if there is more than one migration to be applied",
           "default": "false"
+        },
+        {
+          "name": "preserve-version",
+          "description": "Version schema(s) to preserve during cleanup, in addition to the original and latest. Repeat or comma-separate. Accepts either the bare version name (e.g. 20260429150953_add_queue_priority) or the full schema name (e.g. public_20260429150953_add_queue_priority). Use this when the running application is pointed at an older version than pgroll's latest completed migration.",
+          "default": "[]"
         }
       ],
       "subcommands": [],
