@@ -21,7 +21,7 @@ jobs:
           go-version-file: 'go.mod'
 
       # Mark the checkout as 'safe' despite being owned by `root`
-      - run: git config --global --add safe.directory $GITHUB_WORKSPACE 
+      - run: git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -120,7 +120,14 @@ jobs:
       actions: read
       pull-requests: write
     steps:
+      # Coverage diff against the target branch needs at least one
+      # successful run on that branch. In the baselayer fork that
+      # baseline doesn't exist until the first green build lands on
+      # `baselayer`. Mark the step continue-on-error so a missing
+      # baseline produces a warning, not a blocking failure. Self-heals
+      # once baselayer has a green build — no further changes needed.
       - uses: fgrosse/go-coverage-report@v1.2.0
+        continue-on-error: true
         with:
           coverage-artifact-name: "code-coverage"
           coverage-file-name: "coverage.out"
@@ -167,7 +174,7 @@ jobs:
            echo "run 'make ledger' to regenerate the ledger"
            exit 1
          fi
-         
+
   dead-code-check:
     name: dead code check
     runs-on: ubuntu-24.04
@@ -242,4 +249,3 @@ jobs:
         POSTGRES_HOST: localhost
         PGPASSWORD: postgres
         PGROLL_SCHEMA: ${{ matrix.testSchema }}
-
