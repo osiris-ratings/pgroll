@@ -120,22 +120,45 @@ func (m *Migration) Validate(ctx context.Context, s *schema.Schema) error {
 // doesn't run while the prev-production version schema's views still
 // reference the affected objects.
 //
-// Now that pgroll-internal artifacts (`_pgroll_new_<col>`,
-// `_pgroll_trigger_<table>_<col>`, `_pgroll_needs_backfill`,
-// `_pgroll_del_<name>`) are namespaced per-migration via MigrationScope,
-// every operation type composes cleanly under deferred-Complete:
-// concurrently-deferred migrations don't collide on temp column names,
-// trigger function names, or soft-deleted table names. So in batched
-// `pgroll migrate` flows we defer every intermediate's Complete and
-// drain them all together at final Complete, after the prev-prod schema
-// has been dropped.
+// "Defer everything" is tempting given namespacing, but it doesn't work
+// for additive ops in a batch: downstream migrations may reference the
+// added column by its user-facing name in raw SQL or typed lookups, and
+// while a deferred OpAddColumn's Complete is queued, the column only
+// exists physically as `_pgroll_new_<col>_<scope>`. Subsequent raw-SQL
+// operations against the user-facing name fail.
 //
-// Returns true for any non-empty migration. The classifier method
-// remains for callers (cmd/migrate) that want to opt into the deferred
-// path explicitly; future work could remove it entirely once we're
-// confident every Roll caller wants deferral in batch mode.
+// So additive ops (add column, create table, indexes, set
+// default/comment, regular raw SQL) run inline. Their Completes don't
+// touch user-facing identifiers prev-prod's view references — they
+// rename temp names and drop pgroll-internal trigger machinery, which
+// prev-prod doesn't know about. Inline is safe.
+//
+// Destructive and duplicator-pattern ops defer. With per-migration
+// namespacing of internal artifacts (TemporaryName, TriggerFunctionName,
+// DuplicationName, NeedsBackfillColumnName, DeletionName), concurrently
+// deferred migrations don't collide on temp columns, trigger functions,
+// or marker columns. Deferral is what unblocks them — their Complete
+// drops user-facing columns/tables that prev-prod's view references,
+// which Postgres rejects until prev-prod's view is gone.
 func (m *Migration) CompleteMustBeDeferred() bool {
-	return len(m.Operations) > 0
+	for _, op := range m.Operations {
+		switch v := op.(type) {
+		case *OpDropColumn,
+			*OpDropTable,
+			*OpDropConstraint,
+			*OpDropIndex,
+			*OpDropMultiColumnConstraint,
+			*OpRenameColumn,
+			*OpRenameTable,
+			*OpAlterColumn:
+			return true
+		case *OpRawSQL:
+			if v.OnComplete {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UpdateVirtualSchema updates the in-memory schema representation with the changes

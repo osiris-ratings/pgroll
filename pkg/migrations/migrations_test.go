@@ -75,9 +75,9 @@ func TestCompleteMustBeDeferred(t *testing.T) {
 			ops:    migrations.Operations{&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}}},
 			expect: false,
 		},
-		"alter column is inline-safe": {
+		"alter column needs deferral (duplicator pattern)": {
 			ops:    migrations.Operations{&migrations.OpAlterColumn{Table: "t", Column: "c", Up: "c", Down: "c"}},
-			expect: false,
+			expect: true,
 		},
 		"create table is inline-safe": {
 			ops:    migrations.Operations{&migrations.OpCreateTable{Name: "t"}},
@@ -95,21 +95,21 @@ func TestCompleteMustBeDeferred(t *testing.T) {
 			ops:    migrations.Operations{&migrations.OpDropTable{Name: "t"}},
 			expect: true,
 		},
-		"rename column runs inline (Postgres rewires dependent views automatically)": {
+		"rename column needs deferral": {
 			ops:    migrations.Operations{&migrations.OpRenameColumn{Table: "t", From: "a", To: "b"}},
-			expect: false,
+			expect: true,
 		},
-		"rename table runs inline": {
+		"rename table needs deferral": {
 			ops:    migrations.Operations{&migrations.OpRenameTable{From: "a", To: "b"}},
-			expect: false,
+			expect: true,
 		},
-		"drop constraint runs inline (duplicator-pattern Start doesn't replay cleanly)": {
+		"drop constraint needs deferral": {
 			ops:    migrations.Operations{&migrations.OpDropConstraint{Name: "c", Table: "t", Up: "x", Down: "x"}},
-			expect: false,
+			expect: true,
 		},
-		"drop index runs inline": {
+		"drop index needs deferral": {
 			ops:    migrations.Operations{&migrations.OpDropIndex{Name: "idx"}},
-			expect: false,
+			expect: true,
 		},
 		"OnComplete raw SQL needs deferral": {
 			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "ALTER TABLE t DROP COLUMN c", OnComplete: true}},
