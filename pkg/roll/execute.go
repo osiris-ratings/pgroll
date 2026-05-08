@@ -78,6 +78,17 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 //     projection. Drain (which expects pre-rename temp names) reads the
 //     raw schema directly via state.ReadSchema instead.
 func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
+	return m.readSchemaWithDeferredExcluding(ctx, "")
+}
+
+// readSchemaWithDeferredExcluding is readSchemaWithDeferred with one
+// migration's Start excluded from the replay. Used by drainDeferredMigration
+// when constructing that migration's own Complete actions: the construction
+// needs to see the schema as it stands *before* this migration's Start ran,
+// so duplicator-pattern Completes resolve column.Name to the source column
+// (not the temp this migration installed). All *other* still-deferred
+// migrations are replayed normally.
+func (m *Roll) readSchemaWithDeferredExcluding(ctx context.Context, excludeMigration string) (*schema.Schema, error) {
 	s, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return nil, err
@@ -86,6 +97,15 @@ func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, erro
 	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return nil, fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	if excludeMigration != "" {
+		filtered := deferred[:0]
+		for _, dm := range deferred {
+			if dm.Name != excludeMigration {
+				filtered = append(filtered, dm)
+			}
+		}
+		deferred = filtered
 	}
 	if len(deferred) == 0 {
 		return s, nil
@@ -425,59 +445,48 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		m.logger.Info("skipping old version schema cleanup (deferred to next Complete)", "migration", migration.Name)
 	}
 
-	// Collect deferred Completes from prior intermediates. Their actions get
-	// merged with the active migration's actions and run through a single
-	// Coordinator below. The Coordinator's dedup-and-move-later behavior is
-	// load-bearing here: shared cleanups (e.g. drop_column on the per-table
-	// `_pgroll_needs_backfill` marker) appear in every contributing
-	// migration's action list, and the merged ordering pushes that drop
-	// after every contributing migration's trigger-function drop, so the
-	// column drop doesn't fail on lingering trigger dependencies.
+	// Drain deferred Completes one migration at a time, in chain order.
+	// Each iteration reads the schema fresh, constructs that migration's
+	// Complete actions, executes them through their own Coordinator, and
+	// clears the migration's complete_deferred flag. By the time
+	// migration N's actions are constructed, migrations 1..N-1 have
+	// physically applied — so N's op.Complete sees the post-prior-drain
+	// state when looking up columns/constraints by name.
 	//
-	// Skip drain under WithSkipSchemaDrop — that path keeps the
-	// prev-production schema around, which would block destructive drained
-	// DDL with the same dependency error the deferral was set up to avoid.
-	// Leave the queue for whoever runs the next non-deferred Complete.
-	var drainedMigrations []string
-	var deferredActions []migrations.DBAction
+	// This restores the per-migration Complete contract pgroll is built
+	// around. The merged-Coordinator approach we used previously was
+	// load-bearing only when the `_pgroll_needs_backfill` marker was
+	// shared across migrations on the same table; with per-migration
+	// namespacing each migration's marker is independent, so per-
+	// migration drains compose without ordering dependencies.
+	//
+	// Failure semantics: if migration K's drain fails, the partial state
+	// is exactly "1..K-1 fully drained, K still deferred, K+1..end still
+	// deferred". The operator fixes the underlying issue and re-runs
+	// `pgroll complete`; the retry resumes from K. Cleaner than the
+	// merged version's "all-or-nothing" partial-execution.
+	//
+	// Skip the entire drain under WithSkipSchemaDrop — that path keeps
+	// the prev-production schema around, which would block destructive
+	// drained DDL with the same dependency error the deferral was set up
+	// to avoid. Leave the queue for the next non-deferred Complete.
 	if !o.skipSchemaDrop {
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
 		}
-		for _, dm := range queued {
-			drainedMigrations = append(drainedMigrations, dm.Name)
-			// Use the deferred-aware schema read so op.Complete can find
-			// constraints, indexes, and column metadata installed by
-			// *this* migration's Start (which haven't physically applied
-			// yet because Complete is what we're collecting now). E.g.
-			// OpDropConstraint.Complete looks up the constraint via
-			// table.GetConstraintColumns — that's only populated when the
-			// originating migration's Start mutated the in-memory schema,
-			// which the replay does.
-			drainSchema, err := m.readSchemaWithDeferred(ctx)
-			if err != nil {
-				return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
-			}
-			// Set this deferred migration's scope on the schema so its
-			// op.Complete naming helpers produce identifiers matching
-			// what's physically present (the temp/trigger/marker names
-			// installed by the same migration's earlier Start).
-			drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
-			for _, op := range dm.Operations {
-				opActions, err := op.Complete(m.logger, m.pgConn, drainSchema)
-				if err != nil {
-					return fmt.Errorf("unable to collect actions for deferred complete %q: %w", dm.Name, err)
-				}
-				deferredActions = append(deferredActions, opActions...)
-			}
+		if len(queued) > 0 {
+			m.logger.Info("draining deferred completes", "count", len(queued))
 		}
-		if len(drainedMigrations) > 0 {
-			m.logger.Info("merging deferred completes into final action set", "count", len(drainedMigrations))
+		for _, dm := range queued {
+			if err := m.drainDeferredMigration(ctx, dm); err != nil {
+				return err
+			}
 		}
 	}
 
-	// read the current schema
+	// read the current schema (now reflecting every drained migration's
+	// physical effects).
 	currentSchema, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
@@ -498,9 +507,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		defer m.migrationHooks.AfterCompleteDDL(m)
 	}
 
-	// execute operations
+	// execute the active migration's Complete operations
 	refreshViews := false
-	actions := deferredActions
+	var actions []migrations.DBAction
 	for _, op := range migration.Operations {
 		opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
 		if err != nil {
@@ -516,19 +525,6 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	coordinator := migrations.NewCoordinator(actions)
 	if err := coordinator.Execute(ctx); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
-	}
-
-	// Coordinator succeeded — clear complete_deferred for the drained
-	// migrations now that their actions have physically applied. Done after
-	// successful execution so a Coordinator failure leaves the queue
-	// intact: an operator can fix the underlying issue and re-run
-	// `pgroll complete` to retry. Idempotent DDL (DROP COLUMN IF EXISTS,
-	// DROP FUNCTION IF EXISTS CASCADE) makes the retry safe for
-	// already-executed actions.
-	for _, name := range drainedMigrations {
-		if err := m.state.ClearCompleteDeferred(ctx, m.schema, name); err != nil {
-			return fmt.Errorf("unable to clear complete_deferred for %q: %w", name, err)
-		}
 	}
 
 	// Recreate views for the new version (if some operations require it, ie
@@ -717,6 +713,55 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 		m.logger.LogBackfillComplete(table.Name)
 	}
 
+	return nil
+}
+
+// drainDeferredMigration runs a single deferred migration's Complete
+// actions through its own Coordinator and clears the complete_deferred
+// flag on success. The schema passed to `op.Complete` reflects:
+//   - prior drained migrations' physical effects (they already executed),
+//   - other still-deferred migrations' Start mutations (replayed in-memory
+//     so OpDropConstraint can find constraints, etc.),
+//   - explicitly *not* this migration's own Start mutations.
+//
+// The exclusion of this migration's own Start is load-bearing for
+// duplicator-pattern Completes: OpDropConstraint.Complete uses
+// `column.Name` to derive the source column it needs to drop. With this
+// migration's Start replayed, `column.Name` would be the per-migration
+// temp name the Start installed (e.g. `_pgroll_new_review_<thisScope>`),
+// which is *this migration's own duplicate column*, not the source. We
+// want the user-facing column name as it stands after prior drains —
+// that's the source to drop.
+//
+// Sets the per-migration scope on the schema so naming helpers in
+// `op.Complete` produce identifiers that match what's physically present
+// (the temp/trigger/marker names installed by the same migration's
+// earlier Start).
+func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migration) error {
+	drainSchema, err := m.readSchemaWithDeferredExcluding(ctx, dm.Name)
+	if err != nil {
+		return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
+	}
+	drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
+
+	var actions []migrations.DBAction
+	for _, op := range dm.Operations {
+		opActions, err := op.Complete(m.logger, m.pgConn, drainSchema)
+		if err != nil {
+			return fmt.Errorf("unable to collect actions for deferred complete %q: %w", dm.Name, err)
+		}
+		actions = append(actions, opActions...)
+	}
+
+	coord := migrations.NewCoordinator(actions)
+	if err := coord.Execute(ctx); err != nil {
+		return fmt.Errorf("unable to execute deferred complete %q: %w", dm.Name, err)
+	}
+
+	if err := m.state.ClearCompleteDeferred(ctx, m.schema, dm.Name); err != nil {
+		return fmt.Errorf("unable to clear complete_deferred for %q: %w", dm.Name, err)
+	}
+	m.logger.Info("drained deferred complete", "migration", dm.Name)
 	return nil
 }
 

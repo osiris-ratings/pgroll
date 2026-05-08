@@ -23,11 +23,22 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	// By this point Validate() should have run which ensures the constraint exists and that we only have
-	// one column associated with it.
-	column := table.GetColumn(table.GetConstraintColumns(o.Name)[0])
+	// During FakeDB-backed replay (readSchemaWithDeferred building up
+	// other migrations' Start effects so this Start sees their schema
+	// state), an earlier migration's deferred OpSetCheckConstraint /
+	// OpSetUnique / OpSetForeignKey may not have been replayed if it was
+	// excluded or if the replay hasn't reached it yet. Constraint
+	// metadata can therefore legitimately be absent. Treat that as a
+	// no-op replay rather than panicking — the live (non-replay) Start
+	// path always passes through Validate first, which checks the
+	// constraint exists.
+	constraintColumns := table.GetConstraintColumns(o.Name)
+	if len(constraintColumns) == 0 {
+		return nil, nil
+	}
+	column := table.GetColumn(constraintColumns[0])
 	if column == nil {
-		return nil, ColumnDoesNotExistError{Table: o.Table, Name: table.GetConstraintColumns(o.Name)[0]}
+		return nil, ColumnDoesNotExistError{Table: o.Table, Name: constraintColumns[0]}
 	}
 
 	// Create a copy of the column on the underlying table.
