@@ -78,7 +78,7 @@ func TestSetForeignKey(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `user_id` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("", "user_id"))
+				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_add_fk_constraint"), "user_id"))
 
 				// A temporary FK constraint has been created on the temporary column
 				NotValidatedForeignKeyMustExist(t, db, schema, "posts", "fk_users_id")
@@ -136,7 +136,7 @@ func TestSetForeignKey(t *testing.T) {
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `user_id` column should not exist on the underlying table.
-				ColumnMustNotExist(t, db, schema, "posts", migrations.TemporaryName("", "user_id"))
+				ColumnMustNotExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_add_fk_constraint"), "user_id"))
 
 				// A validated foreign key constraint exists on the underlying table.
 				ValidatedForeignKeyMustExist(t, db, schema, "posts", "fk_users_id")
@@ -758,7 +758,7 @@ func TestSetForeignKey(t *testing.T) {
 					db,
 					schema,
 					"posts",
-					migrations.DuplicationName("", "fk_users_id_1"),
+					migrations.DuplicationName(migrations.MigrationScopeFor("03_add_fk_constraint"), "fk_users_id_1"),
 					migrations.ForeignKeyActionCASCADE,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -1112,7 +1112,7 @@ func TestSetForeignKey(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName("", "user_id"), "the id of the author")
+				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_add_fk_constraint"), "user_id"), "the id of the author")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

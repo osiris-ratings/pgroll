@@ -63,16 +63,26 @@ func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 	// Add the new column to the internal schema representation. This is done
 	// here, before creation of the down trigger, so that the trigger can declare
 	// a variable for the new column. Save the old column name for use as the
-	// physical column name. in the down trigger first.
+	// physical column name in the down trigger first. Preserve the original
+	// column's other metadata (Nullable, Unique, Comment, etc.) so that
+	// replays of this Start across migrations in a deferred batch don't
+	// strip fields that downstream Validate steps depend on. Clear Default
+	// when the type changes — the old default may not parse against the new
+	// type, and view projection would emit ALTER VIEW SET DEFAULT with
+	// mismatched types.
 	oldPhysicalColumn := column.Name
 	columnType := column.Type
+	typeChanged := o.Type != nil && *o.Type != column.Type
 	if o.Type != nil {
 		columnType = *o.Type
 	}
-	table.AddColumn(o.Column, &schema.Column{
-		Name: TemporaryName(scope, o.Column),
-		Type: columnType,
-	})
+	newCol := *column
+	newCol.Name = TemporaryName(scope, o.Column)
+	newCol.Type = columnType
+	if typeChanged {
+		newCol.Default = nil
+	}
+	table.AddColumn(o.Column, &newCol)
 
 	// Add a trigger to copy values from the new column to the old.
 	triggers = append(

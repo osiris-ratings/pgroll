@@ -72,11 +72,14 @@ func (o *OpDropMultiColumnConstraint) Start(ctx context.Context, l Logger, conn 
 		// Add the new column to the internal schema representation. This is done
 		// here, before creation of the down trigger, so that the trigger can declare
 		// a variable for the new column. Save the old column name for use as the
-		// physical column name in the down trigger first.
-		oldPhysicalColumn := table.GetColumn(columnName).Name
-		table.AddColumn(columnName, &schema.Column{
-			Name: TemporaryName(scope, columnName),
-		})
+		// physical column name in the down trigger first. Preserve column
+		// metadata so replays across deferred migrations don't strip fields
+		// downstream Validate steps depend on.
+		oldCol := table.GetColumn(columnName)
+		oldPhysicalColumn := oldCol.Name
+		newCol := *oldCol
+		newCol.Name = TemporaryName(scope, columnName)
+		table.AddColumn(columnName, &newCol)
 
 		// Add a trigger to copy values from the new column to the old, rewriting values using the `down` SQL.
 		triggers = append(

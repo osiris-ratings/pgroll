@@ -2168,7 +2168,7 @@ func TestAddColumnWithComment(t *testing.T) {
 		},
 		afterStart: func(t *testing.T, db *sql.DB, schema string) {
 			// The comment has been added to the underlying column.
-			columnName := migrations.TemporaryName("", "age")
+			columnName := migrations.TemporaryName(migrations.MigrationScopeFor("02_add_column"), "age")
 			ColumnMustHaveComment(t, db, schema, "users", columnName, "the age of the user")
 		},
 		afterRollback: func(t *testing.T, db *sql.DB, schema string) {

@@ -48,13 +48,19 @@ const (
 // scope makes the duplicated identifiers (`_pgroll_new_<col>_<scope>`,
 // `_pgroll_dup_<constraint>_<scope>`) unique per migration so concurrently-
 // deferred duplicator-pattern ops on the same source column don't collide.
+//
+// asName uses temporaryNameRebase(scope, column.Name) so a source column
+// whose physical name is itself a `_pgroll_new_<base>_<otherScope>` left
+// over from a prior deferred migration produces a single-prefixed
+// `_pgroll_new_<base>_<scope>` rather than the double-prefixed
+// `_pgroll_new__pgroll_new_<base>_<otherScope>_<scope>`.
 func NewColumnDuplicator(conn db.DB, scope string, table *schema.Table, columns ...*schema.Column) *duplicator {
 	cols := make(map[string]*columnToDuplicate, len(columns))
 	columsID := make([]string, 0, len(columns))
 	for _, column := range columns {
 		cols[column.Name] = &columnToDuplicate{
 			column:   column,
-			asName:   TemporaryName(scope, column.Name),
+			asName:   temporaryNameRebase(scope, column.Name),
 			withType: column.Type,
 		}
 		columsID = append(columsID, column.Name)
@@ -70,6 +76,29 @@ func NewColumnDuplicator(conn db.DB, scope string, table *schema.Table, columns 
 		columns:           cols,
 		withoutConstraint: make([]string, 0),
 	}
+}
+
+// temporaryNameRebase produces a temp name for a column when the column's
+// current physical name might already be a temp from an earlier deferred
+// migration. For a fresh user-facing name like "review" it returns
+// `_pgroll_new_review_<scope>`. For an already-temp name like
+// `_pgroll_new_review_<otherScope>` it strips the prior prefix+scope and
+// re-applies the new scope, returning `_pgroll_new_review_<scope>` rather
+// than nesting the temp prefix.
+func temporaryNameRebase(scope, name string) string {
+	base := name
+	if strings.HasPrefix(base, temporaryPrefix) {
+		rest := strings.TrimPrefix(base, temporaryPrefix)
+		// Strip a trailing `_<MigrationScopeLength hex chars>` if present.
+		if len(rest) > MigrationScopeLength+1 {
+			tail := rest[len(rest)-MigrationScopeLength-1:]
+			if tail[0] == '_' && isHexLower(tail[1:]) {
+				rest = rest[:len(rest)-MigrationScopeLength-1]
+			}
+		}
+		base = rest
+	}
+	return TemporaryName(scope, base)
 }
 
 func (d *duplicator) ID() string { return d.id }
@@ -277,7 +306,7 @@ func (d *duplicatorStmtBuilder) allConstraintColumns(constraintColumns []string,
 	newConstraintColumns := make([]string, len(constraintColumns))
 	for i, column := range constraintColumns {
 		if slices.Contains(duplicatedColumns, column) {
-			newConstraintColumns[i] = TemporaryName(d.scope, column)
+			newConstraintColumns[i] = temporaryNameRebase(d.scope, column)
 			duplicatedMember = true
 		} else {
 			newConstraintColumns[i] = column

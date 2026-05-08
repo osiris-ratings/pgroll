@@ -65,11 +65,14 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 		// Add the new column to the internal schema representation. This is done
 		// here, before creation of the down trigger, so that the trigger can declare
 		// a variable for the new column. Save the old column name for use as the
-		// physical column name in the down trigger first.
-		oldPhysicalColumn := table.GetColumn(colName).Name
-		table.AddColumn(colName, &schema.Column{
-			Name: TemporaryName(scope, colName),
-		})
+		// physical column name in the down trigger first. Preserve column
+		// metadata so replays across deferred migrations don't strip fields
+		// downstream Validate steps depend on.
+		oldCol := table.GetColumn(colName)
+		oldPhysicalColumn := oldCol.Name
+		newCol := *oldCol
+		newCol.Name = TemporaryName(scope, colName)
+		table.AddColumn(colName, &newCol)
 
 		downSQL := o.Down[colName]
 		triggers = append(

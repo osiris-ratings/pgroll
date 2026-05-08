@@ -60,7 +60,7 @@ func TestSetCheckConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `title` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("", "title"))
+				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_add_check_constraint"), "title"))
 
 				// A check constraint has been added to the temporary column
 				NotInheritableCheckConstraintMustExist(t, db, schema, "posts", "check_title_length")
@@ -283,7 +283,7 @@ func TestSetCheckConstraint(t *testing.T) {
 					db,
 					schema,
 					"employees",
-					migrations.DuplicationName("", "fk_employee_department"),
+					migrations.DuplicationName(migrations.MigrationScopeFor("03_add_check_constraint"), "fk_employee_department"),
 					migrations.ForeignKeyActionCASCADE,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -541,7 +541,7 @@ func TestSetCheckConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName("", "title"), "the title of the post")
+				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_add_check_constraint"), "title"), "the title of the post")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

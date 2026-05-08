@@ -144,7 +144,7 @@ func TestCreateConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName("", "name"))
+				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "name"))
 				// The check constraint exists on the new table.
 				CheckConstraintMustExist(t, db, schema, "users", "name_letters")
 				// Inserting values into the old schema that violate the check constraint must succeed.
@@ -309,9 +309,9 @@ func TestCreateConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName("", "name"))
+				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "name"))
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName("", "email"))
+				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "email"))
 				// The check constraint exists on the new table.
 				CheckConstraintMustExist(t, db, schema, "users", "check_name_email")
 
@@ -440,9 +440,9 @@ func TestCreateConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName("", "users_id"))
+				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "users_id"))
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName("", "users_zip"))
+				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "users_zip"))
 				// A temporary FK constraint has been created on the temporary column
 				NotValidatedForeignKeyMustExist(t, db, schema, "reports", "fk_users")
 
@@ -582,9 +582,9 @@ func TestCreateConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName("", "users_id"))
+				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "users_id"))
 				// The new (temporary) column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName("", "users_zip"))
+				ColumnMustExist(t, db, schema, "reports", migrations.TemporaryName(migrations.MigrationScopeFor("02_create_constraint"), "users_zip"))
 				// A temporary FK constraint has been created on the temporary column
 				NotValidatedForeignKeyMustExistWithReferentialAction(t, db, schema, "reports", "fk_users", migrations.ForeignKeyActionSETNULL, migrations.ForeignKeyActionNOACTION)
 

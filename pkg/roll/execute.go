@@ -139,15 +139,15 @@ func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, erro
 	// processed before invoking ops on the returned schema.
 	s.MigrationScope = ""
 
-	for _, table := range s.Tables {
-		for k, v := range table.Columns {
-			if v != nil && v.Name != k {
-				if _, dupe := table.Columns[v.Name]; dupe {
-					delete(table.Columns, v.Name)
-				}
-			}
-		}
-	}
+	// Don't clean up physical-name-keyed Column entries even when a
+	// virtual-keyed entry now references the same physical column. The
+	// view-projection filter (skip `_pgroll_*` virtual keys in
+	// ensureView) keeps internal columns out of user-facing views, and
+	// OpDropConstraint / OpDropMultiColumnConstraint need to look the
+	// column up by the physical name stored in the constraint's
+	// Columns slice (which pg records based on the SQL the constraint
+	// was created with — temp-named when an earlier deferred migration
+	// added the constraint via duplicator).
 
 	return s, nil
 }

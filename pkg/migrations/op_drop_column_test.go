@@ -355,7 +355,7 @@ func TestDropColumnInMultiOperationMigrations(t *testing.T) {
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// OpDropColumn drops columns on completion, so the column is still
 				// present after start, under its temporary name.
-				ColumnMustExist(t, db, schema, "items", migrations.TemporaryName("", "description"))
+				ColumnMustExist(t, db, schema, "items", migrations.TemporaryName(migrations.MigrationScopeFor("02_multi_operation"), "description"))
 
 				// Can't insert into the dropped column when accessing through the new schema
 				MustNotInsert(t, db, schema, "02_multi_operation", "items", map[string]string{

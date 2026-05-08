@@ -58,10 +58,12 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 
 	// Add the new column to the internal schema representation. This is done
 	// here, before creation of the down trigger, so that the trigger can declare
-	// a variable for the new column.
-	table.AddColumn(column.Name, &schema.Column{
-		Name: TemporaryName(scope, column.Name),
-	})
+	// a variable for the new column. Preserve the original column's metadata
+	// (Type, Nullable, Default, etc.) so replays across deferred migrations
+	// don't strip fields that downstream Validate steps depend on.
+	newCol := *column
+	newCol.Name = TemporaryName(scope, column.Name)
+	table.AddColumn(column.Name, &newCol)
 
 	// Add a trigger to copy values from the new column to the old, rewriting values using the `down` SQL.
 	triggers = append(

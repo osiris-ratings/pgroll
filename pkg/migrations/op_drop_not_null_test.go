@@ -66,7 +66,7 @@ func TestDropNotNull(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `review` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName("", "review"))
+				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_nullable"), "review"))
 
 				// Inserting a NULL into the new `review` column should succeed
 				MustInsert(t, db, schema, "set_nullable", "reviews", map[string]string{
@@ -269,7 +269,7 @@ func TestDropNotNull(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// A temporary FK constraint has been created on the temporary column
-				ValidatedForeignKeyMustExist(t, db, schema, "employees", migrations.DuplicationName("", "fk_employee_department"))
+				ValidatedForeignKeyMustExist(t, db, schema, "employees", migrations.DuplicationName(migrations.MigrationScopeFor("03_set_not_null"), "fk_employee_department"))
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},
@@ -515,7 +515,7 @@ func TestDropNotNull(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("", "name"), "the name of the user")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_not_null"), "name"), "the name of the user")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

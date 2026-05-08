@@ -723,10 +723,12 @@ func (a *CreateCheckConstraintAction) Execute(ctx context.Context) error {
 // the check expression as though it were being applied to the old column,
 // On migration start, however, the check is actually applied to the new (temporary)
 // column. This function naively rewrites the check expression to apply to the
-// per-migration temp name (`_pgroll_new_<col>_<scope>`).
+// per-migration temp name (`_pgroll_new_<col>_<scope>`). Uses temporaryNameRebase
+// so a `column` that's already a temp name from an earlier deferred migration
+// rebases (strip-and-re-apply) instead of double-prefixing.
 func rewriteCheckExpression(scope, check string, columns ...string) string {
 	for _, col := range columns {
-		check = strings.ReplaceAll(check, col, TemporaryName(scope, col))
+		check = strings.ReplaceAll(check, col, temporaryNameRebase(scope, col))
 	}
 	return check
 }

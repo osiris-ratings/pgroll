@@ -69,7 +69,7 @@ func TestChangeColumnType(t *testing.T) {
 				newVersionSchema := roll.VersionedSchemaName(schema, "change_type")
 
 				// The new (temporary) `rating` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName("", "rating"))
+				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName(migrations.MigrationScopeFor("02_change_type"), "rating"))
 
 				// The `rating` column in the new view must have the correct type.
 				ColumnMustHaveType(t, db, newVersionSchema, "reviews", "rating", "integer")
@@ -215,7 +215,7 @@ func TestChangeColumnType(t *testing.T) {
 					db,
 					schema,
 					"employees",
-					migrations.DuplicationName("", "fk_employee_department"),
+					migrations.DuplicationName(migrations.MigrationScopeFor("03_change_type"), "fk_employee_department"),
 					migrations.ForeignKeyActionCASCADE,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -645,7 +645,7 @@ func TestChangeColumnType(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("", "username"), "the name of the user")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_change_type"), "username"), "the name of the user")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},
@@ -691,7 +691,7 @@ func TestChangeColumnType(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has the expected type
-				ColumnMustHaveType(t, db, schema, "Users", migrations.TemporaryName("", "name"), "text")
+				ColumnMustHaveType(t, db, schema, "Users", migrations.TemporaryName(migrations.MigrationScopeFor("02_change_type"), "name"), "text")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The table has been cleaned up
@@ -752,7 +752,7 @@ func TestChangeTypeInMultiOperationMigrations(t *testing.T) {
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has the expected type
 				// The table hasn't been physically renamed yet, so we need to use the old name
-				ColumnMustHaveType(t, db, schema, "items", migrations.TemporaryName("", "name"), "text")
+				ColumnMustHaveType(t, db, schema, "items", migrations.TemporaryName(migrations.MigrationScopeFor("02_multi_operation"), "name"), "text")
 
 				// Can insert a row into the new schema
 				MustInsert(t, db, schema, "02_multi_operation", "products", map[string]string{
@@ -854,7 +854,7 @@ func TestChangeTypeInMultiOperationMigrations(t *testing.T) {
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has the expected type
 				// The table hasn't been physically renamed yet, so we need to use the old name
-				ColumnMustHaveType(t, db, schema, "items", migrations.TemporaryName("", "item_name"), "text")
+				ColumnMustHaveType(t, db, schema, "items", migrations.TemporaryName(migrations.MigrationScopeFor("02_multi_operation"), "item_name"), "text")
 
 				// Can insert a row into the new schema
 				MustInsert(t, db, schema, "02_multi_operation", "products", map[string]string{

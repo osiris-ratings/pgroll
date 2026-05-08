@@ -53,7 +53,7 @@ func TestDropTable(t *testing.T) {
 				ViewMustNotExist(t, db, schema, "drop_table", "users")
 
 				// The underlying table has been soft-deleted (renamed).
-				TableMustExist(t, db, schema, migrations.DeletionName("", "users"))
+				TableMustExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("02_drop_table"), "users"))
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// Rollback is a no-op.
@@ -100,7 +100,7 @@ func TestDropTableInMultiOperationMigrations(t *testing.T) {
 				// OpDropTable drops tables on migration completion, so the table
 				// created by OpCreateTable is present after migration start but has
 				// been soft-deleted (renamed).
-				TableMustExist(t, db, schema, migrations.DeletionName("", "items"))
+				TableMustExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("01_multi_operation"), "items"))
 
 				// There is no view for the "items" table in the new schema
 				ViewMustNotExist(t, db, schema, "01_multi_operation", "items")
@@ -151,7 +151,7 @@ func TestDropTableInMultiOperationMigrations(t *testing.T) {
 				// OpDropTable drops tables on migration completion, so the table
 				// created by OpCreateTable is present after migration start but has
 				// been soft-deleted (renamed).
-				TableMustExist(t, db, schema, migrations.DeletionName("", "items"))
+				TableMustExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("01_multi_operation"), "items"))
 
 				// There is no view for the "items" table in the new schema
 				ViewMustNotExist(t, db, schema, "01_multi_operation", "items")
@@ -228,7 +228,7 @@ func TestDropTableInMultiOperationMigrations(t *testing.T) {
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// There are no tables, either original or soft-deleted
 				TableMustNotExist(t, db, schema, "items")
-				TableMustNotExist(t, db, schema, migrations.DeletionName("", "items"))
+				TableMustNotExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("01_multi_operation"), "items"))
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// Can insert into the items table, and it has a description column
@@ -309,7 +309,7 @@ func TestDropTableInMultiOperationMigrations(t *testing.T) {
 				})
 
 				// There is no soft-deleted version of thte items table
-				TableMustNotExist(t, db, schema, migrations.DeletionName("", "items"))
+				TableMustNotExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("02_multi_operation"), "items"))
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// Can insert into the items table, and it has a description column
