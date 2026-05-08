@@ -64,6 +64,74 @@ func TestOnCompleteSQLMigrationsAreNotIsolated(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestCompleteMustBeDeferred(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		ops    migrations.Operations
+		expect bool
+	}{
+		"add column is inline-safe": {
+			ops:    migrations.Operations{&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}}},
+			expect: false,
+		},
+		"alter column is inline-safe": {
+			ops:    migrations.Operations{&migrations.OpAlterColumn{Table: "t", Column: "c", Up: "c", Down: "c"}},
+			expect: false,
+		},
+		"create table is inline-safe": {
+			ops:    migrations.Operations{&migrations.OpCreateTable{Name: "t"}},
+			expect: false,
+		},
+		"raw SQL without OnComplete is inline-safe": {
+			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
+			expect: false,
+		},
+		"drop column needs deferral": {
+			ops:    migrations.Operations{&migrations.OpDropColumn{Table: "t", Column: "c"}},
+			expect: true,
+		},
+		"drop table needs deferral": {
+			ops:    migrations.Operations{&migrations.OpDropTable{Name: "t"}},
+			expect: true,
+		},
+		"rename column runs inline (Postgres rewires dependent views automatically)": {
+			ops:    migrations.Operations{&migrations.OpRenameColumn{Table: "t", From: "a", To: "b"}},
+			expect: false,
+		},
+		"rename table runs inline": {
+			ops:    migrations.Operations{&migrations.OpRenameTable{From: "a", To: "b"}},
+			expect: false,
+		},
+		"drop constraint runs inline (duplicator-pattern Start doesn't replay cleanly)": {
+			ops:    migrations.Operations{&migrations.OpDropConstraint{Name: "c", Table: "t", Up: "x", Down: "x"}},
+			expect: false,
+		},
+		"drop index runs inline": {
+			ops:    migrations.Operations{&migrations.OpDropIndex{Name: "idx"}},
+			expect: false,
+		},
+		"OnComplete raw SQL needs deferral": {
+			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "ALTER TABLE t DROP COLUMN c", OnComplete: true}},
+			expect: true,
+		},
+		"mixed additive + drop column needs deferral": {
+			ops: migrations.Operations{
+				&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}},
+				&migrations.OpDropColumn{Table: "t", Column: "old"},
+			},
+			expect: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &migrations.Migration{Name: "x", Operations: tc.ops}
+			assert.Equal(t, tc.expect, m.CompleteMustBeDeferred())
+		})
+	}
+}
+
 func TestCollectFilesFromDir(t *testing.T) {
 	t.Parallel()
 

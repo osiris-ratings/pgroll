@@ -115,18 +115,33 @@ func migrateCmd() *cobra.Command {
 			// schema. No apps will ever connect to an intermediate version, so
 			// projecting it would just waste a schema and create view
 			// dependencies that block destructive operations later in the
-			// batch. WithDeferComplete records each intermediate as logically
-			// done but queues its Complete operations for replay during the
-			// final migration's Complete — *after* the production-active
-			// version schema has been dropped. That's what lets a mid-batch
-			// destructive op (DROP COLUMN, RENAME COLUMN, drop-table) succeed
-			// even though its column is still projected by the production
-			// version's view at the time the migration is processed.
+			// batch.
+			//
+			// Pick the right Complete strategy per migration:
+			//
+			//   - WithDeferComplete for migrations whose Complete would be
+			//     blocked by the prev-prod version schema's views (DROP/
+			//     RENAME of user-facing identifiers, OnComplete=true raw
+			//     SQL). Their actions queue and replay at final Complete
+			//     after the prev-prod schema is dropped.
+			//   - WithSkipSchemaDrop for additive migrations (add column/
+			//     index/constraint, create table, alter column, regular
+			//     raw SQL). Their Completes touch only pgroll-internal
+			//     temp names and trigger machinery, which prev-prod views
+			//     don't reference — running inline is safer than deferring
+			//     because it avoids cross-migration interactions on shared
+			//     internal state (e.g. the per-table _pgroll_needs_backfill
+			//     marker column or temp column names colliding with the
+			//     next migration's Start).
 			for _, mig := range migs[:len(migs)-1] {
+				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
+				if mig.CompleteMustBeDeferred() {
+					completeOpt = AsCompleteOption(roll.WithDeferComplete())
+				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
 					AsStartOption(roll.WithoutVersionSchema()),
-					AsCompleteOption(roll.WithDeferComplete()),
+					completeOpt,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}

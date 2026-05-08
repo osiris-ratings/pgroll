@@ -115,6 +115,47 @@ func (m *Migration) Validate(ctx context.Context, s *schema.Schema) error {
 	return nil
 }
 
+// CompleteMustBeDeferred reports whether this migration's Complete actions
+// must be deferred to the final `pgroll complete` because (a) inline they'd
+// be blocked by views in the previous-production version schema, *and*
+// (b) deferring them produces a clean replay over subsequent migrations'
+// schema reads.
+//
+// The intersection is narrower than "all destructive ops":
+//
+//   - OpDropColumn, OpDropTable, OnComplete-true raw SQL: deferral works.
+//     Their Start-side schema mutations are pure (mark Deleted, soft-rename
+//     a table, no-op respectively) and replay cleanly — subsequent
+//     migrations see the schema state implied by the deferred Complete.
+//
+//   - OpRenameColumn, OpRenameTable, OpDropConstraint, OpAlterColumn,
+//     OpDropMultiColumnConstraint, OpDropIndex: deferral does *not* work
+//     yet. They mutate the in-memory schema during Start in ways that
+//     don't survive replay across migrations (duplicator-pattern stub
+//     entries lose column metadata; constraint lookups depend on state
+//     mutated by earlier deferred Starts that itself didn't survive).
+//     Run them inline with WithSkipSchemaDrop. Inline runs may fail when
+//     prev-prod's view references the affected column — same failure
+//     mode as before #18 — but that's a narrower problem than breaking
+//     every batch that contains an alter-column.
+//
+// The migrate command uses this to pick between WithDeferComplete (defer
+// to final Complete after prev-prod schema drops) and WithSkipSchemaDrop
+// (run inline, preserving prev-prod schema for in-flight apps).
+func (m *Migration) CompleteMustBeDeferred() bool {
+	for _, op := range m.Operations {
+		switch v := op.(type) {
+		case *OpDropColumn, *OpDropTable:
+			return true
+		case *OpRawSQL:
+			if v.OnComplete {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // UpdateVirtualSchema updates the in-memory schema representation with the changes
 // made by the migration. No changes are made to the physical database.
 func (m *Migration) UpdateVirtualSchema(ctx context.Context, s *schema.Schema) error {
