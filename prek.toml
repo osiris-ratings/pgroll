@@ -1,0 +1,39 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v5.0.0"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-yaml" },
+  { id = "check-added-large-files", args = ["--maxkb=500"] },
+  { id = "check-merge-conflict" },
+]
+
+[[repos]]
+repo = "https://github.com/golangci/golangci-lint"
+rev = "v2.11.4"
+hooks = [
+  { id = "golangci-lint" },
+]
+
+[[repos]]
+repo = "https://github.com/dnephin/pre-commit-golang"
+rev = "v0.5.1"
+hooks = [
+  { id = "go-build" },
+  { id = "go-mod-tidy" },
+]
+
+# Local hooks — delegate to task targets so the source of truth stays in Taskfile.yml.
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "task-format", name = "task format (gofumpt + prettier + pgformatter)", entry = "task format", language = "system", pass_filenames = false, files = "\\.(go|sql|json)$" },
+  { id = "task-generate-clean", name = "task generate produces no diff", entry = "bash -c 'task generate && git diff --quiet -- pkg/migrations/types.go cli-definition.json'", language = "system", pass_filenames = false, files = "^(schema\\.json|tools/build-cli-definition\\.go)$" },
+  { id = "task-ledger-clean", name = "task ledger produces no diff", entry = "bash -c 'task ledger && git diff --quiet -- examples/.ledger'", language = "system", pass_filenames = false, files = "^examples/" },
+  { id = "task-license", name = "task license (SPDX header on .go files)", entry = "bash -c 'task license && git diff --quiet'", language = "system", pass_filenames = false, files = "\\.go$" },
+]

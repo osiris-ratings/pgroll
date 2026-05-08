@@ -1,20 +1,90 @@
 version: '3'
 
 tasks:
+  install:
+    desc: Set up local dev environment (brew deps, Go modules, git hooks)
+    preconditions:
+      - sh: command -v brew
+        msg: "Homebrew is required. Install from https://brew.sh"
+    cmds:
+      - brew bundle
+      - go mod download
+      - prek install --overwrite
+      - echo "✓ dev environment ready"
+
   build:
     desc: Build the pgroll binary
     cmds:
       - go build -o ./bin/pgroll .
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - go clean
+      - rm -rf ./bin
 
   test:
     desc: Run tests with coverage
     cmds:
       - go test -cover ./...
 
+  bench:
+    desc: Run benchmarks
+    cmds:
+      - go test ./internal/benchmarks -v -benchtime=1x -bench .
+
   lint:
     desc: Run linter
     cmds:
       - golangci-lint run --config=.golangci.yml
+
+  format:
+    desc: Format JSON schema, embedded SQL, and Go sources
+    summary: |
+      Native counterpart of `make format`. Uses brew-installed prettier and
+      pg_format (from the pgformatter formula) instead of Docker, and
+      gofumpt for Go sources.
+    cmds:
+      - prettier schema.json --parser json --tab-width 2 --single-quote --trailing-comma all --no-semi --arrow-parens always --print-width 120 --write
+      - pg_format --inplace pkg/state/init.sql
+      - gofumpt -w .
+
+  generate:
+    desc: Regenerate types from schema.json and the CLI definition
+    summary: |
+      Mirrors `make generate`. Uses the omissis/go-jsonschema Docker image
+      (no Homebrew formula exists), then prepends the SPDX header and
+      regenerates cli-definition.json via `go run tools/build-cli-definition.go`.
+    cmds:
+      - docker run --rm -v $PWD/schema.json:/mnt/schema.json omissis/go-jsonschema:0.17.0 --only-models -p migrations --tags json /mnt/schema.json > pkg/migrations/types.go
+      - |
+        echo "// SPDX-License-Identifier: Apache-2.0" | cat - pkg/migrations/types.go > pkg/migrations/types.go.tmp
+        mv pkg/migrations/types.go.tmp pkg/migrations/types.go
+      - go run tools/build-cli-definition.go
+
+  ledger:
+    desc: Regenerate examples/.ledger
+    dir: examples
+    cmds:
+      - ls > .ledger
+
+  examples:
+    desc: Run all example migrations against a local Postgres
+    deps: [ledger]
+    cmds:
+      - go build
+      - ./pgroll init
+      - ./pgroll migrate examples --complete
+      - go clean
+
+  license:
+    desc: Apply the SPDX license header to all .go files
+    cmds:
+      - |
+        if [ ! -f ./bin/license-header-checker ]; then
+          curl -s https://raw.githubusercontent.com/lluissm/license-header-checker/master/install.sh | bash
+        fi
+      - ./bin/license-header-checker -a -r .github/license-header.txt . go
 
   release:
     desc: Create a new Baselayer release

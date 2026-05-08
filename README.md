@@ -192,6 +192,18 @@ We welcome contributions from the community! If you'd like to contribute to `pgr
 * Create an [issue](https://github.com/xataio/pgroll/issues) for any questions, bug reports, or feature requests.
 * Check the documentation and [existing issues](https://github.com/xataio/pgroll/issues) before opening a new issue.
 
+### Development setup
+
+Requires macOS or Linux with [Homebrew](https://brew.sh):
+
+```sh
+brew bundle           # installs go, go-task, gofumpt, golangci-lint, goreleaser, prek, ...
+task install          # go mod download + prek install
+task test
+```
+
+`task --list` shows every available development task.
+
 ### Contributing Code
 
 1. Fork the repository.
