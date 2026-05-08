@@ -115,16 +115,18 @@ func migrateCmd() *cobra.Command {
 			// schema. No apps will ever connect to an intermediate version, so
 			// projecting it would just waste a schema and create view
 			// dependencies that block destructive operations later in the
-			// batch. WithSkipSchemaDrop on Complete prevents the intermediate
-			// from dropping the production-active version schema. Net effect:
-			// at any point during the run, the only version schema that
-			// exists is the production-active one — until the final
-			// migration's Start creates the new target.
+			// batch. WithDeferComplete records each intermediate as logically
+			// done but queues its Complete operations for replay during the
+			// final migration's Complete — *after* the production-active
+			// version schema has been dropped. That's what lets a mid-batch
+			// destructive op (DROP COLUMN, RENAME COLUMN, drop-table) succeed
+			// even though its column is still projected by the production
+			// version's view at the time the migration is processed.
 			for _, mig := range migs[:len(migs)-1] {
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
 					AsStartOption(roll.WithoutVersionSchema()),
-					AsCompleteOption(roll.WithSkipSchemaDrop()),
+					AsCompleteOption(roll.WithDeferComplete()),
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}

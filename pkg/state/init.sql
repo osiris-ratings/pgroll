@@ -162,6 +162,13 @@ ALTER TABLE placeholder.migrations
     ALTER COLUMN created_at SET DATA TYPE timestamptz USING created_at AT TIME ZONE 'UTC',
     ALTER COLUMN updated_at SET DATA TYPE timestamptz USING updated_at AT TIME ZONE 'UTC';
 
+-- Mark a migration as logically done while its Complete operations are
+-- queued for replay during the next non-deferred Complete. Used by
+-- `pgroll migrate` intermediates so destructive DDL runs after the
+-- previous-production version schema has been dropped.
+ALTER TABLE placeholder.migrations
+    ADD COLUMN IF NOT EXISTS complete_deferred boolean NOT NULL DEFAULT FALSE;
+
 -- Table to track pgroll binary version
 CREATE TABLE IF NOT EXISTS placeholder.pgroll_version (
     version text NOT NULL,
