@@ -477,10 +477,35 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 		if len(queued) > 0 {
 			m.logger.Info("draining deferred completes", "count", len(queued))
-		}
-		for _, dm := range queued {
-			if err := m.drainDeferredMigration(ctx, dm); err != nil {
-				return err
+
+			// Drop the active migration's version schema (and its views)
+			// before drain runs. Drain DDL frequently drops/renames
+			// user-facing columns the active version schema's views
+			// project; pg_depend records those view→column edges as
+			// deptype=n (normal), which DROP COLUMN refuses to cascade
+			// without an explicit CASCADE. Dropping the version schema
+			// up front lets each drain action proceed against the bare
+			// table; we recreate the version schema at the end of
+			// Complete from the post-drain physical state.
+			//
+			// Apps connected to the active version schema would observe
+			// a brief outage, but at this point in the lifecycle the
+			// previous-production schema (V0) has already been reaped,
+			// so apps are in a transition window already. Recreating
+			// from post-drain state immediately restores the projection.
+			if !m.disableVersionSchemas {
+				versionSchema := VersionedSchemaName(m.schema, migration.VersionSchemaName())
+				_, err := m.pgConn.ExecContext(ctx,
+					fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
+				if err != nil {
+					return fmt.Errorf("unable to drop active version schema before drain: %w", err)
+				}
+			}
+
+			for _, dm := range queued {
+				if err := m.drainDeferredMigration(ctx, dm); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -527,12 +552,13 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
 	}
 
-	// Recreate views for the new version (if some operations require it, ie
-	// SQL). Skipped under WithSkipSchemaDrop because that flag signals an
-	// intermediate migration in a `pgroll migrate` batch — those don't
-	// project a version schema in Start, and shouldn't materialize one
-	// here in Complete either.
-	if refreshViews && !o.skipSchemaDrop && !m.disableVersionSchemas {
+	// Recreate the active migration's version schema. Always when
+	// !skipSchemaDrop, because the drain may have dropped it (above) to
+	// unblock destructive DDL, OR the active migration's ops may have
+	// included raw SQL that requires a refresh. The ensureViews call
+	// rebuilds the version schema and its views over the post-drain
+	// physical state, restoring the projection apps deploy against.
+	if !o.skipSchemaDrop && !m.disableVersionSchemas {
 		currentSchema, err = m.state.ReadSchema(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)
@@ -542,6 +568,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		if err != nil {
 			return err
 		}
+		// Suppress unused-var warning if refreshViews ends up unused in
+		// some build paths.
+		_ = refreshViews
 	}
 
 	// mark as completed
@@ -718,27 +747,30 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 
 // drainDeferredMigration runs a single deferred migration's Complete
 // actions through its own Coordinator and clears the complete_deferred
-// flag on success. The schema passed to `op.Complete` reflects:
-//   - prior drained migrations' physical effects (they already executed),
-//   - other still-deferred migrations' Start mutations (replayed in-memory
-//     so OpDropConstraint can find constraints, etc.),
-//   - explicitly *not* this migration's own Start mutations.
+// flag on success. Uses raw physical schema state — no deferred-replay.
 //
-// The exclusion of this migration's own Start is load-bearing for
-// duplicator-pattern Completes: OpDropConstraint.Complete uses
-// `column.Name` to derive the source column it needs to drop. With this
-// migration's Start replayed, `column.Name` would be the per-migration
-// temp name the Start installed (e.g. `_pgroll_new_review_<thisScope>`),
-// which is *this migration's own duplicate column*, not the source. We
-// want the user-facing column name as it stands after prior drains —
-// that's the source to drop.
+// With iterative drain, prior deferred migrations have *physically*
+// applied their Completes by the time this migration's Complete is
+// constructed, so reading the physical schema captures their effects
+// directly. We deliberately don't replay later still-deferred
+// migrations' Starts: those replays would clobber the schema this
+// migration's `op.Complete` reads from (e.g. a later migration's
+// AddColumn replay overwrites Columns[X].Name to the later migration's
+// temp, hiding the user-facing physical name this Complete needs to
+// drop).
+//
+// We also don't replay this migration's own Start: same reason —
+// duplicator-pattern Completes resolve `column.Name` to derive the
+// source column to drop, and the own-Start replay would install this
+// migration's *own* temp name there, pointing the action at the wrong
+// column.
 //
 // Sets the per-migration scope on the schema so naming helpers in
 // `op.Complete` produce identifiers that match what's physically present
 // (the temp/trigger/marker names installed by the same migration's
 // earlier Start).
 func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migration) error {
-	drainSchema, err := m.readSchemaWithDeferredExcluding(ctx, dm.Name)
+	drainSchema, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
 	}

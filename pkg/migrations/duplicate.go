@@ -286,12 +286,53 @@ func (d *duplicatorStmtBuilder) duplicateIndexes(withoutConstraint []string, col
 	return stmts
 }
 
+// columnIsDuplicated reports whether a constraint's column reference is among
+// the columns this duplicator will copy onto a new temp column.
+//
+// The matching rules cover three schema-shape cases:
+//
+//  1. Fresh-from-pg_catalog: constraint Columns[] and column.Name are both the
+//     user-facing key. duplicatedColumns also contains the user-facing key.
+//     Direct match.
+//
+//  2. Cross-migration deferred batch: an earlier deferred migration's Start
+//     rewrote in-memory `column.Name` to its own temp (e.g.
+//     `_pgroll_new_review_<v15Scope>`). The constraint's Columns[] still
+//     references the user-facing key. duplicatedColumns contains the prior
+//     migration's temp. We need to duplicate — when the prior migration drains
+//     it'll rename its temp back to the user-facing column, then this
+//     migration's drain drops that column (taking the constraint with it),
+//     so we must build our own copy on the new temp now.
+//
+//  3. Same-migration multi-sub-op: an earlier sub-op of the *same*
+//     OpAlterColumn already created the constraint physically on
+//     `_pgroll_new_<col>_<thisScope>`. column.Name is also `_pgroll_new_<col>_<thisScope>`.
+//     The constraint already lives where this duplicator wants it — duplicating
+//     would create a redundant copy that conflicts at rename time. Skip.
+//
+// The skip-rule is: if the column resolves to *this* scope's temp name, the
+// constraint is already in the target slot. Any other resolved physical name
+// (user-facing or another scope's temp) means duplicate.
+func (d *duplicatorStmtBuilder) columnIsDuplicated(column string, duplicatedColumns []string) bool {
+	if slices.Contains(duplicatedColumns, column) {
+		return true
+	}
+	c := d.table.GetColumn(column)
+	if c == nil {
+		return false
+	}
+	if c.Name == temporaryNameRebase(d.scope, column) {
+		return false
+	}
+	return slices.Contains(duplicatedColumns, c.Name)
+}
+
 // duplicatedConstraintColumns returns a new slice of constraint columns with
 // the columns that are duplicated replaced with temporary names.
 func (d *duplicatorStmtBuilder) duplicatedConstraintColumns(constraintColumns []string, duplicatedColumns ...string) []string {
 	newConstraintColumns := make([]string, 0)
 	for _, column := range constraintColumns {
-		if slices.Contains(duplicatedColumns, column) {
+		if d.columnIsDuplicated(column, duplicatedColumns) {
 			newConstraintColumns = append(newConstraintColumns, column)
 		}
 	}
@@ -305,7 +346,7 @@ func (d *duplicatorStmtBuilder) allConstraintColumns(constraintColumns []string,
 	duplicatedMember := false
 	newConstraintColumns := make([]string, len(constraintColumns))
 	for i, column := range constraintColumns {
-		if slices.Contains(duplicatedColumns, column) {
+		if d.columnIsDuplicated(column, duplicatedColumns) {
 			newConstraintColumns[i] = temporaryNameRebase(d.scope, column)
 			duplicatedMember = true
 		} else {

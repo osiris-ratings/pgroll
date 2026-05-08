@@ -293,27 +293,23 @@ func (s *State) MarkCompleteDeferred(ctx context.Context, schema, name string) e
 }
 
 // DeferredCompletes returns the migrations whose Complete operations are
-// queued for replay, in parent-chain order (oldest first). The chain is
-// reconstructed via a recursive CTE that walks forward from the
-// non-deferred root through each contiguous deferred segment.
+// queued for replay, in the order they were applied (which equals
+// parent-chain order across all chains).
+//
+// We sort by created_at because pgroll.migrations rows are inserted
+// in-order as each migration's Start runs, so created_at is monotonic
+// along the parent chain. A naïve recursive-CTE walk that walks each
+// disjoint chain separately and orders by depth would interleave
+// chain-roots with chain-children incorrectly: when a deferred chain has
+// a non-deferred migration in the middle, both segments form separate
+// roots and depth=0 of all roots comes before depth=1 of any root —
+// leaving a later chain-root drained before an earlier chain's children.
+// Order by created_at sidesteps the multiple-chain shape entirely.
 func (s *State) DeferredCompletes(ctx context.Context, schema string) ([]*migrations.Migration, error) {
 	q := fmt.Sprintf(`
-		WITH RECURSIVE chain AS (
-			SELECT m.name, m.parent, m.migration, 0 AS depth
-			FROM %[1]s.migrations m
-			WHERE m.schema = $1
-			  AND m.complete_deferred = TRUE
-			  AND (m.parent IS NULL OR NOT EXISTS (
-				SELECT 1 FROM %[1]s.migrations p
-				WHERE p.schema = $1 AND p.name = m.parent AND p.complete_deferred = TRUE
-			  ))
-			UNION ALL
-			SELECT m.name, m.parent, m.migration, c.depth + 1
-			FROM %[1]s.migrations m
-			JOIN chain c ON m.parent = c.name AND m.schema = $1
-			WHERE m.complete_deferred = TRUE
-		)
-		SELECT name, migration FROM chain ORDER BY depth ASC
+		SELECT name, migration FROM %[1]s.migrations
+		WHERE schema = $1 AND complete_deferred = TRUE
+		ORDER BY created_at ASC
 	`, pq.QuoteIdentifier(s.schema))
 
 	rows, err := s.pgConn.QueryContext(ctx, q, schema)
