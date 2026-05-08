@@ -35,6 +35,22 @@ func (o *OpSetUnique) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 	dbActions := []DBAction{
 		NewCreateUniqueIndexConcurrentlyAction(conn, s.Name, o.Name, table.Name, column.Name),
 	}
+
+	// Register the constraint in the in-memory schema so a subsequent
+	// migration in a deferred batch (where this migration's Complete
+	// hasn't physically created the constraint yet) can still find it via
+	// readSchemaWithDeferred replay. The action above creates the index
+	// physically; the constraint-from-index conversion is in Complete and
+	// won't run mid-batch — but downstream Validate steps need to see the
+	// constraint as if it existed.
+	if table.UniqueConstraints == nil {
+		table.UniqueConstraints = make(map[string]*schema.UniqueConstraint)
+	}
+	table.UniqueConstraints[o.Name] = &schema.UniqueConstraint{
+		Name:    o.Name,
+		Columns: []string{o.Column},
+	}
+
 	return &StartResult{Actions: dbActions, BackfillTask: backfill.NewTask(table)}, nil
 }
 

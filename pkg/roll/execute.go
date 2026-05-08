@@ -447,7 +447,15 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 		for _, dm := range queued {
 			drainedMigrations = append(drainedMigrations, dm.Name)
-			drainSchema, err := m.state.ReadSchema(ctx, m.schema)
+			// Use the deferred-aware schema read so op.Complete can find
+			// constraints, indexes, and column metadata installed by
+			// *this* migration's Start (which haven't physically applied
+			// yet because Complete is what we're collecting now). E.g.
+			// OpDropConstraint.Complete looks up the constraint via
+			// table.GetConstraintColumns — that's only populated when the
+			// originating migration's Start mutated the in-memory schema,
+			// which the replay does.
+			drainSchema, err := m.readSchemaWithDeferred(ctx)
 			if err != nil {
 				return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
 			}
