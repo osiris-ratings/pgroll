@@ -79,11 +79,11 @@ func TestDropColumnWithDownSQL(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("users", "name")
+				triggerFnName := backfill.TriggerFunctionName("", "users", "name")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("users", "name")
+				triggerName := backfill.TriggerName("", "users", "name")
 				TriggerMustNotExist(t, db, schema, "users", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -91,11 +91,11 @@ func TestDropColumnWithDownSQL(t *testing.T) {
 				ColumnMustNotExist(t, db, schema, "users", "name")
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("users", "name")
+				triggerFnName := backfill.TriggerFunctionName("", "users", "name")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("users", "name")
+				triggerName := backfill.TriggerName("", "users", "name")
 				TriggerMustNotExist(t, db, schema, "users", triggerName)
 
 				// Inserting into the view in the new version schema should succeed.
@@ -355,7 +355,7 @@ func TestDropColumnInMultiOperationMigrations(t *testing.T) {
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// OpDropColumn drops columns on completion, so the column is still
 				// present after start, under its temporary name.
-				ColumnMustExist(t, db, schema, "items", migrations.TemporaryName("description"))
+				ColumnMustExist(t, db, schema, "items", migrations.TemporaryName(migrations.MigrationScopeFor("02_multi_operation"), "description"))
 
 				// Can't insert into the dropped column when accessing through the new schema
 				MustNotInsert(t, db, schema, "02_multi_operation", "items", map[string]string{

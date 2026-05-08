@@ -4,6 +4,8 @@ package migrations
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,16 +60,52 @@ var AllNonDeprecatedOperations = []string{
 const (
 	temporaryPrefix = "_pgroll_new_"
 	deletedPrefix   = "_pgroll_del_"
+
+	// MigrationScopeLength is the byte length of the migration-scope suffix
+	// appended to pgroll-internal identifiers. 8 hex chars = 32 bits of
+	// entropy from the migration name's SHA-256 — enough to make collisions
+	// vanishingly unlikely across the migrations in a single batch, while
+	// keeping identifier length comfortably under Postgres' 63-byte cap.
+	MigrationScopeLength = 8
 )
 
-// TemporaryName returns a temporary name for a given name.
-func TemporaryName(name string) string {
-	return temporaryPrefix + name
+// MigrationScopeFor derives the per-migration scope suffix used by naming
+// helpers (TemporaryName, TriggerFunctionName, etc.) from the migration's
+// name. Empty input yields an empty scope, which means "no suffix" — used
+// by call sites that need legacy unscoped names (rare, mostly tests).
+func MigrationScopeFor(migrationName string) string {
+	if migrationName == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(migrationName))
+	return hex.EncodeToString(h[:])[:MigrationScopeLength]
 }
 
-// DeletionName returns the deleted name for a given name.
-func DeletionName(name string) string {
-	return deletedPrefix + name
+// scopeSuffix produces the `_<scope>` tail appended to internal identifiers
+// when scope is non-empty. Centralized so every helper formats consistently
+// and empty scope produces no trailing underscore (preserves legacy names).
+func scopeSuffix(scope string) string {
+	if scope == "" {
+		return ""
+	}
+	return "_" + scope
+}
+
+// TemporaryName returns the per-migration physical name of a column being
+// added or duplicated by an in-flight migration. The scope suffix prevents
+// two concurrently-deferred migrations operating on the same user-facing
+// column from colliding on the underlying physical column name.
+func TemporaryName(scope, name string) string {
+	return temporaryPrefix + name + scopeSuffix(scope)
+}
+
+// DeletionName returns the per-migration soft-deleted physical name of a
+// table or column. OpDropTable.Start renames the physical table to this
+// name so the user-facing name is free for a subsequent CreateTable in the
+// same batch; the scope suffix keeps multiple in-flight drops from
+// collapsing onto the same `_pgroll_del_<name>` slot.
+func DeletionName(scope, name string) string {
+	return deletedPrefix + name + scopeSuffix(scope)
 }
 
 // CollectFilesFromDir returns a list of migration files in a directory.

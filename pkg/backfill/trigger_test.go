@@ -30,7 +30,7 @@ func TestBuildFunction(t *testing.T) {
 				LatestSchema:        "public_01_migration_name",
 				TableName:           "reviews",
 				PhysicalColumn:      "_pgroll_new_review",
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: NeedsBackfillColumnName(""),
 				SQL:                 []string{"product || 'is good'"},
 			},
 			expected: `CREATE OR REPLACE FUNCTION "triggerName"()
@@ -73,7 +73,7 @@ func TestBuildFunction(t *testing.T) {
 				LatestSchema:        "public_01_migration_name",
 				TableName:           "reviews",
 				PhysicalColumn:      "_pgroll_new_review",
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: NeedsBackfillColumnName(""),
 				SQL: []string{
 					"product || 'is good'",
 					"CASE WHEN NEW.\"_pgroll_new_review\" = 'bad' THEN 'bad review' ELSE 'good review' END",
@@ -120,7 +120,7 @@ func TestBuildFunction(t *testing.T) {
 				LatestSchema:        "public_01_migration_name",
 				TableName:           "reviews",
 				PhysicalColumn:      "review",
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: NeedsBackfillColumnName(""),
 				SQL:                 []string{`NEW."_pgroll_new_review"`},
 			},
 			expected: `CREATE OR REPLACE FUNCTION "triggerName"()
@@ -164,7 +164,7 @@ func TestBuildFunction(t *testing.T) {
 				LatestSchema:        "public_01_migration_name",
 				TableName:           "reviews",
 				PhysicalColumn:      "rating",
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: NeedsBackfillColumnName(""),
 				SQL:                 []string{`CAST(rating as text)`},
 			},
 			expected: `CREATE OR REPLACE FUNCTION "triggerName"()

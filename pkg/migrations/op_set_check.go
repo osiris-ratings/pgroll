@@ -33,6 +33,7 @@ func (o *OpSetCheckConstraint) Start(ctx context.Context, l Logger, conn db.DB, 
 	dbActions := []DBAction{
 		NewCreateCheckConstraintAction(
 			conn,
+			s.MigrationScope,
 			table.Name,
 			o.Check.Name,
 			o.Check.Constraint,
@@ -40,6 +41,21 @@ func (o *OpSetCheckConstraint) Start(ctx context.Context, l Logger, conn db.DB, 
 			o.Check.NoInherit,
 			skipValidate,
 		),
+	}
+
+	// Register the constraint in the in-memory schema so a subsequent
+	// migration in a deferred batch can find it via readSchemaWithDeferred
+	// replay. Without this, replay leaves the constraint absent until its
+	// originating migration's Complete physically applied — which it
+	// hasn't because Complete is what we're replaying for.
+	if table.CheckConstraints == nil {
+		table.CheckConstraints = make(map[string]*schema.CheckConstraint)
+	}
+	table.CheckConstraints[o.Check.Name] = &schema.CheckConstraint{
+		Name:       o.Check.Name,
+		Columns:    []string{o.Column},
+		Definition: o.Check.Constraint,
+		NoInherit:  o.Check.NoInherit,
 	}
 
 	return &StartResult{Actions: dbActions, BackfillTask: backfill.NewTask(table)}, nil

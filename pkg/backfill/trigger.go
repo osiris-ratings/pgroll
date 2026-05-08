@@ -33,6 +33,9 @@ type triggerConfig struct {
 	LatestSchema        string
 	SQL                 []string
 	NeedsBackfillColumn string
+	// MigrationScope is the per-migration suffix used when naming the
+	// marker column. Empty scope produces the legacy unscoped marker.
+	MigrationScope string
 }
 
 type OperationTrigger struct {
@@ -57,7 +60,7 @@ func (a *createTriggerAction) execute(ctx context.Context) error {
 		}
 	}
 
-	a.cfg.NeedsBackfillColumn = CNeedsBackfillColumn
+	a.cfg.NeedsBackfillColumn = NeedsBackfillColumnName(a.cfg.MigrationScope)
 
 	funcSQL, err := buildFunction(a.cfg)
 	if err != nil {
@@ -73,7 +76,7 @@ func (a *createTriggerAction) execute(ctx context.Context) error {
 		_, err := a.conn.ExecContext(ctx,
 			fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s boolean DEFAULT true",
 				pq.QuoteIdentifier(a.cfg.TableName),
-				pq.QuoteIdentifier(CNeedsBackfillColumn)))
+				pq.QuoteIdentifier(a.cfg.NeedsBackfillColumn)))
 		if err != nil {
 			return err
 		}
@@ -113,13 +116,22 @@ func executeTemplate(name, content string, cfg triggerConfig) (string, error) {
 	return buf.String(), nil
 }
 
-// TriggerFunctionName returns the name of the trigger function
-// for a given table and column.
-func TriggerFunctionName(tableName, columnName string) string {
-	return "_pgroll_trigger_" + tableName + "_" + columnName
+// TriggerFunctionName returns the per-migration name of the trigger
+// function for a given table and column. The scope suffix prevents two
+// concurrently-deferred migrations operating on the same (table, col)
+// from clobbering each other's trigger functions, which is what would
+// happen with the legacy unscoped name.
+func TriggerFunctionName(scope, tableName, columnName string) string {
+	base := "_pgroll_trigger_" + tableName + "_" + columnName
+	if scope == "" {
+		return base
+	}
+	return base + "_" + scope
 }
 
-// TriggerName returns the name of the trigger for a given table and column.
-func TriggerName(tableName, columnName string) string {
-	return TriggerFunctionName(tableName, columnName)
+// TriggerName returns the per-migration name of the trigger for a given
+// table and column. Mirrors TriggerFunctionName so the trigger and its
+// underlying function share an identifier shape.
+func TriggerName(scope, tableName, columnName string) string {
+	return TriggerFunctionName(scope, tableName, columnName)
 }

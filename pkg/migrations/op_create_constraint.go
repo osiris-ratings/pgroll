@@ -17,6 +17,7 @@ var (
 
 func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -32,9 +33,9 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 	}
 
 	// Duplicate each column using its final name after migration completion
-	d := NewColumnDuplicator(conn, table, columns...)
+	d := NewColumnDuplicator(conn, scope, table, columns...)
 	for _, colName := range o.Columns {
-		d = d.WithName(table.GetColumn(colName).Name, TemporaryName(colName))
+		d = d.WithName(table.GetColumn(colName).Name, TemporaryName(scope, colName))
 	}
 	dbActions := []DBAction{d}
 
@@ -52,11 +53,11 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 		triggers = append(
 			triggers,
 			backfill.OperationTrigger{
-				Name:           backfill.TriggerName(o.Table, colName),
+				Name:           backfill.TriggerName(scope, o.Table, colName),
 				Direction:      backfill.TriggerDirectionUp,
 				Columns:        upColumns,
 				TableName:      table.Name,
-				PhysicalColumn: TemporaryName(colName),
+				PhysicalColumn: TemporaryName(scope, colName),
 				SQL:            upSQL,
 			},
 		)
@@ -64,17 +65,20 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 		// Add the new column to the internal schema representation. This is done
 		// here, before creation of the down trigger, so that the trigger can declare
 		// a variable for the new column. Save the old column name for use as the
-		// physical column name in the down trigger first.
-		oldPhysicalColumn := table.GetColumn(colName).Name
-		table.AddColumn(colName, &schema.Column{
-			Name: TemporaryName(colName),
-		})
+		// physical column name in the down trigger first. Preserve column
+		// metadata so replays across deferred migrations don't strip fields
+		// downstream Validate steps depend on.
+		oldCol := table.GetColumn(colName)
+		oldPhysicalColumn := oldCol.Name
+		newCol := *oldCol
+		newCol.Name = TemporaryName(scope, colName)
+		table.AddColumn(colName, &newCol)
 
 		downSQL := o.Down[colName]
 		triggers = append(
 			triggers,
 			backfill.OperationTrigger{
-				Name:           backfill.TriggerName(o.Table, TemporaryName(colName)),
+				Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, colName)),
 				Direction:      backfill.TriggerDirectionDown,
 				Columns:        table.Columns,
 				TableName:      table.Name,
@@ -90,21 +94,21 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 	case OpCreateConstraintTypeUnique, OpCreateConstraintTypePrimaryKey:
 		dbActions = append(
 			dbActions,
-			NewCreateUniqueIndexConcurrentlyAction(conn, s.Name, o.Name, table.Name, temporaryNames(o.Columns)...),
+			NewCreateUniqueIndexConcurrentlyAction(conn, s.Name, o.Name, table.Name, temporaryNames(scope, o.Columns)...),
 		)
 		return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 
 	case OpCreateConstraintTypeCheck:
 		dbActions = append(
 			dbActions,
-			NewCreateCheckConstraintAction(conn, table.Name, o.Name, *o.Check, o.Columns, o.NoInherit, true),
+			NewCreateCheckConstraintAction(conn, scope, table.Name, o.Name, *o.Check, o.Columns, o.NoInherit, true),
 		)
 		return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 
 	case OpCreateConstraintTypeForeignKey:
 		dbActions = append(
 			dbActions,
-			NewCreateFKConstraintAction(conn, table.Name, o.Name, temporaryNames(o.Columns), o.References, false, false, true),
+			NewCreateFKConstraintAction(conn, table.Name, o.Name, temporaryNames(scope, o.Columns), o.References, false, false, true),
 		)
 		return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 	}
@@ -114,6 +118,7 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 
 func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	dbActions := make([]DBAction, 0)
 	switch o.Type {
@@ -156,7 +161,7 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 	}
 
 	for _, col := range o.Columns {
-		dbActions = append(dbActions, NewAlterSequenceOwnerAction(conn, o.Table, col, TemporaryName(col)))
+		dbActions = append(dbActions, NewAlterSequenceOwnerAction(conn, o.Table, col, TemporaryName(scope, col)))
 	}
 
 	dbActions = append(dbActions, NewDropColumnAction(conn, o.Table, o.Columns...))
@@ -172,12 +177,12 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 		if column == nil {
 			return nil, ColumnDoesNotExistError{Table: o.Table, Name: col}
 		}
-		dbActions = append(dbActions, NewRenameDuplicatedColumnAction(conn, table, col))
+		dbActions = append(dbActions, NewRenameDuplicatedColumnAction(conn, scope, table, col))
 	}
 	dbActions = append(
 		dbActions,
-		o.removeTriggers(conn),
-		NewDropColumnAction(conn, o.Table, backfill.CNeedsBackfillColumn),
+		o.removeTriggers(conn, scope),
+		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
 	)
 
 	return dbActions, nil
@@ -185,6 +190,7 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 
 func (o *OpCreateConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -192,17 +198,17 @@ func (o *OpCreateConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([
 	}
 
 	return []DBAction{
-		NewDropColumnAction(conn, table.Name, temporaryNames(o.Columns)...),
-		o.removeTriggers(conn),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+		NewDropColumnAction(conn, table.Name, temporaryNames(scope, o.Columns)...),
+		o.removeTriggers(conn, scope),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 
-func (o *OpCreateConstraint) removeTriggers(conn db.DB) DBAction {
+func (o *OpCreateConstraint) removeTriggers(conn db.DB, scope string) DBAction {
 	dropFuncs := make([]string, 0, len(o.Columns)*2)
 	for _, column := range o.Columns {
-		dropFuncs = append(dropFuncs, backfill.TriggerFunctionName(o.Table, column))
-		dropFuncs = append(dropFuncs, backfill.TriggerFunctionName(o.Table, TemporaryName(column)))
+		dropFuncs = append(dropFuncs, backfill.TriggerFunctionName(scope, o.Table, column))
+		dropFuncs = append(dropFuncs, backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, column)))
 	}
 	return NewDropFunctionAction(conn, dropFuncs...)
 }
@@ -275,10 +281,10 @@ func (o *OpCreateConstraint) Validate(ctx context.Context, s *schema.Schema) err
 	return nil
 }
 
-func temporaryNames(columns []string) []string {
+func temporaryNames(scope string, columns []string) []string {
 	names := make([]string, len(columns))
 	for i, col := range columns {
-		names[i] = TemporaryName(col)
+		names[i] = TemporaryName(scope, col)
 	}
 	return names
 }

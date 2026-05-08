@@ -61,6 +61,22 @@ func (o *OpSetForeignKey) Start(ctx context.Context, l Logger, conn db.DB, s *sc
 		),
 	}
 
+	// Register the foreign key in the in-memory schema so a subsequent
+	// migration in a deferred batch (e.g. an OpDropConstraint targeting
+	// this same FK name) can find it via readSchemaWithDeferred replay.
+	if table.ForeignKeys == nil {
+		table.ForeignKeys = make(map[string]*schema.ForeignKey)
+	}
+	table.ForeignKeys[o.References.Name] = &schema.ForeignKey{
+		Name:              o.References.Name,
+		Columns:           []string{o.Column},
+		ReferencedTable:   o.References.Table,
+		ReferencedColumns: []string{o.References.Column},
+		MatchType:         string(o.References.MatchType),
+		OnDelete:          string(o.References.OnDelete),
+		OnUpdate:          string(o.References.OnUpdate),
+	}
+
 	return &StartResult{Actions: dbActions, BackfillTask: backfill.NewTask(table)}, nil
 }
 

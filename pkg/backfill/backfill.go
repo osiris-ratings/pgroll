@@ -16,9 +16,23 @@ import (
 	"github.com/xataio/pgroll/pkg/schema"
 )
 
-// CNeedsBackfillColumn is the name of the internal column created
-// by pgroll to mark rows that must be backfilled
-const CNeedsBackfillColumn = "_pgroll_needs_backfill"
+// needsBackfillColumnPrefix is the user-invisible prefix on the marker
+// column pgroll adds to a table while a migration with backfill is in
+// flight. The full column name is produced by NeedsBackfillColumnName,
+// which appends the migration's scope so concurrently-deferred
+// intermediates don't collapse onto the same shared column.
+const needsBackfillColumnPrefix = "_pgroll_needs_backfill"
+
+// NeedsBackfillColumnName returns the per-migration physical name of the
+// marker column. Empty scope yields the legacy unscoped name (used by
+// callers that haven't been threaded yet; should be eliminated as the
+// refactor lands everywhere).
+func NeedsBackfillColumnName(scope string) string {
+	if scope == "" {
+		return needsBackfillColumnPrefix
+	}
+	return needsBackfillColumnPrefix + "_" + scope
+}
 
 // Task represents a backfill task for a specific table from an operation.
 type Task struct {
@@ -28,15 +42,17 @@ type Task struct {
 
 // Job is a collection of all tables that need to be backfilled and their associated triggers.
 type Job struct {
-	schemaName   string
-	latestSchema string
-	triggers     map[string]triggerConfig
+	schemaName     string
+	latestSchema   string
+	migrationScope string
+	triggers       map[string]triggerConfig
 
 	Tables []*schema.Table
 }
 
 type Backfill struct {
-	conn db.DB
+	conn  db.DB
+	scope string // migration scope used to derive the per-migration backfill marker column name
 	*Config
 }
 
@@ -49,18 +65,24 @@ func NewTask(table *schema.Table, triggers ...OperationTrigger) *Task {
 	}
 }
 
-func NewJob(schemaName, latestSchema string) *Job {
+func NewJob(schemaName, latestSchema, migrationScope string) *Job {
 	return &Job{
-		schemaName:   schemaName,
-		latestSchema: latestSchema,
-		triggers:     make(map[string]triggerConfig, 0),
-		Tables:       make([]*schema.Table, 0),
+		schemaName:     schemaName,
+		latestSchema:   latestSchema,
+		migrationScope: migrationScope,
+		triggers:       make(map[string]triggerConfig, 0),
+		Tables:         make([]*schema.Table, 0),
 	}
 }
 
 func (t *Task) AddTriggers(other *Task) {
 	t.triggers = append(t.triggers, other.triggers...)
 }
+
+// MigrationScope returns the per-migration suffix used by this Job for
+// pgroll-internal artifact names (the `_pgroll_needs_backfill_<scope>`
+// marker, trigger function names, etc.).
+func (j *Job) MigrationScope() string { return j.migrationScope }
 
 func (j *Job) AddTask(t *Task) {
 	if t.table != nil {
@@ -92,7 +114,8 @@ func (j *Job) AddTask(t *Task) {
 				PhysicalColumn:      trigger.PhysicalColumn,
 				LatestSchema:        j.latestSchema,
 				SQL:                 []string{trigger.SQL},
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: NeedsBackfillColumnName(j.migrationScope),
+				MigrationScope:      j.migrationScope,
 			}
 		}
 	}
@@ -118,11 +141,14 @@ func findColumnName(columns map[string]*schema.Column, columnName string) string
 	return columnName
 }
 
-// New creates a new backfill operation with the given options. The backfill is
-// not started until `Start` is invoked.
-func New(conn db.DB, c *Config) *Backfill {
+// New creates a new backfill operation with the given options. The
+// migration scope is used to derive the per-migration name of the
+// `_pgroll_needs_backfill_<scope>` marker column queried by the batcher.
+// The backfill is not started until `Start` is invoked.
+func New(conn db.DB, c *Config, scope string) *Backfill {
 	b := &Backfill{
 		conn:   conn,
+		scope:  scope,
 		Config: c,
 	}
 
@@ -150,6 +176,7 @@ func (bf *Backfill) CreateTriggers(ctx context.Context, j *Job) error {
 // 3. Update each row in the batch, setting the value of the primary key column to itself.
 // 4. Repeat steps 2 and 3 until no more rows are returned.
 func (bf *Backfill) Start(ctx context.Context, table *schema.Table) error {
+	markerCol := NeedsBackfillColumnName(bf.scope)
 	// Create a batcher for the table.
 	var b batcher
 	if identityColumns := getIdentityColumns(table); identityColumns != nil {
@@ -158,14 +185,14 @@ func (bf *Backfill) Start(ctx context.Context, table *schema.Table) error {
 				TableName:           table.Name,
 				PrimaryKey:          identityColumns,
 				BatchSize:           bf.batchSize,
-				NeedsBackfillColumn: CNeedsBackfillColumn,
+				NeedsBackfillColumn: markerCol,
 			},
 		}
 	} else {
 		b = &needsBackfillColumnBatcher{
 			table:               table.Name,
 			batchSize:           bf.batchSize,
-			needsBackfillColumn: CNeedsBackfillColumn,
+			needsBackfillColumn: markerCol,
 		}
 	}
 

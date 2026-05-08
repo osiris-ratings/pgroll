@@ -30,7 +30,7 @@ func (o *OpSetComment) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 	}
 
 	dbActions := []DBAction{
-		NewCommentColumnAction(conn, o.Table, TemporaryName(o.Column), o.Comment),
+		NewCommentColumnAction(conn, o.Table, TemporaryName(s.MigrationScope, o.Column), o.Comment),
 	}
 
 	return &StartResult{Actions: dbActions, BackfillTask: backfill.NewTask(tbl)}, nil

@@ -133,14 +133,14 @@ func TestAlterColumnMultipleSubOperations(t *testing.T) {
 				}, rows)
 
 				// The type of the new column in the underlying table should be `text`
-				ColumnMustHaveType(t, db, schema, "events", migrations.TemporaryName("name"), "text")
+				ColumnMustHaveType(t, db, schema, "events", migrations.TemporaryName(migrations.MigrationScopeFor("02_alter_column"), "name"), "text")
 
 				// The new column should have the new comment.
-				ColumnMustHaveComment(t, db, schema, "events", migrations.TemporaryName("name"), "the name of the event")
+				ColumnMustHaveComment(t, db, schema, "events", migrations.TemporaryName(migrations.MigrationScopeFor("02_alter_column"), "name"), "the name of the event")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) column should not exist on the underlying table.
-				ColumnMustNotExist(t, db, schema, "events", migrations.TemporaryName("name"))
+				ColumnMustNotExist(t, db, schema, "events", migrations.TemporaryName(migrations.MigrationScopeFor("02_alter_column"), "name"))
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// Inserting a NULL into the new column should fail

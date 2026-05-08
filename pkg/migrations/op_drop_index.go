@@ -17,7 +17,20 @@ var (
 func (o *OpDropIndex) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
 
-	// no-op
+	// Remove the index from the in-memory schema so that subsequent
+	// migrations in a deferred batch — which see the schema state via
+	// readSchemaWithDeferred replaying our Start — don't observe the
+	// index. Without this a subsequent CreateIndex with the same name
+	// (e.g. drop+recreate-with-different-method) would fail Validate as
+	// "already exists" until our Complete physically dropped it at
+	// final drain.
+	for _, table := range s.Tables {
+		if _, ok := table.Indexes[o.Name]; ok {
+			delete(table.Indexes, o.Name)
+			break
+		}
+	}
+
 	return nil, nil
 }
 

@@ -319,7 +319,7 @@ func TestSetColumnUnique(t *testing.T) {
 					db,
 					schema,
 					"employees",
-					migrations.DuplicationName("fk_employee_department"),
+					migrations.DuplicationName(migrations.MigrationScopeFor("03_set_unique"), "fk_employee_department"),
 					migrations.ForeignKeyActionSETNULL,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -511,7 +511,7 @@ func TestSetColumnUnique(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "reviews", migrations.TemporaryName("username"), "the name of the user")
+				ColumnMustHaveComment(t, db, schema, "reviews", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_unique"), "username"), "the name of the user")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

@@ -25,12 +25,12 @@ type renameDuplicatedColumnAction struct {
 	to    string
 }
 
-func NewRenameDuplicatedColumnAction(conn db.DB, table *schema.Table, column string) *renameDuplicatedColumnAction {
+func NewRenameDuplicatedColumnAction(conn db.DB, scope string, table *schema.Table, column string) *renameDuplicatedColumnAction {
 	return &renameDuplicatedColumnAction{
 		conn:  conn,
 		id:    fmt.Sprintf("rename_duplicated_%s_%s", table.Name, column),
 		table: table,
-		from:  TemporaryName(column),
+		from:  TemporaryName(scope, column),
 		to:    column,
 	}
 }

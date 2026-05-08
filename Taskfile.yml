@@ -38,6 +38,22 @@ tasks:
     cmds:
       - golangci-lint run --config=.golangci.yml
 
+  deadcode:
+    desc: Run dead code analysis (matches CI's deadcode check)
+    summary: |
+      Mirrors the CI `dead code check` job. Runs the deadcode tool from
+      golang.org/x/tools via `go run` so it doesn't need to live on PATH,
+      and fails when any unreachable function is found across the module
+      (including tests).
+    cmds:
+      - |
+        OUT=$(go run golang.org/x/tools/cmd/deadcode@latest --test ./...)
+        if [ -n "$OUT" ]; then
+          echo "Dead code analysis found the following dead code:"
+          echo "$OUT"
+          exit 1
+        fi
+
   format:
     desc: Format JSON schema, embedded SQL, and Go sources
     summary: |

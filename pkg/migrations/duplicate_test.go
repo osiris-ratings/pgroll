@@ -57,7 +57,7 @@ var table = &schema.Table{
 }
 
 func TestDuplicateStmtBuilderCheckConstraints(t *testing.T) {
-	d := &duplicatorStmtBuilder{table}
+	d := &duplicatorStmtBuilder{scope: "", table: table}
 	for name, testCases := range map[string]struct {
 		columns       []string
 		expectedStmts []string
@@ -106,7 +106,7 @@ func TestDuplicateStmtBuilderCheckConstraints(t *testing.T) {
 }
 
 func TestDuplicateStmtBuilderForeignKeyConstraints(t *testing.T) {
-	d := &duplicatorStmtBuilder{table}
+	d := &duplicatorStmtBuilder{scope: "", table: table}
 	for name, testCases := range map[string]struct {
 		columns       []string
 		expectedStmts []string
@@ -155,7 +155,7 @@ func TestDuplicateStmtBuilderForeignKeyConstraints(t *testing.T) {
 }
 
 func TestDuplicateStmtBuilderIndexes(t *testing.T) {
-	d := &duplicatorStmtBuilder{table}
+	d := &duplicatorStmtBuilder{scope: "", table: table}
 	for name, testCases := range map[string]struct {
 		columns       []string
 		expectedStmts []string

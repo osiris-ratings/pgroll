@@ -66,7 +66,7 @@ func TestSetNotNull(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `review` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName("review"))
+				ColumnMustExist(t, db, schema, "reviews", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_nullable"), "review"))
 
 				// Inserting a NULL into the new `review` column should fail
 				MustNotInsert(t, db, schema, "set_nullable", "reviews", map[string]string{
@@ -124,7 +124,7 @@ func TestSetNotNull(t *testing.T) {
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `review` column should not exist on the underlying table.
-				ColumnMustNotExist(t, db, schema, "reviews", migrations.TemporaryName("review"))
+				ColumnMustNotExist(t, db, schema, "reviews", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_nullable"), "review"))
 
 				// Selecting from the `reviews` view should succeed.
 				rows := MustSelect(t, db, schema, "set_nullable", "reviews")
@@ -284,7 +284,7 @@ func TestSetNotNull(t *testing.T) {
 					db,
 					schema,
 					"employees",
-					migrations.DuplicationName("fk_employee_department"),
+					migrations.DuplicationName(migrations.MigrationScopeFor("03_set_not_null"), "fk_employee_department"),
 					migrations.ForeignKeyActionCASCADE,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -537,7 +537,7 @@ func TestSetNotNull(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("name"), "the name of the user")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_set_not_null"), "name"), "the name of the user")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

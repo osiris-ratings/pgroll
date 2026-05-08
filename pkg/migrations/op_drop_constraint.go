@@ -16,22 +16,34 @@ var _ Operation = (*OpDropConstraint)(nil)
 
 func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	// By this point Validate() should have run which ensures the constraint exists and that we only have
-	// one column associated with it.
-	column := table.GetColumn(table.GetConstraintColumns(o.Name)[0])
+	// During FakeDB-backed replay (readSchemaWithDeferred building up
+	// other migrations' Start effects so this Start sees their schema
+	// state), an earlier migration's deferred OpSetCheckConstraint /
+	// OpSetUnique / OpSetForeignKey may not have been replayed if it was
+	// excluded or if the replay hasn't reached it yet. Constraint
+	// metadata can therefore legitimately be absent. Treat that as a
+	// no-op replay rather than panicking — the live (non-replay) Start
+	// path always passes through Validate first, which checks the
+	// constraint exists.
+	constraintColumns := table.GetConstraintColumns(o.Name)
+	if len(constraintColumns) == 0 {
+		return nil, nil
+	}
+	column := table.GetColumn(constraintColumns[0])
 	if column == nil {
-		return nil, ColumnDoesNotExistError{Table: o.Table, Name: table.GetConstraintColumns(o.Name)[0]}
+		return nil, ColumnDoesNotExistError{Table: o.Table, Name: constraintColumns[0]}
 	}
 
 	// Create a copy of the column on the underlying table.
 	dbActions := []DBAction{
-		NewColumnDuplicator(conn, table, column).WithoutConstraint(o.Name),
+		NewColumnDuplicator(conn, scope, table, column).WithoutConstraint(o.Name),
 	}
 
 	// Copy the columns from table columns, so we can use it later
@@ -46,27 +58,29 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, column.Name),
+			Name:           backfill.TriggerName(scope, o.Table, column.Name),
 			Direction:      backfill.TriggerDirectionUp,
 			Columns:        upColumns,
 			TableName:      o.Table,
-			PhysicalColumn: TemporaryName(column.Name),
+			PhysicalColumn: TemporaryName(scope, column.Name),
 			SQL:            o.upSQL(column.Name),
 		},
 	)
 
 	// Add the new column to the internal schema representation. This is done
 	// here, before creation of the down trigger, so that the trigger can declare
-	// a variable for the new column.
-	table.AddColumn(column.Name, &schema.Column{
-		Name: TemporaryName(column.Name),
-	})
+	// a variable for the new column. Preserve the original column's metadata
+	// (Type, Nullable, Default, etc.) so replays across deferred migrations
+	// don't strip fields that downstream Validate steps depend on.
+	newCol := *column
+	newCol.Name = TemporaryName(scope, column.Name)
+	table.AddColumn(column.Name, &newCol)
 
 	// Add a trigger to copy values from the new column to the old, rewriting values using the `down` SQL.
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, TemporaryName(column.Name)),
+			Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, column.Name)),
 			Direction:      backfill.TriggerDirectionDown,
 			Columns:        table.Columns,
 			TableName:      o.Table,
@@ -79,6 +93,7 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 
 func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
@@ -86,28 +101,29 @@ func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]D
 
 	return []DBAction{
 		NewDropFunctionAction(conn,
-			backfill.TriggerFunctionName(o.Table, column.Name),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(column.Name))),
-		NewAlterSequenceOwnerAction(conn, o.Table, column.Name, TemporaryName(column.Name)),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+			backfill.TriggerFunctionName(scope, o.Table, column.Name),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, column.Name))),
+		NewAlterSequenceOwnerAction(conn, o.Table, column.Name, TemporaryName(scope, column.Name)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 		NewDropColumnAction(conn, o.Table, column.Name),
-		NewRenameDuplicatedColumnAction(conn, table, column.Name),
+		NewRenameDuplicatedColumnAction(conn, scope, table, column.Name),
 	}, nil
 }
 
 func (o *OpDropConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
 	columnName := table.GetConstraintColumns(o.Name)[0]
 
 	return []DBAction{
-		NewDropColumnAction(conn, o.Table, TemporaryName(columnName)),
+		NewDropColumnAction(conn, o.Table, TemporaryName(scope, columnName)),
 		NewDropFunctionAction(conn,
-			backfill.TriggerFunctionName(o.Table, columnName),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(columnName))),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+			backfill.TriggerFunctionName(scope, o.Table, columnName),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, columnName))),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 

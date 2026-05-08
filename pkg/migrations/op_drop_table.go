@@ -16,6 +16,7 @@ var (
 
 func (o *OpDropTable) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Name)
 	if table == nil {
@@ -27,24 +28,26 @@ func (o *OpDropTable) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 	// Soft-delete the table in order that a create table operation in the same
 	// migration can create a table with the same name
 	dbActions := []DBAction{
-		NewRenameTableAction(conn, table.Name, DeletionName(table.Name)),
+		NewRenameTableAction(conn, table.Name, DeletionName(scope, table.Name)),
 	}
 	return &StartResult{Actions: dbActions}, nil
 }
 
 func (o *OpDropTable) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
-	s.RemoveTable(DeletionName(o.Name))
+	s.RemoveTable(DeletionName(scope, o.Name))
 
 	return []DBAction{
 		// Perform the actual deletion of the soft-deleted table
-		NewDropTableAction(conn, DeletionName(o.Name)),
+		NewDropTableAction(conn, DeletionName(scope, o.Name)),
 	}, nil
 }
 
 func (o *OpDropTable) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	// Mark the table as no longer deleted so that it is visible to preceding
 	// Rollbacks in the same migration
@@ -54,7 +57,7 @@ func (o *OpDropTable) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 	table := s.GetTable(o.Name)
 
 	return []DBAction{
-		NewRenameTableAction(conn, DeletionName(table.Name), table.Name),
+		NewRenameTableAction(conn, DeletionName(scope, table.Name), table.Name),
 	}, nil
 }
 

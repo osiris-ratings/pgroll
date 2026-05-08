@@ -70,7 +70,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `title` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("title"))
+				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("03_drop_check_constraint"), "title"))
 
 				// Inserting a row that meets the check constraint into the old view works.
 				MustInsert(t, db, schema, "add_check_constraint", "posts", map[string]string{
@@ -267,7 +267,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `user_id` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("user_id"))
+				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("03_drop_fk_constraint"), "user_id"))
 
 				// Inserting some data into the `users` table works.
 				MustInsert(t, db, schema, "03_drop_fk_constraint", "users", map[string]string{
@@ -323,7 +323,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `user_id` column should not exist on the underlying table.
-				ColumnMustNotExist(t, db, schema, "posts", migrations.TemporaryName("user_id"))
+				ColumnMustNotExist(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("03_drop_fk_constraint"), "user_id"))
 
 				// Inserting a row that does not meet the check constraint into the new view works.
 				MustInsert(t, db, schema, "03_drop_fk_constraint", "posts", map[string]string{
@@ -381,7 +381,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `name` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName("name"))
+				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_drop_unique_constraint"), "name"))
 
 				// Inserting a row that meets the unique constraint into the old view works.
 				MustInsert(t, db, schema, "01_add_tables", "users", map[string]string{
@@ -449,7 +449,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `secondary_id` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName("secondary_id"))
+				ColumnMustExist(t, db, schema, "users", migrations.TemporaryName(migrations.MigrationScopeFor("02_drop_unique_constraint"), "secondary_id"))
 
 				// Inserting a row that meets the unique constraint into the old view works.
 				MustInsert(t, db, schema, "01_add_tables", "users", map[string]string{
@@ -612,7 +612,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// A temporary FK constraint has been created on the temporary column
-				ValidatedForeignKeyMustExist(t, db, schema, "employees", migrations.DuplicationName("fk_employee_department"))
+				ValidatedForeignKeyMustExist(t, db, schema, "employees", migrations.DuplicationName(migrations.MigrationScopeFor("03_drop_unique_constraint"), "fk_employee_department"))
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},
@@ -869,7 +869,7 @@ func TestDropConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName("title"), "the title of the post")
+				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName(migrations.MigrationScopeFor("02_drop_unique_constraint"), "title"), "the title of the post")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

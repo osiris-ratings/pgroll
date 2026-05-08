@@ -20,6 +20,7 @@ var (
 
 func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -32,8 +33,8 @@ func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 	ops := o.subOperations()
 
 	// Duplicate the column on the underlying table.
-	d := duplicatorForOperations(ops, conn, table, column).
-		WithName(column.Name, TemporaryName(o.Column))
+	d := duplicatorForOperations(ops, conn, scope, table, column).
+		WithName(column.Name, TemporaryName(scope, o.Column))
 	if err := d.Execute(ctx); err != nil {
 		return nil, fmt.Errorf("failed to duplicate column: %w", err)
 	}
@@ -50,11 +51,11 @@ func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, o.Column),
+			Name:           backfill.TriggerName(scope, o.Table, o.Column),
 			Direction:      backfill.TriggerDirectionUp,
 			TableName:      table.Name,
 			Columns:        upColumns,
-			PhysicalColumn: TemporaryName(o.Column),
+			PhysicalColumn: TemporaryName(scope, o.Column),
 			SQL:            o.upSQLForOperations(ops),
 		},
 	)
@@ -62,22 +63,32 @@ func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 	// Add the new column to the internal schema representation. This is done
 	// here, before creation of the down trigger, so that the trigger can declare
 	// a variable for the new column. Save the old column name for use as the
-	// physical column name. in the down trigger first.
+	// physical column name in the down trigger first. Preserve the original
+	// column's other metadata (Nullable, Unique, Comment, etc.) so that
+	// replays of this Start across migrations in a deferred batch don't
+	// strip fields that downstream Validate steps depend on. Clear Default
+	// when the type changes — the old default may not parse against the new
+	// type, and view projection would emit ALTER VIEW SET DEFAULT with
+	// mismatched types.
 	oldPhysicalColumn := column.Name
 	columnType := column.Type
+	typeChanged := o.Type != nil && *o.Type != column.Type
 	if o.Type != nil {
 		columnType = *o.Type
 	}
-	table.AddColumn(o.Column, &schema.Column{
-		Name: TemporaryName(o.Column),
-		Type: columnType,
-	})
+	newCol := *column
+	newCol.Name = TemporaryName(scope, o.Column)
+	newCol.Type = columnType
+	if typeChanged {
+		newCol.Default = nil
+	}
+	table.AddColumn(o.Column, &newCol)
 
 	// Add a trigger to copy values from the new column to the old.
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, TemporaryName(o.Column)),
+			Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, o.Column)),
 			Direction:      backfill.TriggerDirectionDown,
 			TableName:      table.Name,
 			Columns:        table.Columns,
@@ -103,6 +114,7 @@ func (o *OpAlterColumn) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 
 func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	ops := o.subOperations()
 
@@ -128,20 +140,21 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 
 	// Rename the new column to the old column name
 	return append(dbActions, []DBAction{
-		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(column.Name)),
+		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(scope, column.Name)),
 		NewDropColumnAction(conn, table.Name, o.Column),
 		NewDropFunctionAction(
 			conn,
-			backfill.TriggerFunctionName(o.Table, o.Column),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(o.Column)),
+			backfill.TriggerFunctionName(scope, o.Table, o.Column),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
 		),
-		NewDropColumnAction(conn, o.Table, backfill.CNeedsBackfillColumn),
-		NewRenameDuplicatedColumnAction(conn, table, o.Column),
+		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
+		NewRenameDuplicatedColumnAction(conn, scope, table, o.Column),
 	}...), nil
 }
 
 func (o *OpAlterColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -156,7 +169,7 @@ func (o *OpAlterColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 	dbActions := make([]DBAction, 0)
 	ops := o.subOperations()
 	for _, ops := range ops {
-		actions, err := ops.Rollback(l, conn, nil)
+		actions, err := ops.Rollback(l, conn, s)
 		if err != nil {
 			return nil, err
 		}
@@ -168,10 +181,10 @@ func (o *OpAlterColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 		NewDropColumnAction(conn, table.Name, column.Name),
 		NewDropFunctionAction(
 			conn,
-			backfill.TriggerFunctionName(o.Table, o.Column),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(o.Column)),
+			backfill.TriggerFunctionName(scope, o.Table, o.Column),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
 		),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	)
 
 	return dbActions, nil
@@ -293,8 +306,8 @@ func (o *OpAlterColumn) subOperations() []Operation {
 }
 
 // duplicatorForOperations returns a Duplicator for the given operations
-func duplicatorForOperations(ops []Operation, conn db.DB, table *schema.Table, column *schema.Column) *duplicator {
-	d := NewColumnDuplicator(conn, table, column)
+func duplicatorForOperations(ops []Operation, conn db.DB, scope string, table *schema.Table, column *schema.Column) *duplicator {
+	d := NewColumnDuplicator(conn, scope, table, column)
 
 	for _, op := range ops {
 		switch op := op.(type) {
