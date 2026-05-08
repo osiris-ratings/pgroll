@@ -274,7 +274,8 @@ func (s *State) Complete(ctx context.Context, schema, name string) error {
 func (s *State) MarkCompleteDeferred(ctx context.Context, schema, name string) error {
 	res, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
 		"UPDATE %[1]s.migrations SET done=TRUE, complete_deferred=TRUE, resulting_schema=(SELECT %[1]s.read_schema($1)) WHERE schema=$1 AND name=$2 AND done=FALSE",
-		pq.QuoteIdentifier(s.schema)), schema, name)
+		pq.QuoteIdentifier(s.schema),
+	), schema, name)
 	if err != nil {
 		return err
 	}
@@ -345,7 +346,8 @@ func (s *State) DeferredCompletes(ctx context.Context, schema string) ([]*migrat
 func (s *State) ClearCompleteDeferred(ctx context.Context, schema, name string) error {
 	_, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
 		"UPDATE %s.migrations SET complete_deferred=FALSE WHERE schema=$1 AND name=$2",
-		pq.QuoteIdentifier(s.schema)), schema, name)
+		pq.QuoteIdentifier(s.schema),
+	), schema, name)
 	return err
 }
 

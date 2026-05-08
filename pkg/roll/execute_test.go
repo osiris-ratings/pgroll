@@ -1004,7 +1004,6 @@ func TestStartAcceptsMigrationAtVersionSchemaNameLimit(t *testing.T) {
 		// And the version schema actually exists at the full computed name.
 		full := roll.VersionedSchemaName(cSchema, name)
 		assert.True(t, schemaExists(t, db, full))
-
 	})
 }
 
