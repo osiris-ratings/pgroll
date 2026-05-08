@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand/v2"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1758,22 +1760,26 @@ func TestDeferCompleteDrainFailureIsResumable(t *testing.T) {
 			},
 		}, backfill.NewConfig()))
 
-		// Final Complete attempts the drain and fails on V1's bad SQL.
+		// Final Complete merges deferred + active actions into one
+		// Coordinator. V1's bad SQL fails partway through; the error
+		// surfaces the underlying Postgres failure.
 		err := mig.Complete(ctx)
-		require.Error(t, err, "drain must surface the underlying SQL error")
-		assert.Contains(t, err.Error(), "01_drop_nonexistent",
-			"error must identify which deferred migration failed")
+		require.Error(t, err, "merged drain must surface the underlying SQL error")
+		assert.Contains(t, err.Error(), "nonexistent",
+			"error must identify the failing column reference")
 
-		// V1 must still be in the deferred queue so a retry can resume.
+		// All drained migrations remain in the deferred queue. The clear
+		// happens only after the merged Coordinator succeeds end-to-end,
+		// so a partial failure leaves the queue intact for resumable
+		// retry. (Already-executed actions are idempotent under retry —
+		// DROP COLUMN IF EXISTS, DROP FUNCTION IF EXISTS CASCADE.)
 		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
 		require.NoError(t, err)
-		require.Len(t, remaining, 1, "failing migration must remain in the queue for retry")
+		require.Len(t, remaining, 1, "failing batch leaves the queue intact for retry")
 		assert.Equal(t, "01_drop_nonexistent", remaining[0].Name)
 
-		// Operator intervention: drop V1 from the queue manually (in real
-		// life this would be `pgroll rollback` of the broken intermediate
-		// or a hand-correction). For this test we clear the flag directly
-		// to simulate "the operator fixed it" and re-run Complete.
+		// Operator intervention: clear V1 manually to simulate "the
+		// operator fixed it" and re-run Complete.
 		require.NoError(t, mig.State().ClearCompleteDeferred(ctx, cSchema, "01_drop_nonexistent"))
 
 		// Retry Complete — drain queue is now empty, V2's ops run cleanly,
@@ -1783,6 +1789,113 @@ func TestDeferCompleteDrainFailureIsResumable(t *testing.T) {
 
 		// events table exists from V2's drained operations.
 		assert.True(t, tableExists(t, db, cSchema, "events"))
+	})
+}
+
+// TestDeferCompleteMergesMultipleDestructiveDrains is the load-bearing case
+// for merged-Coordinator drain. Two destructive intermediates each create a
+// per-table backfill trigger plus the shared `_pgroll_needs_backfill` marker
+// column. Per-migration draining would deadlock: V1's Complete tries to drop
+// `_pgroll_needs_backfill` while V2's still-installed trigger references it.
+//
+// The fix: merge every drained Complete's actions and the active migration's
+// actions into one Coordinator before executing. The Coordinator dedupes by
+// action ID and moves duplicates to the latest position, so the shared
+// `drop_column_<table>__pgroll_needs_backfill` action lands after every
+// contributing migration's `drop_function_*` (which CASCADE-removes the
+// triggers). Order: drop col(email), drop func(email_trigger), drop
+// col(phone), drop func(phone_trigger), drop col(_pgroll_needs_backfill).
+func TestDeferCompleteMergesMultipleDestructiveDrains(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0 prod: users with two columns, both with data so backfill
+		// triggers actually do something on each subsequent drop.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL, phone text NOT NULL)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// V1 (deferred destructive): drop email with Down SQL, which
+		// installs a backfill trigger and the _pgroll_needs_backfill
+		// marker column.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpDropColumn{
+					Table:  "users",
+					Column: "email",
+					Down:   "''",
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// V2 (deferred destructive): drop phone with Down SQL, installs
+		// its own trigger (different name) but ADDs IF NOT EXISTS the
+		// same _pgroll_needs_backfill column (no-op, V1 added it).
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_drop_phone",
+			Operations: migrations.Operations{
+				&migrations.OpDropColumn{
+					Table:  "users",
+					Column: "phone",
+					Down:   "''",
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// V3 (final): unrelated additive migration to give us a target
+		// version schema. The final Complete must drain both destructives
+		// without the per-migration deadlock that per-migration draining
+		// would produce.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "03_create_events",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE events (id integer PRIMARY KEY)`,
+					Down: `DROP TABLE events`,
+				},
+			},
+		}, backfill.NewConfig()))
+
+		require.NoError(t, mig.Complete(ctx),
+			"merged-Coordinator drain must order shared cleanups (drop _pgroll_needs_backfill) after every contributing trigger drop")
+
+		// Both destructive drops physically applied.
+		for _, col := range []string{"email", "phone"} {
+			var exists bool
+			require.NoError(t, db.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema=$1 AND table_name='users' AND column_name=$2
+				)`, cSchema, col).Scan(&exists))
+			assert.False(t, exists, "%q must be dropped after merged drain", col)
+		}
+
+		// _pgroll_needs_backfill is gone too (single drop succeeded
+		// because both contributing triggers were dropped first).
+		var marker bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema=$1 AND table_name='users' AND column_name='_pgroll_needs_backfill'
+			)`, cSchema).Scan(&marker))
+		assert.False(t, marker, "shared _pgroll_needs_backfill marker must be gone after drain")
+
+		// Deferred queue is drained.
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Empty(t, remaining, "merged drain clears the queue on success")
 	})
 }
 
@@ -1912,4 +2025,527 @@ func tableExists(t *testing.T, db *sql.DB, schema, table string) bool {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+// simulateMigrate emulates `pgroll migrate <dir> --complete` end to end:
+// every intermediate runs without projecting a version schema and is
+// completed via the migration's classifier-picked CompleteOption (deferred
+// for the destructive-but-replay-safe set, inline-via-skip-schema-drop for
+// everything else); the final migration projects normally and runs the
+// drain. Used by stress tests to exercise the same code paths an operator
+// would hit running the migrate command against a Postgres host.
+func simulateMigrate(t *testing.T, mig *roll.Roll, ms []*migrations.Migration) {
+	t.Helper()
+	require.NotEmpty(t, ms, "simulateMigrate needs at least one migration")
+	ctx := context.Background()
+	cfg := backfill.NewConfig()
+
+	for i, m := range ms[:len(ms)-1] {
+		require.NoError(t, mig.Start(ctx, m, cfg, roll.WithoutVersionSchema()),
+			"intermediate %d %q Start", i, m.Name)
+		opt := roll.WithSkipSchemaDrop()
+		if m.CompleteMustBeDeferred() {
+			opt = roll.WithDeferComplete()
+		}
+		require.NoError(t, mig.Complete(ctx, opt),
+			"intermediate %d %q Complete", i, m.Name)
+	}
+
+	final := ms[len(ms)-1]
+	require.NoError(t, mig.Start(ctx, final, cfg), "final %q Start", final.Name)
+	require.NoError(t, mig.Complete(ctx), "final %q Complete", final.Name)
+}
+
+// columnNames returns the sorted physical column names of a table in the
+// given schema. Used as a stable signature for end-state assertions.
+func columnNames(t *testing.T, db *sql.DB, schema, table string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT column_name FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2`, schema, table)
+	require.NoError(t, err)
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		require.NoError(t, rows.Scan(&c))
+		cols = append(cols, c)
+	}
+	require.NoError(t, rows.Err())
+	sort.Strings(cols)
+	return cols
+}
+
+func tableNames(t *testing.T, db *sql.DB, schema string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `
+		SELECT table_name FROM information_schema.tables
+		WHERE table_schema = $1 AND table_type = 'BASE TABLE'`, schema)
+	require.NoError(t, err)
+	defer rows.Close()
+	var ts []string
+	for rows.Next() {
+		var n string
+		require.NoError(t, rows.Scan(&n))
+		ts = append(ts, n)
+	}
+	require.NoError(t, rows.Err())
+	sort.Strings(ts)
+	return ts
+}
+
+// TestTortureMixedBatchAllOpTypes throws one of each major op into a single
+// batch and verifies the final state. The chain interleaves additive ops
+// (run inline by the migrate classifier) with deferred destructive ops
+// (drop_column, drop_table, OnComplete raw SQL) so the merged-Coordinator
+// drain has to handle them all together at final Complete.
+func TestTortureMixedBatchAllOpTypes(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0 prod: a couple of base tables apps are already connected to.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_baseline",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `CREATE TABLE accounts (id integer PRIMARY KEY, email text NOT NULL);
+					     CREATE TABLE legacy_logs (id integer PRIMARY KEY, body text);
+					     INSERT INTO accounts(id, email) VALUES (1, 'a@x'), (2, 'b@x');`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		batch := []*migrations.Migration{
+			// Owen — create a new table.
+			{Name: "10_owen_create_orders", Operations: migrations.Operations{
+				&migrations.OpCreateTable{
+					Name: "orders",
+					Columns: []migrations.Column{
+						{Name: "id", Type: "integer", Pk: true},
+						{Name: "account_id", Type: "integer", Nullable: false},
+						{Name: "total_cents", Type: "integer", Nullable: false},
+					},
+				},
+			}},
+			// Klemen — add an index.
+			{Name: "11_klemen_index_orders_account", Operations: migrations.Operations{
+				&migrations.OpCreateIndex{
+					Name:    "idx_orders_account_id",
+					Table:   "orders",
+					Columns: []migrations.IndexField{{Column: "account_id"}},
+				},
+			}},
+			// Kerlous — add a column on the prod table.
+			{Name: "12_kerlous_add_signup_at", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table: "accounts",
+					Column: migrations.Column{
+						Name: "signup_at", Type: "timestamptz", Nullable: true,
+					},
+				},
+			}},
+			// Tim — drop a prod column. THIS is the case PR #18 was about.
+			{Name: "13_tim_drop_email", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "accounts", Column: "email", Down: "''"},
+			}},
+			// Blake — add another new table.
+			{Name: "14_blake_create_audit", Operations: migrations.Operations{
+				&migrations.OpCreateTable{
+					Name: "audit_events",
+					Columns: []migrations.Column{
+						{Name: "id", Type: "integer", Pk: true},
+						{Name: "kind", Type: "text", Nullable: false},
+					},
+				},
+			}},
+			// Ehab — drop a legacy table outright.
+			{Name: "15_ehab_drop_legacy_logs", Operations: migrations.Operations{
+				&migrations.OpDropTable{Name: "legacy_logs"},
+			}},
+			// Jess — alter a column type. Inline (duplicator pattern).
+			{Name: "16_jess_widen_total", Operations: migrations.Operations{
+				&migrations.OpAlterColumn{
+					Table:  "orders",
+					Column: "total_cents",
+					Type:   ptr("bigint"),
+					Up:     "total_cents",
+					Down:   "total_cents",
+				},
+			}},
+			// Final — additive cap to project the new version schema.
+			{Name: "17_final_add_phone", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table: "accounts",
+					Column: migrations.Column{
+						Name: "phone", Type: "text", Nullable: true,
+					},
+				},
+			}},
+		}
+
+		simulateMigrate(t, mig, batch)
+
+		// End-state assertions.
+		assert.ElementsMatch(t,
+			[]string{"accounts", "orders", "audit_events"},
+			tableNames(t, db, cSchema),
+			"legacy_logs must be gone, new tables present")
+		assert.ElementsMatch(t,
+			[]string{"id", "signup_at", "phone"},
+			columnNames(t, db, cSchema, "accounts"),
+			"accounts must have lost email and gained signup_at + phone (no _pgroll_* leftovers)")
+
+		// Verify deferred queue is fully drained.
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Empty(t, remaining, "queue must be drained after final Complete")
+
+		// Final version schema is what apps will connect to next.
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "17_final_add_phone")))
+	})
+}
+
+// TestTortureManyDestructivesShareBackfillMarker pushes the multi-deferred
+// case the user surfaced: a wave of typed OpDropColumns each installing a
+// down-trigger that touches the shared `_pgroll_needs_backfill` marker,
+// followed by an OnComplete-true raw SQL drop. All deferrals merge into
+// one Coordinator at final Complete; the shared marker drop has to land
+// after every contributing trigger drop.
+func TestTortureManyDestructivesShareBackfillMarker(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0 prod: wide table with several columns we'll drop.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_wide",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `CREATE TABLE wide (
+					        id integer PRIMARY KEY,
+					        a text NOT NULL,
+					        b text NOT NULL,
+					        c text NOT NULL,
+					        d text NOT NULL,
+					        e text NOT NULL
+					     );
+					     INSERT INTO wide VALUES (1, 'a', 'b', 'c', 'd', 'e');`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		batch := []*migrations.Migration{
+			{Name: "01_drop_a", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "wide", Column: "a", Down: "''"},
+			}},
+			{Name: "02_drop_b", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "wide", Column: "b", Down: "''"},
+			}},
+			{Name: "03_drop_c", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "wide", Column: "c", Down: "''"},
+			}},
+			{Name: "04_drop_d", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "wide", Column: "d", Down: "''"},
+			}},
+			{Name: "05_drop_e", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "wide", Column: "e", Down: "''"},
+			}},
+			// Final additive.
+			{Name: "06_final_add_z", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table:  "wide",
+					Column: migrations.Column{Name: "z", Type: "text", Nullable: true},
+				},
+			}},
+		}
+
+		simulateMigrate(t, mig, batch)
+
+		assert.ElementsMatch(t,
+			[]string{"id", "z"},
+			columnNames(t, db, cSchema, "wide"),
+			"all five drops must land; no leftover _pgroll_needs_backfill")
+
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Empty(t, remaining)
+	})
+}
+
+// TestTortureSevenDevsRandomOrder is the load-bearing claim: a 7-developer
+// week where each contributor commits 1-3 migrations of varying op type,
+// the chain order is shuffled by PRNG, and the whole thing applies in one
+// pgroll migrate. We run multiple deterministic seeds; every seed must
+// produce the same final schema signature, proving the batch model is
+// robust to the order migrations happen to land on the chain.
+//
+// Op mix is intentionally constrained to types we currently support
+// reliably under the classifier+drain model: creates, additive column ops,
+// drops (column/table), renames (inline), and additive raw SQL. Alter
+// column type appears once per shuffle to exercise the duplicator path
+// running inline alongside deferrals.
+func TestTortureSevenDevsRandomOrder(t *testing.T) {
+	t.Parallel()
+
+	// Each entry is one developer's contribution: a list of migrations
+	// they wrote during the week. Order WITHIN a developer's list is
+	// preserved (a developer's drop_column comes after their create_table
+	// for the same column). Order ACROSS developers is shuffled by seed.
+	type contributor struct {
+		name string
+		mig  []*migrations.Migration
+	}
+	contributors := []contributor{
+		{name: "owen", mig: []*migrations.Migration{
+			{Name: "owen_01_create_orders", Operations: migrations.Operations{
+				&migrations.OpCreateTable{Name: "orders", Columns: []migrations.Column{
+					{Name: "id", Type: "integer", Pk: true},
+					{Name: "amount", Type: "integer", Nullable: false},
+				}},
+			}},
+		}},
+		{name: "klemen", mig: []*migrations.Migration{
+			{Name: "klemen_01_index_accounts_email", Operations: migrations.Operations{
+				&migrations.OpCreateIndex{
+					Name:    "idx_accounts_email",
+					Table:   "accounts",
+					Columns: []migrations.IndexField{{Column: "email"}},
+				},
+			}},
+		}},
+		{name: "kerlous", mig: []*migrations.Migration{
+			{Name: "kerlous_01_add_kind", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table:  "accounts",
+					Column: migrations.Column{Name: "kind", Type: "text", Nullable: true},
+				},
+			}},
+			{Name: "kerlous_02_add_kind_default", Operations: migrations.Operations{
+				&migrations.OpRawSQL{Up: "ALTER TABLE accounts ALTER COLUMN kind SET DEFAULT 'standard'"},
+			}},
+		}},
+		{name: "tim", mig: []*migrations.Migration{
+			{Name: "tim_01_drop_legacy_flag", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "accounts", Column: "legacy_flag", Down: "FALSE"},
+			}},
+		}},
+		{name: "blake", mig: []*migrations.Migration{
+			{Name: "blake_01_create_audit", Operations: migrations.Operations{
+				&migrations.OpCreateTable{Name: "audit_events", Columns: []migrations.Column{
+					{Name: "id", Type: "integer", Pk: true},
+					{Name: "msg", Type: "text", Nullable: false},
+				}},
+			}},
+		}},
+		{name: "ehab", mig: []*migrations.Migration{
+			{Name: "ehab_01_drop_legacy_logs", Operations: migrations.Operations{
+				&migrations.OpDropTable{Name: "legacy_logs"},
+			}},
+		}},
+		{name: "jess", mig: []*migrations.Migration{
+			// Jess adds a comment via raw SQL (additive, no shuffle deps).
+			// Stresses a different op shape than the other contributors.
+			{Name: "jess_01_comment_email", Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: "COMMENT ON COLUMN accounts.email IS 'normalized lowercase'",
+				},
+			}},
+		}},
+	}
+
+	// Compute the dependency-respecting partial order: each contributor's
+	// migrations stay in their original sequence. shuffleByCommitTime
+	// produces a topologically valid linearization for a given PRNG seed
+	// by repeatedly picking a random contributor whose head hasn't been
+	// emitted yet. That mimics how migration files arrive in a shared
+	// directory ordered by commit timestamp.
+	shuffleByCommitTime := func(seed uint64) []*migrations.Migration {
+		r := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15))
+		queues := make([][]*migrations.Migration, len(contributors))
+		for i, c := range contributors {
+			queues[i] = append([]*migrations.Migration(nil), c.mig...)
+		}
+		var out []*migrations.Migration
+		for {
+			active := []int{}
+			for i, q := range queues {
+				if len(q) > 0 {
+					active = append(active, i)
+				}
+			}
+			if len(active) == 0 {
+				break
+			}
+			pick := active[r.IntN(len(active))]
+			out = append(out, queues[pick][0])
+			queues[pick] = queues[pick][1:]
+		}
+		return out
+	}
+
+	// Many seeds because the chain order is the variable being stressed —
+	// each seed produces a different topologically-valid linearization of
+	// the seven contributors' commits. All must converge to the same end
+	// state. Pinned seeds (deterministic) so failures reproduce; we don't
+	// rely on testing.Short to skip slow runs because the suite is fast.
+	seeds := []uint64{
+		1, 2, 3, 7, 13, 42, 100, 256, 999, 1337,
+		20240101, 20251225, 0xCAFEBABE, 0xDEADBEEF, 0xFEEDFACE,
+	}
+	for _, seed := range seeds {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			t.Parallel()
+			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+				ctx := context.Background()
+
+				// V0 prod: the schema state production ran on Sunday.
+				require.NoError(t, mig.Start(ctx, &migrations.Migration{
+					Name: "00_baseline",
+					Operations: migrations.Operations{
+						&migrations.OpRawSQL{
+							Up: `CREATE TABLE accounts (
+							        id integer PRIMARY KEY,
+							        email text NOT NULL,
+							        legacy_flag boolean DEFAULT false
+							     );
+							     CREATE TABLE legacy_logs (id integer PRIMARY KEY, body text);
+							     INSERT INTO accounts(id, email) VALUES (1, 'a@x'), (2, 'b@x');`,
+						},
+					},
+				}, backfill.NewConfig()))
+				require.NoError(t, mig.Complete(ctx))
+
+				// Apply this seed's shuffled batch as one pgroll migrate run.
+				simulateMigrate(t, mig, shuffleByCommitTime(seed))
+
+				// Final schema signature — must be the same across seeds.
+				assert.ElementsMatch(t,
+					[]string{"accounts", "orders", "audit_events"},
+					tableNames(t, db, cSchema),
+					"legacy_logs dropped, new tables present")
+				assert.ElementsMatch(t,
+					[]string{"id", "email", "kind"},
+					columnNames(t, db, cSchema, "accounts"),
+					"accounts: legacy_flag dropped (Tim), kind added (Kerlous)")
+				assert.ElementsMatch(t,
+					[]string{"id", "amount"},
+					columnNames(t, db, cSchema, "orders"))
+
+				// Verify Jess's comment landed.
+				var emailComment sql.NullString
+				require.NoError(t, db.QueryRowContext(ctx, `
+					SELECT col_description(c.oid, a.attnum)
+					FROM pg_class c
+					JOIN pg_namespace n ON n.oid = c.relnamespace
+					JOIN pg_attribute a ON a.attrelid = c.oid
+					WHERE n.nspname=$1 AND c.relname='accounts' AND a.attname='email'`,
+					cSchema).Scan(&emailComment))
+				assert.True(t, emailComment.Valid && emailComment.String == "normalized lowercase",
+					"Jess's comment must apply (got %q)", emailComment.String)
+
+				// Email default lookup — Kerlous's raw SQL ran.
+				var kindDefault sql.NullString
+				require.NoError(t, db.QueryRowContext(ctx, `
+					SELECT column_default FROM information_schema.columns
+					WHERE table_schema=$1 AND table_name='accounts' AND column_name='kind'`,
+					cSchema).Scan(&kindDefault))
+				assert.True(t, kindDefault.Valid && strings.Contains(kindDefault.String, "standard"),
+					"Kerlous's default-set raw SQL must have applied (got %q)", kindDefault.String)
+
+				// Index from Klemen.
+				var indexExists bool
+				require.NoError(t, db.QueryRowContext(ctx, `
+					SELECT EXISTS (SELECT 1 FROM pg_indexes
+					WHERE schemaname=$1 AND indexname='idx_accounts_email')`,
+					cSchema).Scan(&indexExists))
+				assert.True(t, indexExists, "Klemen's index must exist")
+
+				// Drained queue.
+				remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+				require.NoError(t, err)
+				assert.Empty(t, remaining, "no leftover deferreds after final complete")
+
+				// No _pgroll_* artifacts on user tables.
+				rows, err := db.QueryContext(ctx, `
+					SELECT table_name, column_name FROM information_schema.columns
+					WHERE table_schema=$1 AND column_name LIKE '_pgroll_%'`, cSchema)
+				require.NoError(t, err)
+				defer rows.Close()
+				var leaked []string
+				for rows.Next() {
+					var tn, cn string
+					require.NoError(t, rows.Scan(&tn, &cn))
+					leaked = append(leaked, tn+"."+cn)
+				}
+				assert.Empty(t, leaked, "no pgroll-internal columns may leak into the final user schema")
+			})
+		})
+	}
+}
+
+// TestTortureBackToBackBatches exercises the "weekly release" cadence:
+// after one batch is fully completed, a second batch on top must apply
+// cleanly and observe the first batch's effects. Catches regressions where
+// state from a completed batch (drained queue, dropped schemas) interferes
+// with the next pgroll migrate run.
+func TestTortureBackToBackBatches(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_baseline",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up: `CREATE TABLE t (id integer PRIMARY KEY, a text, b text, c text);
+					     INSERT INTO t VALUES (1, 'a', 'b', 'c');`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// Week 1: drop a, add d.
+		simulateMigrate(t, mig, []*migrations.Migration{
+			{Name: "w1_drop_a", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "t", Column: "a", Down: "''"},
+			}},
+			{Name: "w1_add_d", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table:  "t",
+					Column: migrations.Column{Name: "d", Type: "text", Nullable: true},
+				},
+			}},
+		})
+		assert.ElementsMatch(t, []string{"id", "b", "c", "d"}, columnNames(t, db, cSchema, "t"),
+			"week 1 end state")
+
+		// Week 2: drop b, drop c, add e — multiple destructives from
+		// week-2 contributors landing on the post-week-1 state.
+		simulateMigrate(t, mig, []*migrations.Migration{
+			{Name: "w2_drop_b", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "t", Column: "b", Down: "''"},
+			}},
+			{Name: "w2_drop_c", Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "t", Column: "c", Down: "''"},
+			}},
+			{Name: "w2_add_e", Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table:  "t",
+					Column: migrations.Column{Name: "e", Type: "text", Nullable: true},
+				},
+			}},
+		})
+		assert.ElementsMatch(t, []string{"id", "d", "e"}, columnNames(t, db, cSchema, "t"),
+			"week 2 end state")
+
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Empty(t, remaining)
+	})
 }

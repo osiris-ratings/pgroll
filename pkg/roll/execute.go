@@ -40,7 +40,7 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 	if m.skipValidation {
 		return nil
 	}
-	lastSchema, err := m.state.ReadSchema(ctx, m.schema)
+	lastSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return err
 	}
@@ -52,6 +52,81 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 		return err
 	}
 	return nil
+}
+
+// readSchemaWithDeferred reads the physical schema, then replays the
+// virtual-schema effects of every deferred-pending intermediate so callers
+// see the schema state as it will exist after those completes drain.
+//
+// Two side effects matter:
+//
+//  1. Replay calls each deferred migration's op.Start against a FakeDB,
+//     mutating the in-memory schema only. For example, a deferred
+//     OpDropColumn flips Deleted=true on the column, and a deferred
+//     OpAddColumn registers the new (still virtual) column under its real
+//     name with the temp physical name.
+//  2. The duplicate-cleanup loop removes physical-name-keyed entries that
+//     read_schema returned for columns whose virtual name now differs from
+//     the physical name. Without this, OpAddColumn-style temp columns
+//     (`_pgroll_new_<col>`) would appear twice in the schema — once under
+//     their physical name (from read_schema) and once under their real
+//     name (from replay) — confusing both subsequent Validates and view
+//     projection. Drain (which expects pre-rename temp names) reads the
+//     raw schema directly via state.ReadSchema instead.
+func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
+	s, err := m.state.ReadSchema(ctx, m.schema)
+	if err != nil {
+		return nil, err
+	}
+
+	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	if len(deferred) == 0 {
+		return s, nil
+	}
+
+	// Reverse OpDropTable's soft-delete physical rename so its replay can
+	// find the table to mark Deleted. OpDropTable.Start renames the table
+	// to `_pgroll_del_<name>` physically; read_schema returns it under
+	// that physical key. Without folding it back, a deferred OpDropTable
+	// replay errors with "table does not exist" in any subsequent
+	// migration's Validate/Start. Skip the fold when the un-prefixed key
+	// already exists (the create-with-same-name case after a deferred
+	// drop) — the new table takes precedence.
+	for k, t := range s.Tables {
+		if t == nil {
+			continue
+		}
+		orig := strings.TrimPrefix(t.Name, "_pgroll_del_")
+		if orig == t.Name {
+			continue
+		}
+		if _, exists := s.Tables[orig]; exists {
+			continue
+		}
+		s.Tables[orig] = t
+		delete(s.Tables, k)
+	}
+
+	for _, dm := range deferred {
+		if err := dm.UpdateVirtualSchema(ctx, s); err != nil {
+			return nil, fmt.Errorf("unable to apply deferred virtual schema for %q: %w", dm.Name, err)
+		}
+	}
+
+	for _, table := range s.Tables {
+		for k, v := range table.Columns {
+			if v != nil && v.Name != k {
+				if _, dupe := table.Columns[v.Name]; dupe {
+					delete(table.Columns, v.Name)
+				}
+			}
+		}
+	}
+
+	return s, nil
 }
 
 // validateVersionSchemaName rejects migrations whose computed version schema
@@ -103,16 +178,6 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 	return m.performBackfills(ctx, job, cfg)
 }
 
-// StartDDLOperations performs the DDL operations for the migration. This does
-// not include running backfills for any modified tables.
-//
-// Exported for callers that want fine-grained control of the Start phase
-// without backfills. Equivalent to the internal startDDLOperations with
-// default options.
-func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Migration) (*backfill.Job, error) {
-	return m.startDDLOperations(ctx, migration, &startOptions{})
-}
-
 func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Migration, o *startOptions) (*backfill.Job, error) {
 	// check if there is an active migration, create one otherwise
 	active, err := m.state.IsActiveMigrationPeriod(ctx, m.schema)
@@ -147,8 +212,12 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
 
 	// Reread the latest schema as validation may have updated the schema object
-	// in memory.
-	newSchema, err := m.state.ReadSchema(ctx, m.schema)
+	// in memory. Use the deferred-aware helper so this migration's operations
+	// see the schema state implied by any pending intermediates' Starts —
+	// otherwise an OpAddColumn intermediate whose Complete is deferred would
+	// leave its column under the temp physical name (`_pgroll_new_<col>`),
+	// invisible to subsequent ops looking it up by real name.
+	newSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read schema: %w", err)
 	}
@@ -183,7 +252,7 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 		// override changes made by other operations
 		if _, ok := op.(migrations.RequiresSchemaRefreshOperation); ok {
 			if isolatedOp, ok := op.(migrations.IsolatedOperation); ok && isolatedOp.IsIsolated() {
-				newSchema, err = m.state.ReadSchema(ctx, m.schema)
+				newSchema, err = m.readSchemaWithDeferred(ctx)
 				if err != nil {
 					return nil, fmt.Errorf("unable to refresh schema: %w", err)
 				}
@@ -201,26 +270,10 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	//     that no apps will connect to and that would otherwise create view
 	//     dependencies blocking destructive ops later in the batch).
 	if !o.skipVersionSchema && !m.disableVersionSchemas {
-		// Replay the virtual schema effects of any deferred-pending
-		// intermediates onto the schema we're about to project views over.
-		// Without this, views in the new version schema would still
-		// reference columns that pending DROP COLUMN / RENAME COLUMN
-		// intermediates plan to remove, blocking those drops at drain
-		// time. Done here (rather than before the op loop) because
-		// isolated raw-SQL ops cause `m.state.ReadSchema` re-reads inside
-		// the loop, which would clobber an earlier replay. FakeDB-backed
-		// replay only mutates in-memory state; ops that don't mutate
-		// virtual schema during Start (e.g. OpRawSQL) are no-ops here —
-		// their physical effects are already in newSchema.
-		deferred, err := m.state.DeferredCompletes(ctx, m.schema)
-		if err != nil {
-			return nil, fmt.Errorf("unable to query deferred completes: %w", err)
-		}
-		for _, dm := range deferred {
-			if err := dm.UpdateVirtualSchema(ctx, newSchema); err != nil {
-				return nil, fmt.Errorf("unable to apply deferred virtual schema for %q: %w", dm.Name, err)
-			}
-		}
+		// newSchema already reflects deferred-pending mutations because every
+		// schema read in this method goes through readSchemaWithDeferred — so
+		// the projected views skip columns scheduled for deferred drops or
+		// renames, which is what unblocks the drained DDL at final Complete.
 		if err := m.ensureViews(ctx, newSchema, migration); err != nil {
 			return nil, err
 		}
@@ -242,6 +295,13 @@ func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migr
 	// create views in the new schema
 	for name, table := range schema.Tables {
 		if table.Deleted {
+			continue
+		}
+		// Defensive: skip tables whose physical name is a pgroll soft-delete
+		// artifact. These are produced by OpDropTable.Start and persist
+		// physically across deferred Completes; without this filter they'd
+		// be projected as views and block their own drop at drain time.
+		if strings.HasPrefix(table.Name, "_pgroll_del_") {
 			continue
 		}
 		err = m.ensureView(ctx, mig.VersionSchemaName(), name, table)
@@ -336,17 +396,42 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		m.logger.Info("skipping old version schema cleanup (deferred to next Complete)", "migration", migration.Name)
 	}
 
-	// Drain any deferred Completes from prior intermediates before running
-	// the active migration's own operations. The previous block has just
-	// dropped every version schema except the one being completed, so DDL
-	// the intermediates queued (e.g. DROP COLUMN) is now unblocked. If we
-	// were called with WithSkipSchemaDrop the prev-production schema is
-	// still around and replaying intermediates would fail the same way they
-	// would have mid-batch — so skip the drain in that case and leave it
-	// for whoever runs the next non-deferred Complete.
+	// Collect deferred Completes from prior intermediates. Their actions get
+	// merged with the active migration's actions and run through a single
+	// Coordinator below. The Coordinator's dedup-and-move-later behavior is
+	// load-bearing here: shared cleanups (e.g. drop_column on the per-table
+	// `_pgroll_needs_backfill` marker) appear in every contributing
+	// migration's action list, and the merged ordering pushes that drop
+	// after every contributing migration's trigger-function drop, so the
+	// column drop doesn't fail on lingering trigger dependencies.
+	//
+	// Skip drain under WithSkipSchemaDrop — that path keeps the
+	// prev-production schema around, which would block destructive drained
+	// DDL with the same dependency error the deferral was set up to avoid.
+	// Leave the queue for whoever runs the next non-deferred Complete.
+	var drainedMigrations []string
+	var deferredActions []migrations.DBAction
 	if !o.skipSchemaDrop {
-		if err := m.drainDeferredCompletes(ctx); err != nil {
-			return err
+		queued, err := m.state.DeferredCompletes(ctx, m.schema)
+		if err != nil {
+			return fmt.Errorf("unable to query deferred completes: %w", err)
+		}
+		for _, dm := range queued {
+			drainedMigrations = append(drainedMigrations, dm.Name)
+			drainSchema, err := m.state.ReadSchema(ctx, m.schema)
+			if err != nil {
+				return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
+			}
+			for _, op := range dm.Operations {
+				opActions, err := op.Complete(m.logger, m.pgConn, drainSchema)
+				if err != nil {
+					return fmt.Errorf("unable to collect actions for deferred complete %q: %w", dm.Name, err)
+				}
+				deferredActions = append(deferredActions, opActions...)
+			}
+		}
+		if len(drainedMigrations) > 0 {
+			m.logger.Info("merging deferred completes into final action set", "count", len(drainedMigrations))
 		}
 	}
 
@@ -370,7 +455,7 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 
 	// execute operations
 	refreshViews := false
-	var actions []migrations.DBAction
+	actions := deferredActions
 	for _, op := range migration.Operations {
 		opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
 		if err != nil {
@@ -386,6 +471,19 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	coordinator := migrations.NewCoordinator(actions)
 	if err := coordinator.Execute(ctx); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
+	}
+
+	// Coordinator succeeded — clear complete_deferred for the drained
+	// migrations now that their actions have physically applied. Done after
+	// successful execution so a Coordinator failure leaves the queue
+	// intact: an operator can fix the underlying issue and re-run
+	// `pgroll complete` to retry. Idempotent DDL (DROP COLUMN IF EXISTS,
+	// DROP FUNCTION IF EXISTS CASCADE) makes the retry safe for
+	// already-executed actions.
+	for _, name := range drainedMigrations {
+		if err := m.state.ClearCompleteDeferred(ctx, m.schema, name); err != nil {
+			return fmt.Errorf("unable to clear complete_deferred for %q: %w", name, err)
+		}
 	}
 
 	// Recreate views for the new version (if some operations require it, ie
@@ -483,11 +581,26 @@ func (m *Roll) ensureView(ctx context.Context, version, name string, table *sche
 	columns := make([]string, 0, len(table.Columns))
 	defaults := make(map[string]string, len(table.Columns))
 	for k, v := range table.Columns {
-		if !v.Deleted {
-			columns = append(columns, fmt.Sprintf("%s AS %s", pq.QuoteIdentifier(v.Name), pq.QuoteIdentifier(k)))
-			if v.Default != nil {
-				defaults[k] = *v.Default
-			}
+		if v.Deleted {
+			continue
+		}
+		// Skip columns whose user-facing name is a pgroll-internal artifact
+		// — specifically the shared `_pgroll_needs_backfill` marker that
+		// surfaces in read_schema while a migration with a backfill trigger
+		// is in flight. Without this filter, a deferred migration's view
+		// would project the marker and create a pg_rewrite dependency that
+		// blocks the drained Complete from dropping the column.
+		//
+		// Only filter on the virtual key. A column with a temp physical
+		// name (e.g. `_pgroll_new_<col>` from an in-flight OpAddColumn) is
+		// still a valid user-facing column under its real virtual name —
+		// the projection `_pgroll_new_X AS X` is correct and load-bearing.
+		if strings.HasPrefix(k, "_pgroll_") {
+			continue
+		}
+		columns = append(columns, fmt.Sprintf("%s AS %s", pq.QuoteIdentifier(v.Name), pq.QuoteIdentifier(k)))
+		if v.Default != nil {
+			defaults[k] = *v.Default
 		}
 	}
 
@@ -630,53 +743,6 @@ func (m *Roll) DropVersionSchemasExcept(ctx context.Context, keep ...string) err
 		_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(s)))
 		if err != nil {
 			return fmt.Errorf("unable to drop version schema %q: %w", s, err)
-		}
-	}
-
-	return nil
-}
-
-// drainDeferredCompletes replays the Complete operations of every
-// intermediate migration that was previously recorded with WithDeferComplete.
-// Migrations are replayed in parent-chain order (oldest first) so that
-// destructive DDL applies in the same sequence the operator wrote it. After
-// each migration's actions execute successfully the complete_deferred flag is
-// cleared, making the drain idempotent under retry: a failure mid-drain
-// leaves only the unprocessed tail in the queue, and a subsequent
-// `pgroll complete` resumes from the failure point.
-func (m *Roll) drainDeferredCompletes(ctx context.Context) error {
-	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
-	if err != nil {
-		return fmt.Errorf("unable to query deferred completes: %w", err)
-	}
-	if len(deferred) == 0 {
-		return nil
-	}
-
-	m.logger.Info("draining deferred completes", "count", len(deferred))
-
-	for _, mig := range deferred {
-		m.logger.Info("draining deferred complete", "migration", mig.Name)
-
-		currentSchema, err := m.state.ReadSchema(ctx, m.schema)
-		if err != nil {
-			return fmt.Errorf("unable to read schema before draining %q: %w", mig.Name, err)
-		}
-
-		var actions []migrations.DBAction
-		for _, op := range mig.Operations {
-			opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
-			if err != nil {
-				return fmt.Errorf("unable to collect actions for deferred complete %q: %w", mig.Name, err)
-			}
-			actions = append(actions, opActions...)
-		}
-		coordinator := migrations.NewCoordinator(actions)
-		if err := coordinator.Execute(ctx); err != nil {
-			return fmt.Errorf("unable to execute deferred complete %q: %w", mig.Name, err)
-		}
-		if err := m.state.ClearCompleteDeferred(ctx, m.schema, mig.Name); err != nil {
-			return fmt.Errorf("unable to clear complete_deferred for %q: %w", mig.Name, err)
 		}
 	}
 
