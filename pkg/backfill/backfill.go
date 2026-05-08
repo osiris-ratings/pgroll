@@ -23,13 +23,6 @@ import (
 // intermediates don't collapse onto the same shared column.
 const needsBackfillColumnPrefix = "_pgroll_needs_backfill"
 
-// IsNeedsBackfillColumn reports whether a physical column name is one of
-// pgroll's per-migration needs-backfill markers. Used by view projection
-// to keep these internal columns out of user-facing version-schema views.
-func IsNeedsBackfillColumn(name string) bool {
-	return strings.HasPrefix(name, needsBackfillColumnPrefix)
-}
-
 // NeedsBackfillColumnName returns the per-migration physical name of the
 // marker column. Empty scope yields the legacy unscoped name (used by
 // callers that haven't been threaded yet; should be eliminated as the

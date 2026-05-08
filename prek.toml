@@ -24,7 +24,11 @@ hooks = [
 repo = "https://github.com/dnephin/pre-commit-golang"
 rev = "v0.5.1"
 hooks = [
-  { id = "go-build" },
+  # `go-vet` (not `go-build`): the go-build hook runs `go build ./...`
+  # which fails on legitimate test-only packages
+  # (internal/benchmarks, internal/jsonschema). go-vet handles those
+  # correctly and still catches real compile errors.
+  { id = "go-vet" },
   { id = "go-mod-tidy" },
 ]
 
@@ -36,4 +40,5 @@ hooks = [
   { id = "task-generate-clean", name = "task generate produces no diff", entry = "bash -c 'task generate && git diff --quiet -- pkg/migrations/types.go cli-definition.json'", language = "system", pass_filenames = false, files = "^(schema\\.json|tools/build-cli-definition\\.go)$" },
   { id = "task-ledger-clean", name = "task ledger produces no diff", entry = "bash -c 'task ledger && git diff --quiet -- examples/.ledger'", language = "system", pass_filenames = false, files = "^examples/" },
   { id = "task-license", name = "task license (SPDX header on .go files)", entry = "bash -c 'task license && git diff --quiet'", language = "system", pass_filenames = false, files = "\\.go$" },
+  { id = "task-deadcode", name = "task deadcode (mirrors CI dead code check)", entry = "task deadcode", language = "system", pass_filenames = false, files = "\\.go$" },
 ]

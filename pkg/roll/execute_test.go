@@ -2365,7 +2365,7 @@ func TestTortureSevenDevsRandomOrder(t *testing.T) {
 	// emitted yet. That mimics how migration files arrive in a shared
 	// directory ordered by commit timestamp.
 	shuffleByCommitTime := func(seed uint64) []*migrations.Migration {
-		r := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15))
+		r := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15)) //nolint:gosec // deterministic PRNG for test ordering, not cryptographic
 		queues := make([][]*migrations.Migration, len(contributors))
 		for i, c := range contributors {
 			queues[i] = append([]*migrations.Migration(nil), c.mig...)
