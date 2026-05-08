@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 
 	"github.com/xataio/pgroll/pkg/backfill"
@@ -170,24 +171,29 @@ func migrateCmd() *cobra.Command {
 	return migrateCmd
 }
 
+// cycleState classifies the deployment state for a `pgroll migrate` run.
+type cycleState string
+
+const (
+	cycleFresh       cycleState = "FRESH"
+	cycleIncremental cycleState = "INCREMENTAL"
+	cycleRecovery    cycleState = "RECOVERY"
+	cycleInterrupted cycleState = "INTERRUPTED"
+	cycleNoOp        cycleState = "NO-OP"
+)
+
 // printMigratePreFlight reports the current deployment state and the plan
 // for this run before any migrations execute. This makes `pgroll migrate`
 // auditable and idempotent: an operator can re-run after an interruption
 // (lock_timeout, SIGINT, network blip) and immediately see what state the
 // database is actually in vs what pgroll's state table thinks.
 //
-// What it reports:
-//
-//  1. Existing version schemas (the live `<schema>_*` schemas in Postgres).
-//     Under the no-intermediate-schemas model there is normally exactly
-//     one — the production-active version apps are connected to.
-//  2. pgroll's `state.LatestVersion`. If this matches one of the existing
-//     schemas the run is a fresh cycle. If it has advanced beyond the
-//     existing schemas, this is a recovery run from an aborted prior batch.
-//  3. Total / already-applied / remaining migration counts so the operator
-//     can sanity-check the scope of the run.
-//  4. The final migration name and the schema name it will create when
-//     completed — the target apps will eventually deploy to.
+// The headline is the cycle state (FRESH / INCREMENTAL / RECOVERY /
+// INTERRUPTED / NO-OP) plus how many migrations are applied vs remaining;
+// the migrations directory and total count are demoted to a subtitle.
+// Drift between state.LatestVersion and the active version schema is
+// folded into a single ✓/⚠ on the Active line rather than two lines the
+// operator must mentally diff.
 func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir string, unapplied []*migrations.RawMigration, out io.Writer) error {
 	existingSchemas, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
@@ -204,10 +210,6 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		return fmt.Errorf("reading schema history: %w", err)
 	}
 
-	// Detect a stuck in-progress migration up front. If one exists, the
-	// active-period check immediately after pre-flight will error out — but
-	// the operator wants to see this state called out clearly in the
-	// pre-flight so they understand why the run is about to refuse.
 	activePeriod, err := m.State().IsActiveMigrationPeriod(ctx, m.Schema())
 	if err != nil {
 		return fmt.Errorf("reading active migration period: %w", err)
@@ -229,13 +231,11 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 
 	prefix := m.Schema() + "_"
 
-	// Drift detection: does state.LatestVersion correspond to one of the
-	// existing version schemas? Under the no-intermediate-schemas model,
-	// state can advance past the production-active schema during a batch
-	// (intermediates are marked done=true without projecting a schema), so
-	// a mismatch is the signal that a prior batch ran past where deployment
-	// caught up to. That's a recovery run, not necessarily an error — but
-	// the operator wants to see it.
+	// Drift detection: state.LatestVersion can advance past the
+	// production-active schema during a batched migrate (intermediates
+	// are marked done=true without projecting a schema), so a mismatch
+	// is the signal that a prior batch ran past where deployment caught
+	// up to. That's a recovery run, not necessarily an error.
 	stateInSync := stateLatestVersion == nil
 	if stateLatestVersion != nil {
 		want := prefix + *stateLatestVersion
@@ -247,61 +247,111 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 	}
 
-	fmt.Fprintln(out, "▶ pgroll migrate — pre-flight")
-	fmt.Fprintf(out, "  Migrations directory:    %s\n", migrationsDir)
-	fmt.Fprintf(out, "  Total migrations:        %d\n", totalCount)
-	fmt.Fprintf(out, "  Already applied:         %d\n", appliedCount)
-	fmt.Fprintf(out, "  Remaining to apply:      %d\n", remainingCount)
-	fmt.Fprintln(out)
+	state := classifyCycle(activePeriod, remainingCount, appliedCount, stateInSync)
 
-	if len(existingSchemas) == 0 {
-		fmt.Fprintln(out, "  Active version schema(s): (none — fresh database or post-cleanup)")
-	} else {
-		fmt.Fprintln(out, "  Active version schema(s):")
-		for _, s := range existingSchemas {
-			fmt.Fprintf(out, "    • %s    (migration: %s)\n", s, strings.TrimPrefix(s, prefix))
+	stateColor := pterm.FgGreen
+	switch state {
+	case cycleInterrupted:
+		stateColor = pterm.FgRed
+	case cycleRecovery:
+		stateColor = pterm.FgYellow
+	case cycleNoOp:
+		stateColor = pterm.FgGray
+	}
+
+	const (
+		cycleColWidth = 14
+		fieldColWidth = 16
+	)
+
+	title := pterm.NewStyle(pterm.FgWhite, pterm.Bold).Sprint("▶ pgroll migrate")
+	subtitle := pterm.FgGray.Sprintf("%s · %d total", migrationsDir, totalCount)
+	fmt.Fprintf(out, "\n%s   %s\n\n", title, subtitle)
+
+	bullet := stateColor.Sprint("●")
+	label := pterm.NewStyle(stateColor, pterm.Bold).Sprint(string(state))
+	labelPad := strings.Repeat(" ", cycleColWidth-len(string(state)))
+	progress := fmt.Sprintf("%d applied · %d remaining", appliedCount, remainingCount)
+	fmt.Fprintf(out, "  %s %s%s%s\n", bullet, label, labelPad, progress)
+
+	field := func(name, value string) {
+		gray := pterm.FgGray.Sprint(name)
+		pad := strings.Repeat(" ", fieldColWidth-len(name))
+		fmt.Fprintf(out, "    %s%s%s\n", gray, pad, value)
+	}
+
+	activeLine := func() string {
+		var schemaPart string
+		switch len(existingSchemas) {
+		case 0:
+			schemaPart = pterm.FgGray.Sprint("—")
+		case 1:
+			schemaPart = existingSchemas[0]
+		default:
+			schemaPart = strings.Join(existingSchemas, ", ")
+		}
+		var statePart string
+		switch {
+		case stateLatestVersion == nil:
+			statePart = pterm.FgGray.Sprint("state (none)")
+		case stateInSync:
+			statePart = fmt.Sprintf("state %s %s", *stateLatestVersion, pterm.FgGreen.Sprint("✓"))
+		default:
+			statePart = fmt.Sprintf("state %s %s", *stateLatestVersion, pterm.FgYellow.Sprint("⚠ drift"))
+		}
+		return schemaPart + pterm.FgGray.Sprint(" · ") + statePart
+	}()
+
+	switch state {
+	case cycleInterrupted:
+		if inProgressName != "" {
+			field("Stuck on", inProgressName)
+		}
+		field("Active", activeLine)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, pterm.FgYellow.Sprint("    Run `pgroll rollback` to clean up before retrying."))
+	case cycleNoOp:
+		field("Active", activeLine)
+	default:
+		first := unapplied[0].Name
+		last := unapplied[len(unapplied)-1].Name
+		plan := first
+		if first != last {
+			plan = first + pterm.FgGray.Sprint(" → ") + last
+		}
+		field("Plan", plan)
+
+		finalRaw := unapplied[len(unapplied)-1]
+		finalVersion := finalRaw.Name
+		if finalRaw.VersionSchema != "" {
+			finalVersion = finalRaw.VersionSchema
+		}
+		field("Target schema", roll.VersionedSchemaName(m.Schema(), finalVersion))
+		field("Active", activeLine)
+
+		if state == cycleRecovery {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Recovery run: a previous migrate completed migrations whose schema is not yet deployed."))
 		}
 	}
-	if stateLatestVersion != nil {
-		fmt.Fprintf(out, "  pgroll state.LatestVersion: %s\n", *stateLatestVersion)
-	} else {
-		fmt.Fprintln(out, "  pgroll state.LatestVersion: (none)")
-	}
-	fmt.Fprintln(out)
 
+	fmt.Fprintln(out)
+	return nil
+}
+
+func classifyCycle(activePeriod bool, remaining, applied int, stateInSync bool) cycleState {
 	switch {
 	case activePeriod:
-		fmt.Fprintln(out, "  Cycle: INTERRUPTED — a previous migration is in progress and was never completed.")
-		if inProgressName != "" {
-			fmt.Fprintf(out, "         In-progress migration: %s\n", inProgressName)
-		}
-		fmt.Fprintln(out, "         Run `pgroll rollback` to clean up before retrying. This run will refuse to proceed.")
-	case remainingCount == 0:
-		fmt.Fprintln(out, "  Cycle: NO-OP — all migrations from the directory are already applied.")
-	case stateInSync && appliedCount == 0:
-		fmt.Fprintln(out, "  Cycle: FRESH — no migrations from this directory have been applied yet.")
+		return cycleInterrupted
+	case remaining == 0:
+		return cycleNoOp
+	case stateInSync && applied == 0:
+		return cycleFresh
 	case stateInSync:
-		fmt.Fprintln(out, "  Cycle: INCREMENTAL — pgroll state matches the active schema; new migrations to apply.")
+		return cycleIncremental
 	default:
-		fmt.Fprintln(out, "  Cycle: RECOVERY — pgroll state has advanced beyond the active schema.")
-		fmt.Fprintln(out, "         A previous migrate run completed migrations whose schema is not yet deployed.")
+		return cycleRecovery
 	}
-	if !activePeriod && remainingCount > 0 {
-		fmt.Fprintf(out, "  Resuming from:    %s\n", unapplied[0].Name)
-	}
-	fmt.Fprintln(out)
-
-	if !activePeriod && remainingCount > 0 {
-		final := unapplied[len(unapplied)-1]
-		finalVersion := final.Name
-		if final.VersionSchema != "" {
-			finalVersion = final.VersionSchema
-		}
-		fmt.Fprintf(out, "  Final migration:  %s\n", final.Name)
-		fmt.Fprintf(out, "  Final schema:     %s\n", roll.VersionedSchemaName(m.Schema(), finalVersion))
-		fmt.Fprintln(out)
-	}
-	return nil
 }
 
 // parseMigrations tries to parse all RawMigrations and collects all the errors
