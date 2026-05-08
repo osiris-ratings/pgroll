@@ -16,6 +16,7 @@ var _ Operation = (*OpDropConstraint)(nil)
 
 func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -31,7 +32,7 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 
 	// Create a copy of the column on the underlying table.
 	dbActions := []DBAction{
-		NewColumnDuplicator(conn, table, column).WithoutConstraint(o.Name),
+		NewColumnDuplicator(conn, scope, table, column).WithoutConstraint(o.Name),
 	}
 
 	// Copy the columns from table columns, so we can use it later
@@ -46,11 +47,11 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, column.Name),
+			Name:           backfill.TriggerName(scope, o.Table, column.Name),
 			Direction:      backfill.TriggerDirectionUp,
 			Columns:        upColumns,
 			TableName:      o.Table,
-			PhysicalColumn: TemporaryName(column.Name),
+			PhysicalColumn: TemporaryName(scope, column.Name),
 			SQL:            o.upSQL(column.Name),
 		},
 	)
@@ -59,14 +60,14 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	// here, before creation of the down trigger, so that the trigger can declare
 	// a variable for the new column.
 	table.AddColumn(column.Name, &schema.Column{
-		Name: TemporaryName(column.Name),
+		Name: TemporaryName(scope, column.Name),
 	})
 
 	// Add a trigger to copy values from the new column to the old, rewriting values using the `down` SQL.
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(o.Table, TemporaryName(column.Name)),
+			Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, column.Name)),
 			Direction:      backfill.TriggerDirectionDown,
 			Columns:        table.Columns,
 			TableName:      o.Table,
@@ -79,6 +80,7 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 
 func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
@@ -86,28 +88,29 @@ func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]D
 
 	return []DBAction{
 		NewDropFunctionAction(conn,
-			backfill.TriggerFunctionName(o.Table, column.Name),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(column.Name))),
-		NewAlterSequenceOwnerAction(conn, o.Table, column.Name, TemporaryName(column.Name)),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+			backfill.TriggerFunctionName(scope, o.Table, column.Name),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, column.Name))),
+		NewAlterSequenceOwnerAction(conn, o.Table, column.Name, TemporaryName(scope, column.Name)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 		NewDropColumnAction(conn, o.Table, column.Name),
-		NewRenameDuplicatedColumnAction(conn, table, column.Name),
+		NewRenameDuplicatedColumnAction(conn, scope, table, column.Name),
 	}, nil
 }
 
 func (o *OpDropConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
 	columnName := table.GetConstraintColumns(o.Name)[0]
 
 	return []DBAction{
-		NewDropColumnAction(conn, o.Table, TemporaryName(columnName)),
+		NewDropColumnAction(conn, o.Table, TemporaryName(scope, columnName)),
 		NewDropFunctionAction(conn,
-			backfill.TriggerFunctionName(o.Table, columnName),
-			backfill.TriggerFunctionName(o.Table, TemporaryName(columnName))),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+			backfill.TriggerFunctionName(scope, o.Table, columnName),
+			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, columnName))),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 

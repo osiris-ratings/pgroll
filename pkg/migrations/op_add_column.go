@@ -21,6 +21,7 @@ var (
 
 func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -38,14 +39,14 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		fastPathDefault = v
 	}
 
-	action, err := addColumn(conn, *o, table, fastPathDefault)
+	action, err := addColumn(conn, scope, *o, table, fastPathDefault)
 	if err != nil {
 		return nil, err
 	}
 	dbActions := []DBAction{action}
 
 	if o.Column.Comment != nil {
-		dbActions = append(dbActions, NewCommentColumnAction(conn, table.Name, TemporaryName(o.Column.Name), o.Column.Comment))
+		dbActions = append(dbActions, NewCommentColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Comment))
 	}
 
 	// If the column is `NOT NULL` and there is no default value (either because
@@ -87,7 +88,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				s.Name,
 				UniqueIndexName(o.Column.Name),
 				table.Name,
-				TemporaryName(o.Column.Name),
+				TemporaryName(scope, o.Column.Name),
 			))
 	}
 
@@ -105,18 +106,18 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		task = backfill.NewTask(
 			table,
 			backfill.OperationTrigger{
-				Name:           backfill.TriggerName(o.Table, o.Column.Name),
+				Name:           backfill.TriggerName(scope, o.Table, o.Column.Name),
 				Direction:      backfill.TriggerDirectionUp,
 				Columns:        table.Columns,
 				TableName:      table.Name,
-				PhysicalColumn: TemporaryName(o.Column.Name),
+				PhysicalColumn: TemporaryName(scope, o.Column.Name),
 				SQL:            o.Up,
 			},
 		)
 	}
 
 	tmpColumn := toSchemaColumn(o.Column)
-	tmpColumn.Name = TemporaryName(o.Column.Name)
+	tmpColumn.Name = TemporaryName(scope, o.Column.Name)
 	table.AddColumn(o.Column.Name, tmpColumn)
 
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
@@ -138,11 +139,12 @@ func toSchemaColumn(c Column) *schema.Column {
 
 func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	dbActions := []DBAction{
-		NewRenameColumnAction(conn, o.Table, TemporaryName(o.Column.Name), o.Column.Name),
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(o.Table, o.Column.Name)),
-		NewDropColumnAction(conn, o.Table, backfill.CNeedsBackfillColumn),
+		NewRenameColumnAction(conn, o.Table, TemporaryName(scope, o.Column.Name), o.Column.Name),
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
+		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
 	}
 
 	if !o.Column.IsNullable() && o.Column.Default == nil {
@@ -162,7 +164,7 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 
 	// If the column has a DEFAULT that could not be set using the fast-path
 	// optimization, set it here.
-	column := s.GetTable(o.Table).GetColumn(TemporaryName(o.Column.Name))
+	column := s.GetTable(o.Table).GetColumn(TemporaryName(scope, o.Column.Name))
 	if o.Column.HasDefault() && column.Default == nil {
 		dbActions = append(dbActions, NewSetDefaultValueAction(conn, o.Table, o.Column.Name, *o.Column.Default))
 
@@ -177,6 +179,7 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 
 func (o *OpAddColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 	if table == nil {
@@ -189,8 +192,8 @@ func (o *OpAddColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 
 	return []DBAction{
 		NewDropColumnAction(conn, table.Name, column.Name),
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(o.Table, o.Column.Name)),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 
@@ -248,13 +251,13 @@ func (o *OpAddColumn) Validate(ctx context.Context, s *schema.Schema) error {
 	// Update the schema to ensure that the new column is visible to validation of
 	// subsequent operations.
 	table.AddColumn(o.Column.Name, &schema.Column{
-		Name: TemporaryName(o.Column.Name),
+		Name: TemporaryName(s.MigrationScope, o.Column.Name),
 	})
 
 	return nil
 }
 
-func addColumn(conn db.DB, o OpAddColumn, t *schema.Table, fastPathDefault bool) (DBAction, error) {
+func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPathDefault bool) (DBAction, error) {
 	// don't add non-nullable columns with no default directly
 	// they are handled by:
 	// - adding the column as nullable
@@ -297,7 +300,7 @@ func addColumn(conn db.DB, o OpAddColumn, t *schema.Table, fastPathDefault bool)
 		o.Column.Nullable = true
 	}
 
-	o.Column.Name = TemporaryName(o.Column.Name)
+	o.Column.Name = TemporaryName(scope, o.Column.Name)
 
 	withPK := true
 	return NewAddColumnAction(conn, t.Name, o.Column, withPK), nil

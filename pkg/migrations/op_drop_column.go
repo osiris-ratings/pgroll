@@ -17,13 +17,14 @@ var (
 
 func (o *OpDropColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
+	scope := s.MigrationScope
 
 	var task *backfill.Task
 	if o.Down != "" {
 		task = backfill.NewTask(
 			nil,
 			backfill.OperationTrigger{
-				Name:           backfill.TriggerName(o.Table, o.Column),
+				Name:           backfill.TriggerName(scope, o.Table, o.Column),
 				Direction:      backfill.TriggerDirectionDown,
 				Columns:        s.GetTable(o.Table).Columns,
 				TableName:      s.GetTable(o.Table).Name,
@@ -49,16 +50,18 @@ func (o *OpDropColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 
 func (o *OpDropColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
+	scope := s.MigrationScope
 
 	return []DBAction{
 		NewDropColumnAction(conn, o.Table, o.Column),
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(o.Table, o.Column)),
-		NewDropColumnAction(conn, o.Table, backfill.CNeedsBackfillColumn),
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column)),
+		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 
 func (o *OpDropColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
+	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
 
@@ -67,8 +70,8 @@ func (o *OpDropColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 	s.GetTable(o.Table).UnRemoveColumn(o.Column)
 
 	return []DBAction{
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(o.Table, o.Column)),
-		NewDropColumnAction(conn, table.Name, backfill.CNeedsBackfillColumn),
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 

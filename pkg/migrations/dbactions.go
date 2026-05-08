@@ -720,11 +720,11 @@ func (a *CreateCheckConstraintAction) Execute(ctx context.Context) error {
 // In order for the `check` expression to be easy to write, migration authors specify
 // the check expression as though it were being applied to the old column,
 // On migration start, however, the check is actually applied to the new (temporary)
-// column.
-// This function naively rewrites the check expression to apply to the new column.
-func rewriteCheckExpression(check string, columns ...string) string {
+// column. This function naively rewrites the check expression to apply to the
+// per-migration temp name (`_pgroll_new_<col>_<scope>`).
+func rewriteCheckExpression(scope, check string, columns ...string) string {
 	for _, col := range columns {
-		check = strings.ReplaceAll(check, col, TemporaryName(col))
+		check = strings.ReplaceAll(check, col, TemporaryName(scope, col))
 	}
 	return check
 }

@@ -28,6 +28,19 @@ type Schema struct {
 	Name string `json:"name"`
 	// Tables is a map of virtual table name -> table mapping
 	Tables map[string]*Table `json:"tables"`
+	// MigrationScope is a short stable suffix derived from the migration
+	// currently being processed. Naming helpers (TemporaryName,
+	// TriggerFunctionName, TriggerName, DeletionName, DuplicationName) use
+	// it to produce per-migration-unique pgroll-internal identifiers so
+	// concurrently-deferred intermediates don't collide on temp column
+	// names, trigger function names, or soft-deleted table names.
+	//
+	// Set by Roll on the schema before each operation invocation; left
+	// empty by callers that don't need scoping (e.g. the no-op
+	// `Migration.UpdateVirtualSchema` replay against FakeDB will receive
+	// the parent migration's scope through its own pre-call setup).
+	// Excluded from JSON so it doesn't leak into resulting_schema.
+	MigrationScope string `json:"-"`
 }
 
 // Table represents a table in the schema

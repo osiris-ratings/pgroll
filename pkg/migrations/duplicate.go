@@ -18,6 +18,7 @@ import (
 // comments.
 type duplicator struct {
 	id                string
+	scope             string
 	stmtBuilder       *duplicatorStmtBuilder
 	conn              db.DB
 	columns           map[string]*columnToDuplicate
@@ -34,6 +35,7 @@ type columnToDuplicate struct {
 // duplicatorStmtBuilder is a helper for building SQL statements to duplicate
 // columns and constraints in a table.
 type duplicatorStmtBuilder struct {
+	scope string
 	table *schema.Table
 }
 
@@ -42,21 +44,26 @@ const (
 	undefinedFunctionErrorCode pq.ErrorCode = "42883"
 )
 
-// NewColumnDuplicator creates a new Duplicator for a column.
-func NewColumnDuplicator(conn db.DB, table *schema.Table, columns ...*schema.Column) *duplicator {
+// NewColumnDuplicator creates a new Duplicator for a column. The migration
+// scope makes the duplicated identifiers (`_pgroll_new_<col>_<scope>`,
+// `_pgroll_dup_<constraint>_<scope>`) unique per migration so concurrently-
+// deferred duplicator-pattern ops on the same source column don't collide.
+func NewColumnDuplicator(conn db.DB, scope string, table *schema.Table, columns ...*schema.Column) *duplicator {
 	cols := make(map[string]*columnToDuplicate, len(columns))
 	columsID := make([]string, 0, len(columns))
 	for _, column := range columns {
 		cols[column.Name] = &columnToDuplicate{
 			column:   column,
-			asName:   TemporaryName(column.Name),
+			asName:   TemporaryName(scope, column.Name),
 			withType: column.Type,
 		}
 		columsID = append(columsID, column.Name)
 	}
 	return &duplicator{
-		id: fmt.Sprintf("duplicate_%s_%s", table.Name, strings.Join(columsID, "_")),
+		id:    fmt.Sprintf("duplicate_%s_%s", table.Name, strings.Join(columsID, "_")),
+		scope: scope,
 		stmtBuilder: &duplicatorStmtBuilder{
+			scope: scope,
 			table: table,
 		},
 		conn:              conn,
@@ -142,7 +149,7 @@ func (d *duplicator) Execute(ctx context.Context) error {
 			continue
 		}
 		if duplicatedMember, constraintColumns := d.stmtBuilder.allConstraintColumns(uc.Columns, colNames...); duplicatedMember {
-			action := NewCreateUniqueIndexConcurrentlyAction(d.conn, "", DuplicationName(uc.Name), d.stmtBuilder.table.Name, constraintColumns...)
+			action := NewCreateUniqueIndexConcurrentlyAction(d.conn, "", DuplicationName(d.scope, uc.Name), d.stmtBuilder.table.Name, constraintColumns...)
 			if err := action.Execute(ctx); err != nil {
 				return err
 			}
@@ -177,7 +184,7 @@ func (d *duplicatorStmtBuilder) duplicateCheckConstraints(withoutConstraint []st
 		}
 		if duplicatedConstraintColumns := d.duplicatedConstraintColumns(cc.Columns, colNames...); len(duplicatedConstraintColumns) > 0 {
 			sql := fmt.Sprintf("ALTER TABLE %s ADD ", pq.QuoteIdentifier(d.table.Name))
-			writer := ConstraintSQLWriter{Name: DuplicationName(cc.Name), SkipValidation: true}
+			writer := ConstraintSQLWriter{Name: DuplicationName(d.scope, cc.Name), SkipValidation: true}
 			sql += writer.WriteCheck(rewriteCheckExpression(cc.Definition, duplicatedConstraintColumns...), cc.NoInherit)
 			stmts = append(stmts, sql)
 		}
@@ -194,7 +201,7 @@ func (d *duplicatorStmtBuilder) duplicateForeignKeyConstraints(withoutConstraint
 		if duplicatedMember, constraintColumns := d.allConstraintColumns(fk.Columns, colNames...); duplicatedMember {
 			sql := fmt.Sprintf("ALTER TABLE %s ADD ", pq.QuoteIdentifier(d.table.Name))
 			writer := ConstraintSQLWriter{
-				Name:    DuplicationName(fk.Name),
+				Name:    DuplicationName(d.scope, fk.Name),
 				Columns: constraintColumns,
 			}
 			sql += writer.WriteForeignKey(
@@ -227,7 +234,7 @@ func (d *duplicatorStmtBuilder) duplicateIndexes(withoutConstraint []string, col
 			if idx.Unique {
 				stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s"
 			}
-			stmt := fmt.Sprintf(stmtFmt, pq.QuoteIdentifier(DuplicationName(idx.Name)), pq.QuoteIdentifier(d.table.Name))
+			stmt := fmt.Sprintf(stmtFmt, pq.QuoteIdentifier(DuplicationName(d.scope, idx.Name)), pq.QuoteIdentifier(d.table.Name))
 			if idx.Method != "" {
 				stmt += fmt.Sprintf(" USING %s", string(idx.Method))
 			}
@@ -270,7 +277,7 @@ func (d *duplicatorStmtBuilder) allConstraintColumns(constraintColumns []string,
 	newConstraintColumns := make([]string, len(constraintColumns))
 	for i, column := range constraintColumns {
 		if slices.Contains(duplicatedColumns, column) {
-			newConstraintColumns[i] = TemporaryName(column)
+			newConstraintColumns[i] = TemporaryName(d.scope, column)
 			duplicatedMember = true
 		} else {
 			newConstraintColumns[i] = column
@@ -299,7 +306,7 @@ func (d *duplicatorStmtBuilder) duplicateColumn(
 	// Generate SQL to add an unchecked NOT NULL constraint if the original column
 	// is NOT NULL. The constraint will be validated on migration completion.
 	if !column.Nullable && !withoutNotNull {
-		constraintName := DuplicationName(NotNullConstraintName(column.Name))
+		constraintName := DuplicationName(d.scope, NotNullConstraintName(column.Name))
 		if _, ok := d.table.CheckConstraints[constraintName]; ok {
 			return sql // Skip if the constraint already exists
 		}
@@ -350,9 +357,11 @@ func (d *duplicatorStmtBuilder) duplicateComment(column *schema.Column, asName s
 	)
 }
 
-// DuplicationName returns the name of a duplicated column.
-func DuplicationName(name string) string {
-	return "_pgroll_dup_" + name
+// DuplicationName returns the per-migration name of a duplicated constraint
+// or index. The scope suffix prevents concurrently-deferred duplicator-pattern
+// ops on the same source object from colliding.
+func DuplicationName(scope, name string) string {
+	return "_pgroll_dup_" + name + scopeSuffix(scope)
 }
 
 // IsDuplicatedName returns true if the name is a duplicated column name.
@@ -360,9 +369,29 @@ func IsDuplicatedName(name string) bool {
 	return strings.HasPrefix(name, "_pgroll_dup_")
 }
 
-// StripDuplicationPrefix removes the duplication prefix from a column name.
+// StripDuplicationPrefix removes the duplication prefix and any
+// MigrationScope suffix from a duplicated identifier.
 func StripDuplicationPrefix(name string) string {
-	return strings.TrimPrefix(name, "_pgroll_dup_")
+	stripped := strings.TrimPrefix(name, "_pgroll_dup_")
+	// Trim a trailing "_<8 hex chars>" if present (the scope suffix shape
+	// produced by DuplicationName); leave the name alone if it doesn't
+	// match so legacy unscoped names round-trip cleanly.
+	if len(stripped) > MigrationScopeLength+1 {
+		tail := stripped[len(stripped)-MigrationScopeLength-1:]
+		if tail[0] == '_' && isHexLower(tail[1:]) {
+			return stripped[:len(stripped)-MigrationScopeLength-1]
+		}
+	}
+	return stripped
+}
+
+func isHexLower(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func errorIgnoringErrorCode(err error, code pq.ErrorCode) error {
