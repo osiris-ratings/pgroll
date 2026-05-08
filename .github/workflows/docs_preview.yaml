@@ -4,6 +4,12 @@ on:
     types: [opened, reopened, synchronize]
 jobs:
   docs-preview:
+    # The docs preview deploys to pgroll.com, which is owned by Xata. In
+    # the Baselayer fork we don't control that domain, so the deployment
+    # always fails. Gate the job on the upstream repo so it becomes a
+    # skipped no-op here while keeping the file identical to upstream
+    # (no rebase conflicts when pulling Xata's docs-preview changes).
+    if: github.repository == 'xataio/pgroll'
     runs-on: ubuntu-latest
     steps:
       - name: Create Docs Preview GitHub Deployment
@@ -37,4 +43,3 @@ jobs:
               description: 'Created a preview',
               environment_url: previewUrl
             });
-
