@@ -117,3 +117,57 @@ tasks:
       - brew tap | grep -q pgroll && brew untap osiris-ratings/pgroll || true
       - brew tap osiris-ratings/pgroll git@github.com:osiris-ratings/pgroll.git
       - HOMEBREW_GITHUB_API_TOKEN=$(gh auth token) brew install osiris-ratings/pgroll/pgroll
+
+  release:test:deb:
+    desc: Snapshot-build the .deb via goreleaser-cross and install it in a debian container
+    summary: |
+      Runs goreleaser --snapshot in the goreleaser-cross Docker image to
+      produce .deb artifacts in dist/, then installs the host-arch .deb
+      in a debian:stable-slim container to verify packaging end-to-end:
+      binary, completions, and the pgroll-update script.
+
+      Requires Docker.
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "docker not found"; exit 1
+        fi
+
+        HOST_ARCH=$(uname -m)
+        case "$HOST_ARCH" in
+          x86_64) DEB_ARCH=amd64 ;;
+          aarch64|arm64) DEB_ARCH=arm64 ;;
+          *) echo "unsupported host arch: $HOST_ARCH"; exit 1 ;;
+        esac
+
+        echo "==> Snapshot build via goreleaser-cross..."
+        docker run --rm \
+          -v "$PWD:/go/src/pgroll" \
+          -w /go/src/pgroll \
+          goreleaser/goreleaser-cross:v1.24 \
+          release --snapshot --clean --skip=publish
+
+        DEB=$(ls dist/pgroll_*_${DEB_ARCH}.deb 2>/dev/null | head -1)
+        if [ -z "$DEB" ]; then
+          echo "no .deb produced for ${DEB_ARCH}"; exit 1
+        fi
+        DEB_NAME=$(basename "$DEB")
+        echo "==> Built: $DEB"
+
+        echo "==> Installing in debian:stable-slim..."
+        docker run --rm \
+          -v "$PWD/dist:/dist:ro" \
+          -e DEB_NAME="$DEB_NAME" \
+          debian:stable-slim bash -euc '
+            apt-get update -qq
+            apt-get install -y --no-install-recommends "/dist/$DEB_NAME"
+            pgroll --version
+            test -f /usr/share/bash-completion/completions/pgroll && echo "bash completion ok"
+            test -f /usr/share/zsh/site-functions/_pgroll && echo "zsh completion ok"
+            test -x /usr/local/bin/pgroll-update && echo "pgroll-update ok"
+          '
+
+        echo "==> .deb verified."

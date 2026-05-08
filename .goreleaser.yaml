@@ -5,6 +5,9 @@ project_name: pgroll
 before:
   hooks:
     - go mod tidy
+    - mkdir -p completions
+    - sh -c "go run . completion bash > completions/pgroll.bash"
+    - sh -c "go run . completion zsh > completions/pgroll.zsh"
 
 builds:
   - id: pgroll
@@ -47,6 +50,38 @@ archives:
       - tar.gz
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+nfpms:
+  - id: pgroll-deb
+    package_name: pgroll
+    ids:
+      - pgroll
+    file_name_template: "{{ .ConventionalFileName }}"
+    homepage: "https://github.com/osiris-ratings/pgroll"
+    description: "Postgres zero-downtime migrations made easy (Baselayer fork)"
+    maintainer: "Blake Watters <blake@baselayer.com>"
+    license: "Apache-2.0"
+    vendor: "Baselayer"
+    formats:
+      - deb
+    bindir: /usr/bin
+    dependencies:
+      - curl
+      - jq
+      - ca-certificates
+    contents:
+      - src: ./completions/pgroll.bash
+        dst: /usr/share/bash-completion/completions/pgroll
+        file_info:
+          mode: 0644
+      - src: ./completions/pgroll.zsh
+        dst: /usr/share/zsh/site-functions/_pgroll
+        file_info:
+          mode: 0644
+      - src: ./scripts/pgroll-update.sh
+        dst: /usr/local/bin/pgroll-update
+        file_info:
+          mode: 0755
 
 brews:
   - repository:
