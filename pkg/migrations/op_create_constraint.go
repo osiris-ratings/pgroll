@@ -98,7 +98,7 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 	case OpCreateConstraintTypeCheck:
 		dbActions = append(
 			dbActions,
-			NewCreateCheckConstraintAction(conn, table.Name, o.Name, *o.Check, o.Columns, o.NoInherit, true),
+			NewCreateCheckConstraintAction(conn, scope, table.Name, o.Name, *o.Check, o.Columns, o.NoInherit, true),
 		)
 		return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 

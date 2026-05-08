@@ -87,7 +87,7 @@ func TestAddColumn(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has been dropped from the underlying table
-				columnName := migrations.TemporaryName("age")
+				columnName := migrations.TemporaryName("", "age")
 				ColumnMustNotExist(t, db, schema, "users", columnName)
 
 				// The table's column count reflects the drop of the new column
@@ -209,7 +209,7 @@ func TestAddColumn(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has been dropped from the underlying table
-				columnName := migrations.TemporaryName("age")
+				columnName := migrations.TemporaryName("", "age")
 				ColumnMustNotExist(t, db, schema, "users", columnName)
 
 				// The table's column count reflects the drop of the new column
@@ -313,7 +313,7 @@ func TestAddColumn(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The new column has been dropped from the underlying table
-				columnName := migrations.TemporaryName("age")
+				columnName := migrations.TemporaryName("", "age")
 				ColumnMustNotExist(t, db, schema, "users", columnName)
 
 				// The table's column count reflects the drop of the new column
@@ -861,11 +861,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -877,11 +877,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 				}, res)
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 		},
@@ -943,11 +943,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -959,11 +959,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 				}, res)
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 		},
@@ -1025,11 +1025,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -1041,11 +1041,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 				}, res)
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 		},
@@ -1109,11 +1109,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -1125,11 +1125,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 				}, res)
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 		},
@@ -1200,11 +1200,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
@@ -1217,11 +1217,11 @@ func TestAddColumnWithUpSql(t *testing.T) {
 				}, res)
 
 				// The trigger function has been dropped.
-				triggerFnName := backfill.TriggerFunctionName("products", "description")
+				triggerFnName := backfill.TriggerFunctionName("", "products", "description")
 				FunctionMustNotExist(t, db, schema, triggerFnName)
 
 				// The trigger has been dropped.
-				triggerName := backfill.TriggerName("products", "description")
+				triggerName := backfill.TriggerName("", "products", "description")
 				TriggerMustNotExist(t, db, schema, "products", triggerName)
 			},
 		},
@@ -2168,7 +2168,7 @@ func TestAddColumnWithComment(t *testing.T) {
 		},
 		afterStart: func(t *testing.T, db *sql.DB, schema string) {
 			// The comment has been added to the underlying column.
-			columnName := migrations.TemporaryName("age")
+			columnName := migrations.TemporaryName("", "age")
 			ColumnMustHaveComment(t, db, schema, "users", columnName, "the age of the user")
 		},
 		afterRollback: func(t *testing.T, db *sql.DB, schema string) {

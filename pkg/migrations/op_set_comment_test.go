@@ -67,7 +67,7 @@ func TestSetComment(t *testing.T) {
 				ColumnMustHaveComment(t, db, schema, "users", "name", "apples")
 
 				// The new column should have the new comment.
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("name"), "name of the user")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("", "name"), "name of the user")
 
 				// The old schema view has the expected rows
 				rows := MustSelect(t, db, schema, "add_table", "users")
@@ -150,7 +150,7 @@ func TestSetComment(t *testing.T) {
 				ColumnMustHaveComment(t, db, schema, "users", "name", "apples")
 
 				// The new column should have the new comment.
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("name"), "name of the user")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("", "name"), "name of the user")
 
 				// The old schema view has the expected rows
 				rows := MustSelect(t, db, schema, "01_add_table", "users")
@@ -221,7 +221,7 @@ func TestSetComment(t *testing.T) {
 				ColumnMustHaveComment(t, db, schema, "users", "name", "apples")
 
 				// The new column should have no comment.
-				ColumnMustNotHaveComment(t, db, schema, "users", migrations.TemporaryName("name"))
+				ColumnMustNotHaveComment(t, db, schema, "users", migrations.TemporaryName("", "name"))
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 				// The old column should have the old comment.
@@ -269,7 +269,7 @@ func TestSetComment(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The comment has not been changed on the temporary column.
-				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("name"), "apples")
+				ColumnMustHaveComment(t, db, schema, "users", migrations.TemporaryName("", "name"), "apples")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},

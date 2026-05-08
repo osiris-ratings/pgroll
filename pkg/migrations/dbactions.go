@@ -682,6 +682,7 @@ func (a *validateConstraintAction) Execute(ctx context.Context) error {
 type CreateCheckConstraintAction struct {
 	conn           db.DB
 	id             string
+	scope          string
 	table          string
 	columns        []string
 	constraint     string
@@ -690,10 +691,11 @@ type CreateCheckConstraintAction struct {
 	skipValidation bool
 }
 
-func NewCreateCheckConstraintAction(conn db.DB, table, constraint, check string, columns []string, noInherit, skipValidation bool) *CreateCheckConstraintAction {
+func NewCreateCheckConstraintAction(conn db.DB, scope, table, constraint, check string, columns []string, noInherit, skipValidation bool) *CreateCheckConstraintAction {
 	return &CreateCheckConstraintAction{
 		conn:           conn,
 		id:             fmt.Sprintf("create_check_constraint_%s_%s", table, constraint),
+		scope:          scope,
 		table:          table,
 		columns:        columns,
 		check:          check,
@@ -712,7 +714,7 @@ func (a *CreateCheckConstraintAction) Execute(ctx context.Context) error {
 		Name:           a.constraint,
 		SkipValidation: a.skipValidation,
 	}
-	sql += writer.WriteCheck(rewriteCheckExpression(a.check, a.columns...), a.noInherit)
+	sql += writer.WriteCheck(rewriteCheckExpression(a.scope, a.check, a.columns...), a.noInherit)
 	_, err := a.conn.ExecContext(ctx, sql)
 	return err
 }

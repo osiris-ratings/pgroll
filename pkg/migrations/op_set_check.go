@@ -33,6 +33,7 @@ func (o *OpSetCheckConstraint) Start(ctx context.Context, l Logger, conn db.DB, 
 	dbActions := []DBAction{
 		NewCreateCheckConstraintAction(
 			conn,
+			s.MigrationScope,
 			table.Name,
 			o.Check.Name,
 			o.Check.Constraint,

@@ -59,6 +59,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		dbActions = append(dbActions,
 			NewCreateCheckConstraintAction(
 				conn,
+				scope,
 				table.Name,
 				NotNullConstraintName(o.Column.Name),
 				fmt.Sprintf("%s IS NOT NULL", o.Column.Name),
@@ -72,6 +73,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		dbActions = append(dbActions,
 			NewCreateCheckConstraintAction(
 				conn,
+				scope,
 				table.Name,
 				o.Column.Check.Name,
 				o.Column.Check.Constraint,

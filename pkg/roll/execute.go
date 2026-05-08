@@ -44,6 +44,10 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 	if err != nil {
 		return err
 	}
+	// Set the migration's scope on the schema so any naming helpers
+	// invoked during Validate (e.g. via sub-op Validate paths that call
+	// table.AddColumn(temp_name, ...)) produce the right identifiers.
+	lastSchema.MigrationScope = migrations.MigrationScopeFor(migration.Name)
 	err = migration.Validate(ctx, lastSchema)
 	if err != nil {
 		return fmt.Errorf("migration '%s' is invalid: %w", migration.Name, err)
@@ -89,32 +93,51 @@ func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, erro
 
 	// Reverse OpDropTable's soft-delete physical rename so its replay can
 	// find the table to mark Deleted. OpDropTable.Start renames the table
-	// to `_pgroll_del_<name>` physically; read_schema returns it under
-	// that physical key. Without folding it back, a deferred OpDropTable
-	// replay errors with "table does not exist" in any subsequent
-	// migration's Validate/Start. Skip the fold when the un-prefixed key
-	// already exists (the create-with-same-name case after a deferred
-	// drop) — the new table takes precedence.
-	for k, t := range s.Tables {
-		if t == nil {
-			continue
+	// to `_pgroll_del_<name>_<scope>` physically; read_schema returns it
+	// under that physical key. Build a lookup of (scope -> set of orig
+	// names that this migration soft-deleted), then for each migration's
+	// soft-deletes, fold the physical entry back to the un-prefixed key
+	// so the replay can find it.
+	for _, dm := range deferred {
+		dmScope := migrations.MigrationScopeFor(dm.Name)
+		suffix := "_pgroll_del_"
+		for k, t := range s.Tables {
+			if t == nil {
+				continue
+			}
+			// Look for `_pgroll_del_<orig>_<dmScope>` matching this
+			// migration's scope; that's a table this dm soft-deleted.
+			if !strings.HasPrefix(t.Name, suffix) {
+				continue
+			}
+			rest := strings.TrimPrefix(t.Name, suffix)
+			scopeTail := "_" + dmScope
+			if !strings.HasSuffix(rest, scopeTail) {
+				continue
+			}
+			orig := strings.TrimSuffix(rest, scopeTail)
+			if _, exists := s.Tables[orig]; exists {
+				continue
+			}
+			s.Tables[orig] = t
+			delete(s.Tables, k)
 		}
-		orig := strings.TrimPrefix(t.Name, "_pgroll_del_")
-		if orig == t.Name {
-			continue
-		}
-		if _, exists := s.Tables[orig]; exists {
-			continue
-		}
-		s.Tables[orig] = t
-		delete(s.Tables, k)
 	}
 
+	// Replay each deferred migration's Start with its own scope set on
+	// the schema, so naming helpers inside op.Start produce identifiers
+	// matching what's physically present in the database.
 	for _, dm := range deferred {
+		s.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 		if err := dm.UpdateVirtualSchema(ctx, s); err != nil {
 			return nil, fmt.Errorf("unable to apply deferred virtual schema for %q: %w", dm.Name, err)
 		}
 	}
+	// Reset to empty so subsequent helper calls don't accidentally use
+	// a prior migration's scope. The caller (Roll.Start, drain, etc.) is
+	// responsible for setting scope to the migration currently being
+	// processed before invoking ops on the returned schema.
+	s.MigrationScope = ""
 
 	for _, table := range s.Tables {
 		for k, v := range table.Columns {
@@ -221,9 +244,15 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	if err != nil {
 		return nil, fmt.Errorf("unable to read schema: %w", err)
 	}
+	// Set the per-migration scope on the schema so naming helpers
+	// (TemporaryName, TriggerFunctionName, NeedsBackfillColumnName, etc.)
+	// produce identifiers that don't collide with concurrently-deferred
+	// migrations.
+	scope := migrations.MigrationScopeFor(migration.Name)
+	newSchema.MigrationScope = scope
 
 	// execute operations
-	job := backfill.NewJob(m.schema, versionSchemaName)
+	job := backfill.NewJob(m.schema, versionSchemaName, scope)
 	for _, op := range migration.Operations {
 		startOp, err := op.Start(ctx, m.logger, m.pgConn, newSchema)
 		if err != nil {
@@ -422,6 +451,11 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 			if err != nil {
 				return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
 			}
+			// Set this deferred migration's scope on the schema so its
+			// op.Complete naming helpers produce identifiers matching
+			// what's physically present (the temp/trigger/marker names
+			// installed by the same migration's earlier Start).
+			drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 			for _, op := range dm.Operations {
 				opActions, err := op.Complete(m.logger, m.pgConn, drainSchema)
 				if err != nil {
@@ -440,6 +474,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
 	}
+	// Set the active migration's scope so its op.Complete naming helpers
+	// match the identifiers installed by its earlier Start.
+	currentSchema.MigrationScope = migrations.MigrationScopeFor(migration.Name)
 
 	// run any BeforeCompleteDDL hooks
 	if m.migrationHooks.BeforeCompleteDDL != nil {
@@ -548,6 +585,11 @@ func (m *Roll) Rollback(ctx context.Context) error {
 		}
 	}
 
+	// Set the migration's scope so naming helpers in op.Start (replayed
+	// here via UpdateVirtualSchema) and op.Rollback produce identifiers
+	// matching the physical artifacts installed during Start.
+	schema.MigrationScope = migrations.MigrationScopeFor(migration.Name)
+
 	// update the in-memory schema with the results of applying the migration
 	if err := migration.UpdateVirtualSchema(ctx, schema); err != nil {
 		return fmt.Errorf("unable to replay changes to in-memory schema: %w", err)
@@ -645,7 +687,7 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 	// operator without requiring callers of NewConfig to opt in.
 	backfill.WithLogger(m.logger)(cfg)
 
-	bf := backfill.New(m.pgConn, cfg)
+	bf := backfill.New(m.pgConn, cfg, job.MigrationScope())
 
 	bf.CreateTriggers(ctx, job)
 

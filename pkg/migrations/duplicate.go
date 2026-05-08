@@ -185,7 +185,7 @@ func (d *duplicatorStmtBuilder) duplicateCheckConstraints(withoutConstraint []st
 		if duplicatedConstraintColumns := d.duplicatedConstraintColumns(cc.Columns, colNames...); len(duplicatedConstraintColumns) > 0 {
 			sql := fmt.Sprintf("ALTER TABLE %s ADD ", pq.QuoteIdentifier(d.table.Name))
 			writer := ConstraintSQLWriter{Name: DuplicationName(d.scope, cc.Name), SkipValidation: true}
-			sql += writer.WriteCheck(rewriteCheckExpression(cc.Definition, duplicatedConstraintColumns...), cc.NoInherit)
+			sql += writer.WriteCheck(rewriteCheckExpression(d.scope, cc.Definition, duplicatedConstraintColumns...), cc.NoInherit)
 			stmts = append(stmts, sql)
 		}
 	}

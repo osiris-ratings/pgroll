@@ -978,20 +978,20 @@ func TableMustBeCleanedUp(t *testing.T, db *sql.DB, schema, table string, column
 
 	for _, column := range columns {
 		// The temporary column should not exist on the underlying table.
-		ColumnMustNotExist(t, db, schema, table, migrations.TemporaryName(column))
+		ColumnMustNotExist(t, db, schema, table, migrations.TemporaryName("", column))
 
 		// The _pgroll_needs_backfill column should not exist on the table.
-		ColumnMustNotExist(t, db, schema, table, backfill.CNeedsBackfillColumn)
+		ColumnMustNotExist(t, db, schema, table, backfill.NeedsBackfillColumnName(""))
 
 		// The up function for the column no longer exists.
-		FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName(table, column))
+		FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("", table, column))
 		// The down function for the column no longer exists.
-		FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName(table, migrations.TemporaryName(column)))
+		FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("", table, migrations.TemporaryName("", column)))
 
 		// The up trigger for the column no longer exists.
-		TriggerMustNotExist(t, db, schema, table, backfill.TriggerName(table, column))
+		TriggerMustNotExist(t, db, schema, table, backfill.TriggerName("", table, column))
 		// The down trigger for the column no longer exists.
-		TriggerMustNotExist(t, db, schema, table, backfill.TriggerName(table, migrations.TemporaryName(column)))
+		TriggerMustNotExist(t, db, schema, table, backfill.TriggerName("", table, migrations.TemporaryName("", column)))
 	}
 }
 

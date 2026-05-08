@@ -116,44 +116,26 @@ func (m *Migration) Validate(ctx context.Context, s *schema.Schema) error {
 }
 
 // CompleteMustBeDeferred reports whether this migration's Complete actions
-// must be deferred to the final `pgroll complete` because (a) inline they'd
-// be blocked by views in the previous-production version schema, *and*
-// (b) deferring them produces a clean replay over subsequent migrations'
-// schema reads.
+// must be deferred to the final `pgroll complete` so destructive DDL
+// doesn't run while the prev-production version schema's views still
+// reference the affected objects.
 //
-// The intersection is narrower than "all destructive ops":
+// Now that pgroll-internal artifacts (`_pgroll_new_<col>`,
+// `_pgroll_trigger_<table>_<col>`, `_pgroll_needs_backfill`,
+// `_pgroll_del_<name>`) are namespaced per-migration via MigrationScope,
+// every operation type composes cleanly under deferred-Complete:
+// concurrently-deferred migrations don't collide on temp column names,
+// trigger function names, or soft-deleted table names. So in batched
+// `pgroll migrate` flows we defer every intermediate's Complete and
+// drain them all together at final Complete, after the prev-prod schema
+// has been dropped.
 //
-//   - OpDropColumn, OpDropTable, OnComplete-true raw SQL: deferral works.
-//     Their Start-side schema mutations are pure (mark Deleted, soft-rename
-//     a table, no-op respectively) and replay cleanly — subsequent
-//     migrations see the schema state implied by the deferred Complete.
-//
-//   - OpRenameColumn, OpRenameTable, OpDropConstraint, OpAlterColumn,
-//     OpDropMultiColumnConstraint, OpDropIndex: deferral does *not* work
-//     yet. They mutate the in-memory schema during Start in ways that
-//     don't survive replay across migrations (duplicator-pattern stub
-//     entries lose column metadata; constraint lookups depend on state
-//     mutated by earlier deferred Starts that itself didn't survive).
-//     Run them inline with WithSkipSchemaDrop. Inline runs may fail when
-//     prev-prod's view references the affected column — same failure
-//     mode as before #18 — but that's a narrower problem than breaking
-//     every batch that contains an alter-column.
-//
-// The migrate command uses this to pick between WithDeferComplete (defer
-// to final Complete after prev-prod schema drops) and WithSkipSchemaDrop
-// (run inline, preserving prev-prod schema for in-flight apps).
+// Returns true for any non-empty migration. The classifier method
+// remains for callers (cmd/migrate) that want to opt into the deferred
+// path explicitly; future work could remove it entirely once we're
+// confident every Roll caller wants deferral in batch mode.
 func (m *Migration) CompleteMustBeDeferred() bool {
-	for _, op := range m.Operations {
-		switch v := op.(type) {
-		case *OpDropColumn, *OpDropTable:
-			return true
-		case *OpRawSQL:
-			if v.OnComplete {
-				return true
-			}
-		}
-	}
-	return false
+	return len(m.Operations) > 0
 }
 
 // UpdateVirtualSchema updates the in-memory schema representation with the changes

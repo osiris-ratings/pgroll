@@ -60,7 +60,7 @@ func TestSetCheckConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The new (temporary) `title` column should exist on the underlying table.
-				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("title"))
+				ColumnMustExist(t, db, schema, "posts", migrations.TemporaryName("", "title"))
 
 				// A check constraint has been added to the temporary column
 				NotInheritableCheckConstraintMustExist(t, db, schema, "posts", "check_title_length")
@@ -129,14 +129,14 @@ func TestSetCheckConstraint(t *testing.T) {
 				}, rows)
 
 				// The up function no longer exists.
-				FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("posts", "title"))
+				FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("", "posts", "title"))
 				// The down function no longer exists.
-				FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("posts", migrations.TemporaryName("title")))
+				FunctionMustNotExist(t, db, schema, backfill.TriggerFunctionName("", "posts", migrations.TemporaryName("", "title")))
 
 				// The up trigger no longer exists.
-				TriggerMustNotExist(t, db, schema, "posts", backfill.TriggerName("posts", "title"))
+				TriggerMustNotExist(t, db, schema, "posts", backfill.TriggerName("", "posts", "title"))
 				// The down trigger no longer exists.
-				TriggerMustNotExist(t, db, schema, "posts", backfill.TriggerName("posts", migrations.TemporaryName("title")))
+				TriggerMustNotExist(t, db, schema, "posts", backfill.TriggerName("", "posts", migrations.TemporaryName("", "title")))
 			},
 		},
 		{
@@ -283,7 +283,7 @@ func TestSetCheckConstraint(t *testing.T) {
 					db,
 					schema,
 					"employees",
-					migrations.DuplicationName("fk_employee_department"),
+					migrations.DuplicationName("", "fk_employee_department"),
 					migrations.ForeignKeyActionCASCADE,
 					migrations.ForeignKeyActionNOACTION,
 				)
@@ -541,7 +541,7 @@ func TestSetCheckConstraint(t *testing.T) {
 			},
 			afterStart: func(t *testing.T, db *sql.DB, schema string) {
 				// The duplicated column has a comment defined on it
-				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName("title"), "the title of the post")
+				ColumnMustHaveComment(t, db, schema, "posts", migrations.TemporaryName("", "title"), "the title of the post")
 			},
 			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
 			},
