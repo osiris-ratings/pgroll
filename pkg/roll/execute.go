@@ -201,6 +201,26 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	//     that no apps will connect to and that would otherwise create view
 	//     dependencies blocking destructive ops later in the batch).
 	if !o.skipVersionSchema && !m.disableVersionSchemas {
+		// Replay the virtual schema effects of any deferred-pending
+		// intermediates onto the schema we're about to project views over.
+		// Without this, views in the new version schema would still
+		// reference columns that pending DROP COLUMN / RENAME COLUMN
+		// intermediates plan to remove, blocking those drops at drain
+		// time. Done here (rather than before the op loop) because
+		// isolated raw-SQL ops cause `m.state.ReadSchema` re-reads inside
+		// the loop, which would clobber an earlier replay. FakeDB-backed
+		// replay only mutates in-memory state; ops that don't mutate
+		// virtual schema during Start (e.g. OpRawSQL) are no-ops here —
+		// their physical effects are already in newSchema.
+		deferred, err := m.state.DeferredCompletes(ctx, m.schema)
+		if err != nil {
+			return nil, fmt.Errorf("unable to query deferred completes: %w", err)
+		}
+		for _, dm := range deferred {
+			if err := dm.UpdateVirtualSchema(ctx, newSchema); err != nil {
+				return nil, fmt.Errorf("unable to apply deferred virtual schema for %q: %w", dm.Name, err)
+			}
+		}
 		if err := m.ensureViews(ctx, newSchema, migration); err != nil {
 			return nil, err
 		}
@@ -238,18 +258,34 @@ func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migr
 // completeOptions holds options for the Complete method.
 type completeOptions struct {
 	skipSchemaDrop bool
+	deferComplete  bool
 }
 
 // CompleteOption is a functional option for the Complete method.
 type CompleteOption func(*completeOptions)
 
 // WithSkipSchemaDrop returns a CompleteOption that skips dropping old version
-// schemas during Complete. This is used by `pgroll migrate` for intermediate
-// migrations in a multi-migration batch, so cleanup is deferred until the final
-// migration is completed (either by `--complete` on migrate, or by a
-// subsequent `pgroll complete`).
+// schemas during Complete. Retained for callers that want to run intermediate
+// operations inline while preserving the previous-production version schema —
+// fine for purely-additive batches but blocks destructive DDL via dependency
+// errors. New `pgroll migrate` callers should prefer WithDeferComplete, which
+// also defers the operations themselves.
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
+}
+
+// WithDeferComplete returns a CompleteOption that records the migration as
+// logically done but queues its Complete operations for replay during the
+// next non-deferred Complete. Used by `pgroll migrate` for intermediate
+// migrations in a multi-migration batch.
+//
+// The replay window opens at the next non-deferred Complete *after* old
+// version schemas are dropped, so destructive DDL (DROP COLUMN, RENAME
+// COLUMN, drop-table, etc.) is no longer blocked by views in the
+// previous-production version schema. This is what lets a weekly batched
+// release contain mid-chain destructive migrations without getting stuck.
+func WithDeferComplete() CompleteOption {
+	return func(o *completeOptions) { o.deferComplete = true }
 }
 
 // Complete will update the database schema to match the current version
@@ -265,6 +301,22 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	}
 
 	m.logger.LogMigrationComplete(migration)
+
+	// Deferred path: record the migration as logically done with its
+	// Complete operations queued for replay during the next non-deferred
+	// Complete. Skip everything else — no schema cleanup, no operation
+	// execution. This is what `pgroll migrate` intermediates use so that
+	// destructive DDL (DROP COLUMN, RENAME COLUMN, drop-table) doesn't run
+	// while the previous-production version schema's views still reference
+	// the affected objects. Replay happens at final Complete after those
+	// schemas have been dropped.
+	if o.deferComplete {
+		if err := m.state.MarkCompleteDeferred(ctx, m.schema, migration.Name); err != nil {
+			return fmt.Errorf("unable to mark migration as complete-deferred: %w", err)
+		}
+		m.logger.Info("complete deferred — operations will replay at next non-deferred Complete", "migration", migration.Name)
+		return nil
+	}
 
 	// Drop every other version schema, keeping only the version being
 	// completed. This must happen before the operations execute so views in
@@ -282,6 +334,20 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 	} else if o.skipSchemaDrop {
 		m.logger.Info("skipping old version schema cleanup (deferred to next Complete)", "migration", migration.Name)
+	}
+
+	// Drain any deferred Completes from prior intermediates before running
+	// the active migration's own operations. The previous block has just
+	// dropped every version schema except the one being completed, so DDL
+	// the intermediates queued (e.g. DROP COLUMN) is now unblocked. If we
+	// were called with WithSkipSchemaDrop the prev-production schema is
+	// still around and replaying intermediates would fail the same way they
+	// would have mid-batch — so skip the drain in that case and leave it
+	// for whoever runs the next non-deferred Complete.
+	if !o.skipSchemaDrop {
+		if err := m.drainDeferredCompletes(ctx); err != nil {
+			return err
+		}
 	}
 
 	// read the current schema
@@ -564,6 +630,53 @@ func (m *Roll) DropVersionSchemasExcept(ctx context.Context, keep ...string) err
 		_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(s)))
 		if err != nil {
 			return fmt.Errorf("unable to drop version schema %q: %w", s, err)
+		}
+	}
+
+	return nil
+}
+
+// drainDeferredCompletes replays the Complete operations of every
+// intermediate migration that was previously recorded with WithDeferComplete.
+// Migrations are replayed in parent-chain order (oldest first) so that
+// destructive DDL applies in the same sequence the operator wrote it. After
+// each migration's actions execute successfully the complete_deferred flag is
+// cleared, making the drain idempotent under retry: a failure mid-drain
+// leaves only the unprocessed tail in the queue, and a subsequent
+// `pgroll complete` resumes from the failure point.
+func (m *Roll) drainDeferredCompletes(ctx context.Context) error {
+	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	if len(deferred) == 0 {
+		return nil
+	}
+
+	m.logger.Info("draining deferred completes", "count", len(deferred))
+
+	for _, mig := range deferred {
+		m.logger.Info("draining deferred complete", "migration", mig.Name)
+
+		currentSchema, err := m.state.ReadSchema(ctx, m.schema)
+		if err != nil {
+			return fmt.Errorf("unable to read schema before draining %q: %w", mig.Name, err)
+		}
+
+		var actions []migrations.DBAction
+		for _, op := range mig.Operations {
+			opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
+			if err != nil {
+				return fmt.Errorf("unable to collect actions for deferred complete %q: %w", mig.Name, err)
+			}
+			actions = append(actions, opActions...)
+		}
+		coordinator := migrations.NewCoordinator(actions)
+		if err := coordinator.Execute(ctx); err != nil {
+			return fmt.Errorf("unable to execute deferred complete %q: %w", mig.Name, err)
+		}
+		if err := m.state.ClearCompleteDeferred(ctx, m.schema, mig.Name); err != nil {
+			return fmt.Errorf("unable to clear complete_deferred for %q: %w", mig.Name, err)
 		}
 	}
 

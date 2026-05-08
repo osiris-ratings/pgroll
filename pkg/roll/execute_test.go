@@ -1531,6 +1531,262 @@ func TestExistingVersionSchemas(t *testing.T) {
 	})
 }
 
+// TestDeferCompleteAllowsMidBatchDestructiveOp is the load-bearing scenario
+// for WithDeferComplete: a weekly batched release where a destructive
+// migration sits between additive ones. With WithDeferComplete on every
+// intermediate, the destructive DROP COLUMN no longer fails mid-batch — its
+// physical execution slides into the drain step at final Complete, *after*
+// the previous-production version schema has been dropped (so its view no
+// longer projects the column being dropped).
+func TestDeferCompleteAllowsMidBatchDestructiveOp(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0 (production-active): users table with id, email. Completed
+		// normally — its version schema's view projects email and is what
+		// apps are still connected to throughout the batch.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text, name text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// V1 (intermediate, additive): add column 'role'.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_add_role",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN role text`,
+					Down: `ALTER TABLE users DROP COLUMN role`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// V2 (intermediate, destructive): drop column 'email'. Uses typed
+		// OpDropColumn (not OpRawSQL OnComplete) so its Start mutation —
+		// marking the column Deleted in the virtual schema — replays
+		// during V4's Start, keeping V4's projected view from referencing
+		// email and unblocking the eventual DROP COLUMN at drain time.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpDropColumn{
+					Table:  "users",
+					Column: "email",
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()),
+			"WithDeferComplete must not run the destructive DDL — it just queues it")
+
+		// V3 (intermediate, additive): add column 'phone'.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "03_add_phone",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN phone text`,
+					Down: `ALTER TABLE users DROP COLUMN phone`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// V4 (final, additive): create a new table. Projects the new target
+		// version schema as today.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "04_create_events",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE events (id integer PRIMARY KEY, kind text)`,
+					Down: `DROP TABLE events`,
+				},
+			},
+		}, backfill.NewConfig()))
+
+		// At this point V0 (prod) and V4 (target) coexist. V1, V2, V3 have
+		// no version schemas (intermediates).
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "00_create_users")))
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "04_create_events")))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "01_add_role")))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "02_drop_email")))
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "03_add_phone")))
+
+		// Final Complete: drops V0, drains V1/V2/V3 (DROP COLUMN now
+		// succeeds because V0's view is gone), runs V4's ops, marks V4 done.
+		require.NoError(t, mig.Complete(ctx),
+			"final Complete must drain deferred destructive ops without dependency errors")
+
+		// V0 reaped, V4 remains, intermediates have no schemas.
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "00_create_users")))
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "04_create_events")))
+
+		// email is physically gone from the underlying table — proves
+		// V2's deferred Complete actually replayed.
+		var emailExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
+			)`, cSchema).Scan(&emailExists))
+		assert.False(t, emailExists, "email column must be dropped by V2's drained Complete")
+
+		// role and phone are physically present (proves additive
+		// intermediates' Completes also drained successfully).
+		var roleExists, phoneExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'role'
+			)`, cSchema).Scan(&roleExists))
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'phone'
+			)`, cSchema).Scan(&phoneExists))
+		assert.True(t, roleExists, "role column should exist after drain")
+		assert.True(t, phoneExists, "phone column should exist after drain")
+
+		// Deferred queue is empty after a successful drain.
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Empty(t, remaining, "drain must clear the deferred queue on success")
+	})
+}
+
+// TestDeferCompleteAllowsNextMigrationToStart proves that a deferred
+// intermediate frees the active-migration slot immediately. Without this
+// property the migrate batch loop would block at the second migration
+// because IsActiveMigrationPeriod would still report true.
+func TestDeferCompleteAllowsNextMigrationToStart(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_add_email",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN email text`,
+					Down: `ALTER TABLE users DROP COLUMN email`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// Active migration slot must be free even though the deferred
+		// migration's operations haven't replayed yet.
+		active, err := mig.State().IsActiveMigrationPeriod(ctx, cSchema)
+		require.NoError(t, err)
+		assert.False(t, active, "deferred Complete must release the active-migration slot")
+
+		// The next migration's Start should succeed.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "03_add_phone",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `ALTER TABLE users ADD COLUMN phone text`,
+					Down: `ALTER TABLE users DROP COLUMN phone`,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()),
+			"Start of subsequent migration must not be blocked by a deferred intermediate")
+	})
+}
+
+// TestDeferCompleteDrainFailureIsResumable proves the idempotent-drain
+// property: when one deferred Complete fails mid-drain, the queue is left
+// with the failing migration (and any remaining tail) so that a subsequent
+// `pgroll complete` after operator intervention can resume.
+func TestDeferCompleteDrainFailureIsResumable(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// V0 prod: simple table.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// V1 (deferred): OpRawSQL OnComplete that will fail at drain time
+		// because the column doesn't exist.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_drop_nonexistent",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:         `ALTER TABLE users DROP COLUMN nonexistent`,
+					OnComplete: true,
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		// V2 (final).
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_create_events",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE events (id integer PRIMARY KEY)`,
+					Down: `DROP TABLE events`,
+				},
+			},
+		}, backfill.NewConfig()))
+
+		// Final Complete attempts the drain and fails on V1's bad SQL.
+		err := mig.Complete(ctx)
+		require.Error(t, err, "drain must surface the underlying SQL error")
+		assert.Contains(t, err.Error(), "01_drop_nonexistent",
+			"error must identify which deferred migration failed")
+
+		// V1 must still be in the deferred queue so a retry can resume.
+		remaining, err := mig.State().DeferredCompletes(ctx, cSchema)
+		require.NoError(t, err)
+		require.Len(t, remaining, 1, "failing migration must remain in the queue for retry")
+		assert.Equal(t, "01_drop_nonexistent", remaining[0].Name)
+
+		// Operator intervention: drop V1 from the queue manually (in real
+		// life this would be `pgroll rollback` of the broken intermediate
+		// or a hand-correction). For this test we clear the flag directly
+		// to simulate "the operator fixed it" and re-run Complete.
+		require.NoError(t, mig.State().ClearCompleteDeferred(ctx, cSchema, "01_drop_nonexistent"))
+
+		// Retry Complete — drain queue is now empty, V2's ops run cleanly,
+		// V2 is marked done.
+		require.NoError(t, mig.Complete(ctx),
+			"resumed Complete must succeed once the failing intermediate has been cleared")
+
+		// events table exists from V2's drained operations.
+		assert.True(t, tableExists(t, db, cSchema, "events"))
+	})
+}
+
 func TestSingleMigrationCompleteStillDropsPreviousSchema(t *testing.T) {
 	t.Parallel()
 

@@ -266,6 +266,89 @@ func (s *State) Complete(ctx context.Context, schema, name string) error {
 	return err
 }
 
+// MarkCompleteDeferred marks a migration as logically done while flagging
+// its Complete operations for replay during the next non-deferred Complete.
+// Captures resulting_schema as a normal Complete would, so subsequent reads
+// see the schema state implied by the migration even though the DDL hasn't
+// physically run yet.
+func (s *State) MarkCompleteDeferred(ctx context.Context, schema, name string) error {
+	res, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %[1]s.migrations SET done=TRUE, complete_deferred=TRUE, resulting_schema=(SELECT %[1]s.read_schema($1)) WHERE schema=$1 AND name=$2 AND done=FALSE",
+		pq.QuoteIdentifier(s.schema)), schema, name)
+	if err != nil {
+		return err
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("no active migration found with name %s", name)
+	}
+
+	return nil
+}
+
+// DeferredCompletes returns the migrations whose Complete operations are
+// queued for replay, in parent-chain order (oldest first). The chain is
+// reconstructed via a recursive CTE that walks forward from the
+// non-deferred root through each contiguous deferred segment.
+func (s *State) DeferredCompletes(ctx context.Context, schema string) ([]*migrations.Migration, error) {
+	q := fmt.Sprintf(`
+		WITH RECURSIVE chain AS (
+			SELECT m.name, m.parent, m.migration, 0 AS depth
+			FROM %[1]s.migrations m
+			WHERE m.schema = $1
+			  AND m.complete_deferred = TRUE
+			  AND (m.parent IS NULL OR NOT EXISTS (
+				SELECT 1 FROM %[1]s.migrations p
+				WHERE p.schema = $1 AND p.name = m.parent AND p.complete_deferred = TRUE
+			  ))
+			UNION ALL
+			SELECT m.name, m.parent, m.migration, c.depth + 1
+			FROM %[1]s.migrations m
+			JOIN chain c ON m.parent = c.name AND m.schema = $1
+			WHERE m.complete_deferred = TRUE
+		)
+		SELECT name, migration FROM chain ORDER BY depth ASC
+	`, pq.QuoteIdentifier(s.schema))
+
+	rows, err := s.pgConn.QueryContext(ctx, q, schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*migrations.Migration
+	for rows.Next() {
+		var name, raw string
+		if err := rows.Scan(&name, &raw); err != nil {
+			return nil, fmt.Errorf("unable to scan deferred complete row: %w", err)
+		}
+		var mig migrations.Migration
+		if err := json.Unmarshal([]byte(raw), &mig); err != nil {
+			return nil, fmt.Errorf("unable to unmarshal deferred migration %q: %w", name, err)
+		}
+		mig.Name = name
+		out = append(out, &mig)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating deferred completes: %w", err)
+	}
+	return out, nil
+}
+
+// ClearCompleteDeferred clears the complete_deferred flag on a migration
+// after its queued operations have successfully replayed.
+func (s *State) ClearCompleteDeferred(ctx context.Context, schema, name string) error {
+	_, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s.migrations SET complete_deferred=FALSE WHERE schema=$1 AND name=$2",
+		pq.QuoteIdentifier(s.schema)), schema, name)
+	return err
+}
+
 // ReadSchema reads the schema for the specified schema name
 func (s *State) ReadSchema(ctx context.Context, schemaName string) (*schema.Schema, error) {
 	var rawSchema []byte
