@@ -161,6 +161,32 @@
       "args": []
     },
     {
+      "name": "materialize",
+      "short": "Re-create the version schema and views from the live database state",
+      "use": "materialize",
+      "example": "",
+      "flags": [
+        {
+          "name": "migrations",
+          "description": "Optional directory of migration files; unapplied migrations are replayed in memory before projecting views",
+          "default": ""
+        },
+        {
+          "name": "version",
+          "description": "Override the version name (default: derived from --migrations or pgroll state)",
+          "default": ""
+        },
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "Skip confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": []
+    },
+    {
       "name": "migrate",
       "short": "Apply outstanding migrations from a directory to a database",
       "use": "migrate <directory>",
