@@ -2,8 +2,8 @@
 # install-debian.sh — One-time bootstrap for pgroll on a Debian/Ubuntu host.
 #
 # Use this on a fresh VM to install pgroll for the first time. After this,
-# /usr/local/bin/pgroll-update is available for subsequent upgrades — they
-# share the same logic, so prefer pgroll-update once the package is on disk.
+# /usr/bin/pgroll-update is available for subsequent upgrades — they share
+# the same logic, so prefer pgroll-update once the package is on disk.
 #
 # Token resolution:
 #   1. $PGROLL_RELEASE_TOKEN environment variable

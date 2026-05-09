@@ -253,7 +253,7 @@ tasks:
             pgroll --version
             test -f /usr/share/bash-completion/completions/pgroll && echo "bash completion ok"
             test -f /usr/share/zsh/site-functions/_pgroll && echo "zsh completion ok"
-            test -x /usr/local/bin/pgroll-update && echo "pgroll-update ok"
+            test -x /usr/bin/pgroll-update && echo "pgroll-update ok"
           '
 
         echo "==> .deb verified."

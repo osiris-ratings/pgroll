@@ -79,7 +79,11 @@ nfpms:
         file_info:
           mode: 0644
       - src: ./scripts/pgroll-update.sh
-        dst: /usr/local/bin/pgroll-update
+        # /usr/bin (not /usr/local/bin) so the script sits in the same
+        # dpkg-managed namespace as the pgroll binary itself. /usr/local/
+        # is fair game for image-hardening policies (e.g. GCE OS Config)
+        # to clean up; /usr/bin is not.
+        dst: /usr/bin/pgroll-update
         file_info:
           mode: 0755
 
