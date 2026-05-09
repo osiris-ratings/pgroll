@@ -57,12 +57,15 @@ tasks:
   format:
     desc: Format JSON schema, embedded SQL, and Go sources
     summary: |
-      Native counterpart of `make format`. Uses brew-installed prettier and
-      pg_format (from the pgformatter formula) instead of Docker, and
-      gofumpt for Go sources.
+      Mirrors `make format` exactly. Prettier and pgformatter run via
+      Docker (matching CI's Makefile path) so contributors and CI always
+      produce byte-identical output for embedded SQL — brew-installed
+      pg_format historically diverged from `backplane/pgformatter:latest`
+      and silently reverted CI-required formatting in pre-commit. Go
+      sources still use native gofumpt for speed.
     cmds:
-      - prettier schema.json --parser json --tab-width 2 --single-quote --trailing-comma all --no-semi --arrow-parens always --print-width 120 --write
-      - pg_format --inplace pkg/state/init.sql
+      - docker run --rm -v $PWD/schema.json:/mnt/schema.json node:alpine npx prettier /mnt/schema.json --parser json --tab-width 2 --single-quote --trailing-comma all --no-semi --arrow-parens always --print-width 120 --write
+      - docker run --rm -v $PWD/pkg/state/init.sql:/data/init.sql backplane/pgformatter --inplace /data/init.sql
       - gofumpt -w .
 
   generate:
