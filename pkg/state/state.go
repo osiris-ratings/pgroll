@@ -207,6 +207,47 @@ func (s *State) IsActiveMigrationPeriod(ctx context.Context, schema string) (boo
 	return isActive, nil
 }
 
+// BackendPID returns the pg_backend_pid of this State's connection. Used by
+// callers that need to exclude their own backends when probing
+// pg_stat_activity for other live pgroll processes.
+func (s *State) BackendPID(ctx context.Context) (int, error) {
+	var pid int
+	if err := s.pgConn.QueryRowContext(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+		return 0, fmt.Errorf("reading pg_backend_pid: %w", err)
+	}
+	return pid, nil
+}
+
+// OtherPgrollBackends returns the count of backends connected to the current
+// database with application_name set to 'pgroll' or 'pgroll-state',
+// excluding the supplied PIDs (typically the caller's own state and DDL
+// connections).
+//
+// `pgroll migrate` uses this to distinguish a migration that's currently
+// being executed by a live pgroll process (IN-PROGRESS) from one whose
+// owning process has died and left a done=FALSE row behind (INTERRUPTED).
+//
+// The application_name strings here mirror the package-private constants in
+// pkg/state and pkg/roll; if those ever change, this list must change with
+// them.
+func (s *State) OtherPgrollBackends(ctx context.Context, excludePIDs []int) (int, error) {
+	pids := make([]int64, len(excludePIDs))
+	for i, p := range excludePIDs {
+		pids[i] = int64(p)
+	}
+	const q = `
+		SELECT count(*)
+		FROM pg_stat_activity
+		WHERE application_name IN ('pgroll', 'pgroll-state')
+		  AND datname = current_database()
+		  AND pid <> ALL($1)`
+	var count int
+	if err := s.pgConn.QueryRowContext(ctx, q, pq.Array(pids)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("counting pgroll backends: %w", err)
+	}
+	return count, nil
+}
+
 // GetActiveMigration returns the name & raw content of the active migration (if any), errors out otherwise
 func (s *State) GetActiveMigration(ctx context.Context, schema string) (*migrations.Migration, error) {
 	var name, rawMigration string
@@ -440,7 +481,7 @@ func (s *State) CreateBaseline(ctx context.Context, schemaName, baselineVersion 
 
 	// Insert a baseline migration record
 	stmt := fmt.Sprintf(`
-		INSERT INTO %[1]s.migrations 
+		INSERT INTO %[1]s.migrations
 		(schema, name, migration, resulting_schema, done, parent, migration_type, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, TRUE,  %[1]s.latest_migration($1), 'baseline', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 		pq.QuoteIdentifier(s.schema))

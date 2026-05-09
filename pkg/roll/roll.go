@@ -143,6 +143,28 @@ func (m *Roll) PgConn() db.DB {
 	return m.pgConn
 }
 
+// BackendPID returns the pg_backend_pid of this Roll's DDL connection.
+// Used by `pgroll migrate` pre-flight to exclude its own backend when
+// probing pg_stat_activity for other live pgroll processes.
+func (m *Roll) BackendPID(ctx context.Context) (int, error) {
+	rows, err := m.pgConn.QueryContext(ctx, "SELECT pg_backend_pid()")
+	if err != nil {
+		return 0, fmt.Errorf("reading pg_backend_pid: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("reading pg_backend_pid: %w", err)
+		}
+		return 0, fmt.Errorf("reading pg_backend_pid: no rows")
+	}
+	var pid int
+	if err := rows.Scan(&pid); err != nil {
+		return 0, fmt.Errorf("scanning pg_backend_pid: %w", err)
+	}
+	return pid, nil
+}
+
 // State returns the state instance the Roll instance is acting on
 func (m *Roll) State() *state.State {
 	return m.state

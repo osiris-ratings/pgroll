@@ -68,7 +68,8 @@ func migrateCmd() *cobra.Command {
 			// this run before doing any work. This is the single point where
 			// operators can verify pgroll's state matches their understanding
 			// of production and catch drift introduced by prior aborted runs.
-			if err := printMigratePreFlight(ctx, m, migrationsDir, rawMigs, os.Stdout); err != nil {
+			preFlightState, err := printMigratePreFlight(ctx, m, migrationsDir, rawMigs, os.Stdout)
+			if err != nil {
 				return fmt.Errorf("pre-flight summary: %w", err)
 			}
 
@@ -82,6 +83,13 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("unable to determine active migration period: %w", err)
 			}
 			if active {
+				if preFlightState == cycleInProgress {
+					return fmt.Errorf(
+						"migration %q is currently being run by another pgroll process; "+
+							"wait for that run to finish before retrying",
+						*latestMigration,
+					)
+				}
 				return fmt.Errorf(
 					"migration %q is in progress and was not completed; "+
 						"this usually means a previous run was interrupted "+
@@ -178,6 +186,7 @@ const (
 	cycleFresh       cycleState = "FRESH"
 	cycleIncremental cycleState = "INCREMENTAL"
 	cycleRecovery    cycleState = "RECOVERY"
+	cycleInProgress  cycleState = "IN-PROGRESS"
 	cycleInterrupted cycleState = "INTERRUPTED"
 	cycleNoOp        cycleState = "NO-OP"
 )
@@ -195,34 +204,50 @@ const (
 // surface pgroll's `state.LatestVersion` only when it diverges from the
 // live schema (RECOVERY), since in all other cases the live schema name
 // already encodes it.
-func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir string, unapplied []*migrations.RawMigration, out io.Writer) error {
+func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir string, unapplied []*migrations.RawMigration, out io.Writer) (cycleState, error) {
 	existingSchemas, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
-		return fmt.Errorf("listing existing version schemas: %w", err)
+		return "", fmt.Errorf("listing existing version schemas: %w", err)
 	}
 
 	stateLatestVersion, err := m.State().LatestVersion(ctx, m.Schema())
 	if err != nil {
-		return fmt.Errorf("reading state.LatestVersion: %w", err)
+		return "", fmt.Errorf("reading state.LatestVersion: %w", err)
 	}
 
 	history, err := m.State().SchemaHistory(ctx, m.Schema())
 	if err != nil {
-		return fmt.Errorf("reading schema history: %w", err)
+		return "", fmt.Errorf("reading schema history: %w", err)
 	}
 
 	activePeriod, err := m.State().IsActiveMigrationPeriod(ctx, m.Schema())
 	if err != nil {
-		return fmt.Errorf("reading active migration period: %w", err)
+		return "", fmt.Errorf("reading active migration period: %w", err)
 	}
 	var inProgressName string
+	otherBackends := 0
 	if activePeriod {
 		latestMig, err := m.State().LatestMigration(ctx, m.Schema())
 		if err != nil {
-			return fmt.Errorf("reading latest migration: %w", err)
+			return "", fmt.Errorf("reading latest migration: %w", err)
 		}
 		if latestMig != nil {
 			inProgressName = *latestMig
+		}
+
+		// Probe pg_stat_activity for other live pgroll backends so we can
+		// distinguish a concurrent run (IN-PROGRESS) from an abandoned one
+		// (INTERRUPTED). On error (e.g. restricted pg_stat_activity), fall
+		// back to today's behaviour by treating the count as zero — the
+		// caller will still classify as INTERRUPTED, never weaker than the
+		// status quo.
+		statePID, sErr := m.State().BackendPID(ctx)
+		rollPID, rErr := m.BackendPID(ctx)
+		if sErr == nil && rErr == nil {
+			n, err := m.State().OtherPgrollBackends(ctx, []int{statePID, rollPID})
+			if err == nil {
+				otherBackends = n
+			}
 		}
 	}
 
@@ -248,13 +273,13 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 	}
 
-	state := classifyCycle(activePeriod, remainingCount, appliedCount, stateInSync)
+	state := classifyCycle(activePeriod, otherBackends, remainingCount, appliedCount, stateInSync)
 
 	stateColor := pterm.FgGreen
 	switch state {
 	case cycleInterrupted:
 		stateColor = pterm.FgRed
-	case cycleRecovery:
+	case cycleInProgress, cycleRecovery:
 		stateColor = pterm.FgYellow
 	case cycleNoOp:
 		stateColor = pterm.FgGray
@@ -296,9 +321,13 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 	}
 
 	switch state {
-	case cycleInterrupted:
+	case cycleInterrupted, cycleInProgress:
+		label := "Stuck on"
+		if state == cycleInProgress {
+			label = "Running"
+		}
 		if inProgressName != "" {
-			field("Stuck on", inProgressName)
+			field(label, inProgressName)
 		}
 		liveLabel := "Live schema"
 		if len(existingSchemas) != 1 {
@@ -310,7 +339,11 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 		field(liveLabel, liveValue)
 		fmt.Fprintln(out)
-		fmt.Fprintln(out, pterm.FgYellow.Sprint("    Run `pgroll rollback` to clean up before retrying."))
+		if state == cycleInProgress {
+			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Another pgroll process is running this migration — wait for it to finish."))
+		} else {
+			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Run `pgroll rollback` to clean up before retrying."))
+		}
 	case cycleNoOp:
 		current := "—"
 		if len(existingSchemas) > 0 {
@@ -356,11 +389,18 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 	}
 
 	fmt.Fprintln(out)
-	return nil
+	return state, nil
 }
 
-func classifyCycle(activePeriod bool, remaining, applied int, stateInSync bool) cycleState {
+// classifyCycle picks the deployment state label for the pre-flight
+// summary. otherBackends is the count of *other* pgroll processes connected
+// to the same database; when an activePeriod row exists but a live pgroll
+// backend is also present, the migration is genuinely in progress (a
+// concurrent run) rather than abandoned.
+func classifyCycle(activePeriod bool, otherBackends int, remaining, applied int, stateInSync bool) cycleState {
 	switch {
+	case activePeriod && otherBackends > 0:
+		return cycleInProgress
 	case activePeriod:
 		return cycleInterrupted
 	case remaining == 0:
