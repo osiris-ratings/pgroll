@@ -10,6 +10,11 @@ import (
 )
 
 func TestAppendSearchPathOption(t *testing.T) {
+	// Test fixtures use the conventional local-postgres URL form
+	// `postgres://postgres:postgres@localhost`. The "password" is the same
+	// non-secret default that ships with the project's docker-compose and
+	// CI services, not a real credential.
+	//nolint:gosec // G101: test fixture URLs only; no real credentials.
 	tests := []struct {
 		Name     string
 		ConnStr  string

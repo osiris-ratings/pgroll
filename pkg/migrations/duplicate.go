@@ -39,6 +39,12 @@ type duplicatorStmtBuilder struct {
 	table *schema.Table
 }
 
+// pq.ErrorCode is marked deprecated in lib/pq v1.10.x but no replacement
+// package exists; pq.Error.Code is itself still typed pq.ErrorCode, so any
+// substitute would just lose type safety. See pkg/db/db.go for the same
+// rationale.
+//
+//nolint:staticcheck // SA1019: pq.ErrorCode replacement does not exist in lib/pq v1.10.x.
 const (
 	dataTypeMismatchErrorCode  pq.ErrorCode = "42804"
 	undefinedFunctionErrorCode pq.ErrorCode = "42883"
@@ -464,6 +470,10 @@ func isHexLower(s string) bool {
 	return true
 }
 
+// pq.Error.Code (which we compare against) is itself typed pq.ErrorCode, so
+// taking a string here would force a per-call cast at every call site.
+//
+//nolint:staticcheck // SA1019: pq.ErrorCode replacement does not exist in lib/pq v1.10.x.
 func errorIgnoringErrorCode(err error, code pq.ErrorCode) error {
 	pqErr := &pq.Error{}
 	if ok := errors.As(err, &pqErr); ok {

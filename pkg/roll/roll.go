@@ -88,6 +88,12 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 }
 
 func setupConn(ctx context.Context, pgURL, schema string, options options) (*sql.DB, error) {
+	// pq.ParseURL is marked deprecated, but the deprecation notice ("just pass
+	// the URL to sql.Open") doesn't help here: we need to *augment* the
+	// resulting DSN with `search_path` and `application_name` keyword pairs,
+	// which only works on the keyword-form DSN that ParseURL produces. The
+	// fallback to the raw input on parse error preserves keyword-form inputs.
+	//nolint:staticcheck // SA1019: deprecation suggestion does not match this use.
 	dsn, err := pq.ParseURL(pgURL)
 	if err != nil {
 		dsn = pgURL

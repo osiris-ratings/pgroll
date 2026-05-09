@@ -198,6 +198,11 @@ func setupInitialTable(tb testing.TB, ctx context.Context, testSchema string, mi
 		require.NoError(tb, err)
 		defer tx.Rollback()
 
+		// pq.CopyInSchema is marked deprecated, but it correctly quotes the
+		// schema/table/column identifiers for COPY FROM STDIN; rewriting that
+		// quoting by hand for a single benchmark caller would just reproduce
+		// the same logic.
+		//nolint:staticcheck // SA1019: deprecated alternative is hand-rolled COPY string assembly.
 		stmt, err := tx.PrepareContext(ctx, pq.CopyInSchema(testSchema, "users", "name"))
 		require.NoError(tb, err)
 
