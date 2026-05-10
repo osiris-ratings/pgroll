@@ -174,6 +174,152 @@ func TestUnappliedMigrations(t *testing.T) {
 	})
 }
 
+func TestUnappliedMigrationsWithDivergentHistories(t *testing.T) {
+	t.Parallel()
+
+	t.Run("out-of-order applied migrations are tolerated", func(t *testing.T) {
+		// Local files: A, B, C, D
+		// DB applied: A, C (applied out of filesystem order)
+		// Expected unapplied: B, D
+		fs := fstest.MapFS{
+			"01_migration_A.json": &fstest.MapFile{Data: exampleMigration(t, "01_migration_A")},
+			"02_migration_B.json": &fstest.MapFile{Data: exampleMigration(t, "02_migration_B")},
+			"03_migration_C.json": &fstest.MapFile{Data: exampleMigration(t, "03_migration_C")},
+			"04_migration_D.json": &fstest.MapFile{Data: exampleMigration(t, "04_migration_D")},
+		}
+
+		testutils.WithMigratorAndConnectionToContainer(t, func(roll *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			// Apply A then C (skipping B)
+			for _, filename := range []string{"01_migration_A.json", "03_migration_C.json"} {
+				migration, err := migrations.ReadMigration(fs, filename)
+				require.NoError(t, err)
+				err = roll.Start(ctx, migration, backfill.NewConfig())
+				require.NoError(t, err)
+				err = roll.Complete(ctx)
+				require.NoError(t, err)
+			}
+
+			// Get unapplied migrations
+			migs, err := roll.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+
+			// Assert B and D are unapplied, in filesystem order
+			require.Len(t, migs, 2)
+			require.Equal(t, "02_migration_B", migs[0].Name)
+			require.Equal(t, "04_migration_D", migs[1].Name)
+		})
+	})
+
+	t.Run("hotfix branch scenario: migration applied out of filesystem order", func(t *testing.T) {
+		// Local files: A, B, C, D, H (H = hotfix, sorts last)
+		// DB applied: A, B, H (hotfix deployed before C, D existed)
+		// Expected unapplied: C, D
+		fs := fstest.MapFS{
+			"01_migration_A.json": &fstest.MapFile{Data: exampleMigration(t, "01_migration_A")},
+			"02_migration_B.json": &fstest.MapFile{Data: exampleMigration(t, "02_migration_B")},
+			"03_migration_C.json": &fstest.MapFile{Data: exampleMigration(t, "03_migration_C")},
+			"04_migration_D.json": &fstest.MapFile{Data: exampleMigration(t, "04_migration_D")},
+			"05_migration_H.json": &fstest.MapFile{Data: exampleMigration(t, "05_migration_H")},
+		}
+
+		testutils.WithMigratorAndConnectionToContainer(t, func(roll *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			// Apply A, B, then H (skipping C and D — simulates hotfix deploy)
+			for _, filename := range []string{"01_migration_A.json", "02_migration_B.json", "05_migration_H.json"} {
+				migration, err := migrations.ReadMigration(fs, filename)
+				require.NoError(t, err)
+				err = roll.Start(ctx, migration, backfill.NewConfig())
+				require.NoError(t, err)
+				err = roll.Complete(ctx)
+				require.NoError(t, err)
+			}
+
+			// Get unapplied migrations
+			migs, err := roll.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+
+			// Assert C and D are unapplied, in filesystem order
+			require.Len(t, migs, 2)
+			require.Equal(t, "03_migration_C", migs[0].Name)
+			require.Equal(t, "04_migration_D", migs[1].Name)
+		})
+	})
+
+	t.Run("applied migration not in local files returns error", func(t *testing.T) {
+		// Local files: A, B
+		// DB applied: A, X (X has no local file)
+		// Expected: error
+		fs := fstest.MapFS{
+			"01_migration_A.json": &fstest.MapFile{Data: exampleMigration(t, "01_migration_A")},
+			"02_migration_B.json": &fstest.MapFile{Data: exampleMigration(t, "02_migration_B")},
+		}
+
+		testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			// Apply A
+			migration, err := migrations.ReadMigration(fs, "01_migration_A.json")
+			require.NoError(t, err)
+			err = m.Start(ctx, migration, backfill.NewConfig())
+			require.NoError(t, err)
+			err = m.Complete(ctx)
+			require.NoError(t, err)
+
+			// Apply X (not in local files)
+			err = m.Start(ctx, &migrations.Migration{
+				Name: "01a_migration_X",
+				Operations: migrations.Operations{
+					&migrations.OpRawSQL{Up: "SELECT 1"},
+				},
+			}, backfill.NewConfig())
+			require.NoError(t, err)
+			err = m.Complete(ctx)
+			require.NoError(t, err)
+
+			// Get unapplied migrations
+			_, err = m.UnappliedMigrations(ctx, fs)
+
+			// Assert mismatch error
+			assert.ErrorIs(t, err, roll.ErrMismatchedMigration)
+		})
+	})
+
+	t.Run("all migrations applied out of order returns empty unapplied", func(t *testing.T) {
+		// Local files: A, B, C
+		// DB applied: A, C, B (different order)
+		// Expected unapplied: [] (all applied)
+		fs := fstest.MapFS{
+			"01_migration_A.json": &fstest.MapFile{Data: exampleMigration(t, "01_migration_A")},
+			"02_migration_B.json": &fstest.MapFile{Data: exampleMigration(t, "02_migration_B")},
+			"03_migration_C.json": &fstest.MapFile{Data: exampleMigration(t, "03_migration_C")},
+		}
+
+		testutils.WithMigratorAndConnectionToContainer(t, func(roll *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			// Apply A, C, B (out of filesystem order)
+			for _, filename := range []string{"01_migration_A.json", "03_migration_C.json", "02_migration_B.json"} {
+				migration, err := migrations.ReadMigration(fs, filename)
+				require.NoError(t, err)
+				err = roll.Start(ctx, migration, backfill.NewConfig())
+				require.NoError(t, err)
+				err = roll.Complete(ctx)
+				require.NoError(t, err)
+			}
+
+			// Get unapplied migrations
+			migs, err := roll.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+
+			// Assert no migrations are unapplied
+			require.Len(t, migs, 0)
+		})
+	})
+}
+
 func TestUnappliedMigrationsWithBaselines(t *testing.T) {
 	t.Parallel()
 
