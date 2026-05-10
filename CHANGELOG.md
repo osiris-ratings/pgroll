@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `depends_on` — migrations may declare a list of migration names that must be applied before them, creating a DAG that `UnappliedMigrations` topologically sorts (Kahn's algorithm with filesystem order as the tiebreaker). Restores ordering guarantees for non-commutative migrations without forcing a strict positional history.
+- `preconditions` — migrations may declare schema-state assertions that are validated before the migration runs. Eight assertion variants: `table_exists`, `table_not_exists`, `column_exists` (with optional type), `column_not_exists`, `index_exists`, `constraint_exists`, `function_exists` (with optional signature and SHA-256 body hash), and `type_exists` (with optional values hash for enums). Schema-level assertions run inside `Migration.Validate`; DB-level (`function_exists`, `type_exists`) run inside `Roll.Validate` against `pg_proc` / `pg_type`. Catches the "raw SQL silently runs against the wrong schema" class of bug — e.g. an `OpRawSQL` whose output depends on `normalize_name()` body, or a migration that assumes an enum has a specific set of values.
+- `pgroll check <directory>` — filesystem-only validation (no DB connection required). Catches YAML/JSON syntax errors, missing/empty `operations`, schema names that exceed Postgres' 63-char identifier limit, `depends_on` targets that don't exist in the migration set, dependency cycles, and (advisory) raw-SQL operations without preconditions. With `--base origin/main`, also flags new migrations whose filenames sort before the base branch's latest migration — surfacing renames needed for the new name-set matching to remain ergonomic.
+
+### Changed
+- `UnappliedMigrations` matches by **migration name set** instead of strict linear filesystem order. A migration is considered unapplied iff its name is missing from the schema history. This unblocks divergent histories — hotfix branches, out-of-order merges — without renaming/shuffling files to keep a linear timeline. Migrations applied to the database that have no corresponding local file still produce a hard `ErrMismatchedMigration` (so accidental local deletions are still caught).
+- `prek.toml` lint hook switched from upstream `golangci-lint` to `golangci-lint-full --config=.golangci.yml --timeout=30m`. The former passes `--new-from-rev HEAD --fix` and silently skipped a real `gosec` issue that CI flagged; the latter mirrors the CI lint job byte-for-byte.
+- `prek.toml` `task-format` replaced with `task-format-clean` (runs `task format` and fails if it produced a diff). Local commits now reproduce the CI `format` check exactly instead of silently auto-fixing and letting drift through.
+- `prek.toml` `task-generate-clean` now also fires when `cmd/*.go` changes — `cli-definition.json` is regenerated from the cobra command tree, so adding a new subcommand can stale that file even when `schema.json` and `tools/build-cli-definition.go` are untouched.
+
 ## [0.16.1-baselayer.8] - 2026-05-10
 
 ### Added
