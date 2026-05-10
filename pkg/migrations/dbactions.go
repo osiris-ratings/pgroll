@@ -22,26 +22,36 @@ type DBAction interface {
 }
 
 type addColumnAction struct {
-	conn   db.DB
-	id     string
-	table  string
-	column Column
-	withPK bool
+	conn                  db.DB
+	id                    string
+	table                 string
+	column                Column
+	withPK                bool
+	notNullConstraintName string
 }
 
-func NewAddColumnAction(conn db.DB, table string, c Column, withPK bool) *addColumnAction {
+// NewAddColumnAction adds a column to a table. notNullConstraintName, if
+// non-empty and the column is NOT NULL, names the inline NOT NULL constraint
+// explicitly so PostgreSQL 17+ doesn't auto-derive a name from the (possibly
+// temporary) column name in play at ADD COLUMN time.
+func NewAddColumnAction(conn db.DB, table string, c Column, withPK bool, notNullConstraintName string) *addColumnAction {
 	return &addColumnAction{
-		conn:   conn,
-		id:     fmt.Sprintf("add_column_%s_%s", table, c.Name),
-		table:  table,
-		column: c,
+		conn:                  conn,
+		id:                    fmt.Sprintf("add_column_%s_%s", table, c.Name),
+		table:                 table,
+		column:                c,
+		withPK:                withPK,
+		notNullConstraintName: notNullConstraintName,
 	}
 }
 
 func (a *addColumnAction) ID() string { return a.id }
 
 func (a *addColumnAction) Execute(ctx context.Context) error {
-	colSQL, err := ColumnSQLWriter{WithPK: a.withPK}.Write(a.column)
+	colSQL, err := ColumnSQLWriter{
+		WithPK:                a.withPK,
+		NotNullConstraintName: a.notNullConstraintName,
+	}.Write(a.column)
 	if err != nil {
 		return err
 	}
@@ -863,18 +873,27 @@ func (a *dropConstraintAction) Execute(ctx context.Context) error {
 }
 
 type setNotNullAction struct {
-	conn   db.DB
-	id     string
-	table  string
-	column string
+	conn           db.DB
+	id             string
+	table          string
+	column         string
+	constraintName string
 }
 
-func NewSetNotNullAction(conn db.DB, table, column string) *setNotNullAction {
+// NewSetNotNullAction sets a column NOT NULL. constraintName, if non-empty,
+// renames the resulting NOT NULL constraint to that name on PostgreSQL 17+
+// (where SET NOT NULL produces a real, auto-named pg_constraint row whose
+// auto-derived name embeds whatever the column was called at action time).
+// Pre-PG-17 there is no separate constraint and the rename step is a silent
+// no-op. Pass CanonicalNotNullName(table, finalCol) to keep the permanent name
+// matching what pg_dump treats as the default form.
+func NewSetNotNullAction(conn db.DB, table, column, constraintName string) *setNotNullAction {
 	return &setNotNullAction{
-		conn:   conn,
-		id:     fmt.Sprintf("set_not_null_%s_%s", table, column),
-		table:  table,
-		column: column,
+		conn:           conn,
+		id:             fmt.Sprintf("set_not_null_%s_%s", table, column),
+		table:          table,
+		column:         column,
+		constraintName: constraintName,
 	}
 }
 
@@ -884,6 +903,54 @@ func (a *setNotNullAction) Execute(ctx context.Context) error {
 	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s ALTER COLUMN %s SET NOT NULL",
 		pq.QuoteIdentifier(a.table),
 		pq.QuoteIdentifier(a.column)))
+	if err != nil {
+		return err
+	}
+
+	if a.constraintName == "" {
+		return nil
+	}
+
+	return ensureNotNullConstraintName(ctx, a.conn, a.table, a.column, a.constraintName)
+}
+
+// ensureNotNullConstraintName renames the NOT NULL constraint on (table, column)
+// to desired, if one exists and is not already named that. On PostgreSQL <17
+// NOT NULL is a column attribute (no pg_constraint row with contype='n'), so
+// the lookup returns nothing and this is a silent no-op.
+func ensureNotNullConstraintName(ctx context.Context, conn db.DB, table, column, desired string) error {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT con.conname
+		FROM pg_constraint con
+		JOIN pg_attribute att
+		  ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+		WHERE con.conrelid = $1::regclass
+		  AND att.attname = $2
+		  AND con.contype = 'n'
+		LIMIT 1
+	`, pq.QuoteIdentifier(table), column)
+	if err != nil {
+		return fmt.Errorf("looking up not null constraint: %w", err)
+	}
+	if rows == nil {
+		// FakeDB path used in unit tests.
+		return nil
+	}
+	defer rows.Close()
+
+	var current string
+	if err := db.ScanFirstValue(rows, &current); err != nil {
+		// No row → PG <17 (no contype='n') or no NOT NULL constraint exists.
+		return nil
+	}
+	if current == "" || current == desired {
+		return nil
+	}
+
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME CONSTRAINT %s TO %s",
+		pq.QuoteIdentifier(table),
+		pq.QuoteIdentifier(current),
+		pq.QuoteIdentifier(desired)))
 	return err
 }
 

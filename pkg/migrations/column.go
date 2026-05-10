@@ -55,6 +55,13 @@ func (c *Column) Validate() bool {
 // When creating a table, the primary key constraint is not added to the column definition
 type ColumnSQLWriter struct {
 	WithPK bool
+	// NotNullConstraintName, when non-empty and the column is NOT NULL, names
+	// the inline NOT NULL constraint explicitly. Used during ADD COLUMN against
+	// a temp-named column so PostgreSQL 17+ doesn't auto-derive the constraint
+	// name from the temp column name (which would fossilize the temp token in
+	// pg_constraint after the column is renamed back). Pre-PG-17 the syntax
+	// is accepted but the name is silently discarded.
+	NotNullConstraintName string
 }
 
 func (w ColumnSQLWriter) Write(col Column) (string, error) {
@@ -68,7 +75,11 @@ func (w ColumnSQLWriter) Write(col Column) (string, error) {
 		sql += " UNIQUE"
 	}
 	if !col.IsNullable() {
-		sql += " NOT NULL"
+		if w.NotNullConstraintName != "" {
+			sql += " CONSTRAINT " + pq.QuoteIdentifier(w.NotNullConstraintName) + " NOT NULL"
+		} else {
+			sql += " NOT NULL"
+		}
 	}
 	if col.Default != nil {
 		sql += fmt.Sprintf(" DEFAULT %s", *col.Default)

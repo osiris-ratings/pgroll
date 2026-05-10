@@ -302,10 +302,20 @@ func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPat
 		o.Column.Nullable = true
 	}
 
+	// Capture the canonical (final) NOT NULL constraint name *before* the
+	// column is renamed to its in-flight temp form. Naming the inline NOT NULL
+	// constraint explicitly stops PostgreSQL 17+ from auto-deriving the name
+	// from the temp column name, which would fossilize the temp token in
+	// pg_constraint after the column is renamed back at Complete.
+	var notNullName string
+	if !o.Column.IsNullable() {
+		notNullName = CanonicalNotNullName(t.Name, o.Column.Name)
+	}
+
 	o.Column.Name = TemporaryName(scope, o.Column.Name)
 
 	withPK := true
-	return NewAddColumnAction(conn, t.Name, o.Column, withPK), nil
+	return NewAddColumnAction(conn, t.Name, o.Column, withPK, notNullName), nil
 }
 
 // upgradeNotNullConstraintToNotNullAttribute validates and upgrades a NOT NULL
@@ -314,7 +324,7 @@ func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPat
 func upgradeNotNullConstraintToNotNullAttribute(conn db.DB, tableName, columnName string) []DBAction {
 	return []DBAction{
 		NewValidateConstraintAction(conn, tableName, NotNullConstraintName(columnName)),
-		NewSetNotNullAction(conn, tableName, columnName),
+		NewSetNotNullAction(conn, tableName, columnName, CanonicalNotNullName(tableName, columnName)),
 		NewDropConstraintAction(conn, tableName, NotNullConstraintName(columnName)),
 	}
 }
@@ -332,4 +342,18 @@ func NotNullConstraintName(columnName string) string {
 // IsNotNullConstraintName returns true if the given name is a NOT NULL constraint name
 func IsNotNullConstraintName(name string) bool {
 	return strings.HasPrefix(name, "_pgroll_check_not_null_")
+}
+
+// CanonicalNotNullName returns the canonical, permanent NOT NULL constraint
+// name pgroll uses for a column on PostgreSQL 17+. The shape `<table>_<col>_not_null`
+// matches Postgres' default auto-generated name, which causes pg_dump to
+// suppress the explicit `CONSTRAINT <name>` clause in schema output. The name
+// is truncated to fit Postgres' NAMEDATALEN-1 = 63-byte identifier cap.
+func CanonicalNotNullName(table, column string) string {
+	name := fmt.Sprintf("%s_%s_not_null", table, column)
+	const maxIdentLen = 63
+	if len(name) > maxIdentLen {
+		name = name[:maxIdentLen]
+	}
+	return name
 }

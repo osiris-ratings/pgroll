@@ -86,8 +86,11 @@ func (a *renameDuplicatedColumnAction) Execute(ctx context.Context) error {
 			// unchecked `NOT NULL` constraint into a `NOT NULL` attribute on the
 			// column.
 			if IsNotNullConstraintName(StripDuplicationPrefix(cc.Name)) {
-				// Apply `NOT NULL` attribute to the column. This uses the validated constraint
-				if err := NewSetNotNullAction(a.conn, a.table.Name, a.to).Execute(ctx); err != nil {
+				// Apply `NOT NULL` attribute to the column. This uses the validated
+				// constraint. Pass the canonical name so the auto-named pg_constraint
+				// row produced on PostgreSQL 17+ is renamed to match what pg_dump
+				// treats as the default form.
+				if err := NewSetNotNullAction(a.conn, a.table.Name, a.to, CanonicalNotNullName(a.table.Name, a.to)).Execute(ctx); err != nil {
 					return fmt.Errorf("failed to set column not null: %w", err)
 				}
 

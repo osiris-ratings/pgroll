@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- NOT NULL constraint names from `add_column` and `set_not_null` no longer fossilize the temp `_pgroll_new_<col>_<scope>` token in `pg_constraint` on Postgres 17+. PostgreSQL 17 promoted NOT NULL from a column attribute to a real named constraint; before this fix, pgroll's inline `ADD COLUMN ... NOT NULL` and bare `ALTER COLUMN ... SET NOT NULL` statements ran against the in-flight temp column name, so PG auto-derived names like `<table>__pgroll_new_<col>_<hash>_not_null` that didn't follow the column rename at Complete and surfaced explicitly in `pg_dump` output. `ColumnSQLWriter` now accepts an explicit `NotNullConstraintName`, `NewAddColumnAction` threads the canonical `<table>_<col>_not_null` name down to the `ADD COLUMN` SQL, and `setNotNullAction` looks up the auto-generated constraint after `SET NOT NULL` and renames it to the canonical form (no-op on PG <17 where the catalog row doesn't exist). The canonical name matches Postgres' default auto-name shape, so `pg_dump` suppresses the explicit `CONSTRAINT` clause and downstream `osiris.sql`-style dumps come out clean.
+
 ## [0.16.1-baselayer.9] - 2026-05-10
 
 ### Added
