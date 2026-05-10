@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1-baselayer.9] - 2026-05-10
+
 ### Added
 - `depends_on` — migrations may declare a list of migration names that must be applied before them, creating a DAG that `UnappliedMigrations` topologically sorts (Kahn's algorithm with filesystem order as the tiebreaker). Restores ordering guarantees for non-commutative migrations without forcing a strict positional history.
 - `preconditions` — migrations may declare schema-state assertions that are validated before the migration runs. Eight assertion variants: `table_exists`, `table_not_exists`, `column_exists` (with optional type), `column_not_exists`, `index_exists`, `constraint_exists`, `function_exists` (with optional signature and SHA-256 body hash), and `type_exists` (with optional values hash for enums). Schema-level assertions run inside `Migration.Validate`; DB-level (`function_exists`, `type_exists`) run inside `Roll.Validate` against `pg_proc` / `pg_type`. Catches the "raw SQL silently runs against the wrong schema" class of bug — e.g. an `OpRawSQL` whose output depends on `normalize_name()` body, or a migration that assumes an enum has a specific set of values.
