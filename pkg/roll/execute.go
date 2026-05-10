@@ -52,6 +52,12 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 	if err != nil {
 		return fmt.Errorf("migration '%s' is invalid: %w", migration.Name, err)
 	}
+
+	// Validate database-level preconditions (function_exists, type_exists)
+	if err := migrations.ValidateDBPreconditions(ctx, migration.Preconditions, m.pgConn, m.schema); err != nil {
+		return fmt.Errorf("migration '%s' is invalid: %w", migration.Name, err)
+	}
+
 	if err := validateVersionSchemaName(m.schema, migration.VersionSchemaName()); err != nil {
 		return err
 	}
@@ -209,6 +215,10 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 	m.logger.LogMigrationStart(migration)
 
 	if err := m.Validate(ctx, migration); err != nil {
+		return err
+	}
+
+	if err := m.validateDependencies(ctx, migration); err != nil {
 		return err
 	}
 

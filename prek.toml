@@ -21,7 +21,13 @@ hooks = [
 repo = "https://github.com/golangci/golangci-lint"
 rev = "v2.11.4"
 hooks = [
-  { id = "golangci-lint" },
+  # `golangci-lint-full` (not `golangci-lint`): the latter passes
+  # `--new-from-rev HEAD --fix`, which only flags issues introduced after
+  # HEAD and silently skips real ones already in the diff. The full variant
+  # lints the whole module exactly like CI does. We pin the same v2.11.4
+  # rev CI uses for byte-identical lint behavior, regardless of what version
+  # `brew install golangci-lint` happens to ship locally.
+  { id = "golangci-lint-full", args = ["--config=.golangci.yml", "--timeout=30m"] },
 ]
 
 [[repos]]
@@ -36,12 +42,18 @@ hooks = [
   { id = "go-mod-tidy" },
 ]
 
-# Local hooks — delegate to task targets so the source of truth stays in Taskfile.yml.
+# Local hooks — delegate to task targets so the source of truth stays in
+# Taskfile.yml. CI runs the same task targets, so each *-clean hook mirrors
+# the corresponding CI check (run task target, then fail if working tree
+# changed). Without the `&& git diff --quiet` step, hooks would silently
+# auto-fix and let CI-failing changes ship.
 [[repos]]
 repo = "local"
 hooks = [
-  { id = "task-format", name = "task format (gofumpt + prettier + pgformatter)", entry = "task format", language = "system", pass_filenames = false, files = "\\.(go|sql|json)$" },
-  { id = "task-generate-clean", name = "task generate produces no diff", entry = "bash -c 'task generate && git diff --quiet -- pkg/migrations/types.go cli-definition.json'", language = "system", pass_filenames = false, files = "^(schema\\.json|tools/build-cli-definition\\.go)$" },
+  { id = "task-format-clean", name = "task format produces no diff (mirrors CI format check)", entry = "bash -c 'task format && git diff --quiet'", language = "system", pass_filenames = false, files = "\\.(go|sql|json)$" },
+  # cli-definition.json is built from the cobra command tree, so any change
+  # under cmd/ can affect it — not just schema.json or build-cli-definition.go.
+  { id = "task-generate-clean", name = "task generate produces no diff (mirrors CI code generation check)", entry = "bash -c 'task generate && git diff --quiet -- pkg/migrations/types.go cli-definition.json'", language = "system", pass_filenames = false, files = "^(schema\\.json|tools/build-cli-definition\\.go|cmd/.*\\.go)$" },
   { id = "task-ledger-clean", name = "task ledger produces no diff", entry = "bash -c 'task ledger && git diff --quiet -- examples/.ledger'", language = "system", pass_filenames = false, files = "^examples/" },
   { id = "task-license", name = "task license (SPDX header on .go files)", entry = "bash -c 'task license && git diff --quiet'", language = "system", pass_filenames = false, files = "\\.go$" },
   { id = "task-deadcode", name = "task deadcode (mirrors CI dead code check)", entry = "task deadcode", language = "system", pass_filenames = false, files = "\\.go$" },

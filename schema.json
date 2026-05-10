@@ -1159,6 +1159,169 @@
       },
       "type": "array"
     },
+    "Precondition": {
+      "description": "A schema state assertion that must hold before a migration can be applied",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table_exists": {
+          "description": "Assert that a table with this name exists",
+          "type": "string"
+        },
+        "table_not_exists": {
+          "description": "Assert that a table with this name does not exist",
+          "type": "string"
+        },
+        "column_exists": {
+          "description": "Assert that a column exists on a table",
+          "$ref": "#/$defs/PreconditionColumnExists"
+        },
+        "column_not_exists": {
+          "description": "Assert that a column does not exist on a table",
+          "$ref": "#/$defs/PreconditionColumnRef"
+        },
+        "index_exists": {
+          "description": "Assert that an index exists on a table",
+          "$ref": "#/$defs/PreconditionIndexRef"
+        },
+        "constraint_exists": {
+          "description": "Assert that a constraint exists on a table",
+          "$ref": "#/$defs/PreconditionConstraintRef"
+        },
+        "function_exists": {
+          "description": "Assert that a function exists with a specific signature and optionally a specific body hash",
+          "$ref": "#/$defs/PreconditionFunctionRef"
+        },
+        "type_exists": {
+          "description": "Assert that a type (e.g. ENUM) exists, optionally with specific values or a values hash",
+          "$ref": "#/$defs/PreconditionTypeRef"
+        }
+      },
+      "oneOf": [
+        { "required": ["table_exists"] },
+        { "required": ["table_not_exists"] },
+        { "required": ["column_exists"] },
+        { "required": ["column_not_exists"] },
+        { "required": ["index_exists"] },
+        { "required": ["constraint_exists"] },
+        { "required": ["function_exists"] },
+        { "required": ["type_exists"] }
+      ]
+    },
+    "PreconditionColumnExists": {
+      "description": "Column existence assertion with optional type check",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "description": "Name of the table",
+          "type": "string"
+        },
+        "column": {
+          "description": "Name of the column",
+          "type": "string"
+        },
+        "type": {
+          "description": "Expected column type (validated only if provided)",
+          "type": "string"
+        }
+      },
+      "required": ["table", "column"]
+    },
+    "PreconditionColumnRef": {
+      "description": "Reference to a column on a table",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "description": "Name of the table",
+          "type": "string"
+        },
+        "column": {
+          "description": "Name of the column",
+          "type": "string"
+        }
+      },
+      "required": ["table", "column"]
+    },
+    "PreconditionIndexRef": {
+      "description": "Reference to an index on a table",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "description": "Name of the table",
+          "type": "string"
+        },
+        "index": {
+          "description": "Name of the index",
+          "type": "string"
+        }
+      },
+      "required": ["table", "index"]
+    },
+    "PreconditionConstraintRef": {
+      "description": "Reference to a constraint on a table",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "description": "Name of the table",
+          "type": "string"
+        },
+        "constraint": {
+          "description": "Name of the constraint",
+          "type": "string"
+        }
+      },
+      "required": ["table", "constraint"]
+    },
+    "PreconditionFunctionRef": {
+      "description": "Function existence assertion with optional signature and body hash",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "description": "Schema containing the function (defaults to public)",
+          "type": "string",
+          "default": "public"
+        },
+        "name": {
+          "description": "Name of the function",
+          "type": "string"
+        },
+        "signature": {
+          "description": "Expected function signature, e.g. '(text) -> text'. Validated only if provided.",
+          "type": "string"
+        },
+        "body_hash": {
+          "description": "Expected SHA-256 hash of the function body prefixed with 'sha256:', e.g. 'sha256:a1b2c3...'. Validated only if provided.",
+          "type": "string"
+        }
+      },
+      "required": ["name"]
+    },
+    "PreconditionTypeRef": {
+      "description": "Type existence assertion with optional values hash for ENUMs",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "description": "Schema containing the type (defaults to public)",
+          "type": "string",
+          "default": "public"
+        },
+        "name": {
+          "description": "Name of the type",
+          "type": "string"
+        },
+        "values_hash": {
+          "description": "Expected SHA-256 hash of the sorted enum values prefixed with 'sha256:', e.g. 'sha256:a1b2c3...'. Validated only if provided.",
+          "type": "string"
+        }
+      },
+      "required": ["name"]
+    },
     "PgRollMigration": {
       "additionalProperties": false,
       "description": "PgRoll migration definition",
@@ -1173,6 +1336,20 @@
         },
         "operations": {
           "$ref": "#/$defs/PgRollOperations"
+        },
+        "depends_on": {
+          "description": "List of migration names that must be applied before this migration. Creates explicit ordering constraints for migrations that are not commutative.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "preconditions": {
+          "description": "Schema state assertions that must hold before this migration can be applied. If any precondition fails, the migration is rejected.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Precondition"
+          }
         }
       },
       "required": ["operations"],

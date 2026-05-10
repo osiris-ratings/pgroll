@@ -173,6 +173,8 @@ func ParseMigration(raw *RawMigration) (*Migration, error) {
 		Name:          raw.Name,
 		VersionSchema: raw.VersionSchema,
 		Operations:    ops,
+		DependsOn:     raw.DependsOn,
+		Preconditions: raw.Preconditions,
 	}, nil
 }
 

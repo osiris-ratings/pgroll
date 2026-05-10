@@ -483,11 +483,19 @@ type OpSetReplicaIdentity struct {
 
 // PgRoll migration definition
 type PgRollMigration struct {
+	// List of migration names that must be applied before this migration. Creates
+	// explicit ordering constraints for migrations that are not commutative.
+	DependsOn []string `json:"depends_on,omitempty"`
+
 	// Name of the migration
 	Name *string `json:"name,omitempty"`
 
 	// Operations corresponds to the JSON schema field "operations".
 	Operations PgRollOperations `json:"operations"`
+
+	// Schema state assertions that must hold before this migration can be applied. If
+	// any precondition fails, the migration is rejected.
+	Preconditions []Precondition `json:"preconditions,omitempty"`
 
 	// Name of the version schema to use for this migration
 	VersionSchema *string `json:"version_schema,omitempty"`
@@ -496,6 +504,103 @@ type PgRollMigration struct {
 type PgRollOperation interface{}
 
 type PgRollOperations []interface{}
+
+// A schema state assertion that must hold before a migration can be applied
+type Precondition struct {
+	// Assert that a column exists on a table
+	ColumnExists *PreconditionColumnExists `json:"column_exists,omitempty"`
+
+	// Assert that a column does not exist on a table
+	ColumnNotExists *PreconditionColumnRef `json:"column_not_exists,omitempty"`
+
+	// Assert that a constraint exists on a table
+	ConstraintExists *PreconditionConstraintRef `json:"constraint_exists,omitempty"`
+
+	// Assert that a function exists with a specific signature and optionally a
+	// specific body hash
+	FunctionExists *PreconditionFunctionRef `json:"function_exists,omitempty"`
+
+	// Assert that an index exists on a table
+	IndexExists *PreconditionIndexRef `json:"index_exists,omitempty"`
+
+	// Assert that a table with this name exists
+	TableExists *string `json:"table_exists,omitempty"`
+
+	// Assert that a table with this name does not exist
+	TableNotExists *string `json:"table_not_exists,omitempty"`
+
+	// Assert that a type (e.g. ENUM) exists, optionally with specific values or a
+	// values hash
+	TypeExists *PreconditionTypeRef `json:"type_exists,omitempty"`
+}
+
+// Column existence assertion with optional type check
+type PreconditionColumnExists struct {
+	// Name of the column
+	Column string `json:"column"`
+
+	// Name of the table
+	Table string `json:"table"`
+
+	// Expected column type (validated only if provided)
+	Type *string `json:"type,omitempty"`
+}
+
+// Reference to a column on a table
+type PreconditionColumnRef struct {
+	// Name of the column
+	Column string `json:"column"`
+
+	// Name of the table
+	Table string `json:"table"`
+}
+
+// Reference to a constraint on a table
+type PreconditionConstraintRef struct {
+	// Name of the constraint
+	Constraint string `json:"constraint"`
+
+	// Name of the table
+	Table string `json:"table"`
+}
+
+// Function existence assertion with optional signature and body hash
+type PreconditionFunctionRef struct {
+	// Expected SHA-256 hash of the function body prefixed with 'sha256:', e.g.
+	// 'sha256:a1b2c3...'. Validated only if provided.
+	BodyHash *string `json:"body_hash,omitempty"`
+
+	// Name of the function
+	Name string `json:"name"`
+
+	// Schema containing the function (defaults to public)
+	Schema string `json:"schema,omitempty"`
+
+	// Expected function signature, e.g. '(text) -> text'. Validated only if provided.
+	Signature *string `json:"signature,omitempty"`
+}
+
+// Reference to an index on a table
+type PreconditionIndexRef struct {
+	// Name of the index
+	Index string `json:"index"`
+
+	// Name of the table
+	Table string `json:"table"`
+}
+
+// Type existence assertion with optional values hash for ENUMs
+type PreconditionTypeRef struct {
+	// Name of the type
+	Name string `json:"name"`
+
+	// Schema containing the type (defaults to public)
+	Schema string `json:"schema,omitempty"`
+
+	// Expected SHA-256 hash of the sorted enum values prefixed with 'sha256:', e.g.
+	// 'sha256:a1b2c3...'. Validated only if provided.
+	ValuesHash *string `json:"values_hash,omitempty"`
+}
 
 // Replica identity definition
 type ReplicaIdentity struct {

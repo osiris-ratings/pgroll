@@ -83,12 +83,14 @@ func (m *Roll) UnappliedMigrations(ctx context.Context, dir fs.FS) ([]*migration
 		}
 	}
 
-	// Return local migrations not yet applied, preserving filesystem order
+	// Collect local migrations not yet applied, preserving filesystem order
 	unapplied := make([]*migrations.RawMigration, 0)
 	for _, m := range migsAfterBaseline {
 		if _, ok := applied[m.Name]; !ok {
 			unapplied = append(unapplied, m)
 		}
 	}
-	return unapplied, nil
+
+	// Sort respecting depends_on constraints, with filesystem order as tiebreaker
+	return TopoSortMigrations(unapplied, applied)
 }

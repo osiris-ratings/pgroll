@@ -96,23 +96,62 @@ Name-set matching operates only on migrations after the latest
 baseline. If you use baselines, divergent history handling works
 the same way — only post-baseline migrations are considered.
 
+## Ensuring safety with dependencies and preconditions
+
+Name-set matching enables flexible deployment but removes the
+implicit ordering guarantee. For migrations that are **not
+commutative** -- where the result depends on execution order -- use
+`depends_on` and `preconditions` to make ordering constraints
+explicit.
+
+See [Migration Dependencies and Preconditions](migration-dependencies.md)
+for full details.
+
+### Quick example
+
+```yaml
+# This migration must run after create_normalize_name and expects
+# the lien_parties table to have an entity_type enum column.
+depends_on:
+  - "20260319_create_normalize_name"
+preconditions:
+  - column_exists:
+      table: "lien_parties"
+      column: "entity_type"
+      type: "lien_party_entity_types"
+operations:
+  - sql:
+      up: |
+        CREATE FUNCTION build_individual_entity_name(...)
+        ...
+```
+
 ## Best practices
 
 1. **Use timestamp prefixes for migration filenames.** This ensures
    filesystem order reflects intended chronological order (e.g.,
    `20240115120000_create_users.json`).
 
-2. **Rebase feature branches before merging.** If your feature
+2. **Use `depends_on` for raw SQL migrations that reference objects
+   from other migrations.** Declarative operations are validated
+   automatically, but raw SQL bypasses this. Explicit dependencies
+   ensure correct ordering even when histories diverge.
+
+3. **Use `preconditions` when correctness depends on column types
+   or constraint existence.** This catches silent breakage from
+   schema drift.
+
+4. **Rebase feature branches before merging.** If your feature
    branch has migrations that sort before migrations already on
    `main`, rebase the migration timestamps so they sort after. This
    keeps the filesystem order clean, even though pgroll tolerates
    divergence.
 
-3. **Don't delete migration files.** pgroll validates that every
+5. **Don't delete migration files.** pgroll validates that every
    applied migration has a local file. Deleting a file for an
    applied migration will cause an error. Use baselines to hide
    old history instead.
 
-4. **Merge hotfix branches promptly.** The longer a hotfix branch
+6. **Merge hotfix branches promptly.** The longer a hotfix branch
    lives independently, the more divergence accumulates. Merge back
    to `main` as soon as the hotfix is verified.
