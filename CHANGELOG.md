@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `pgroll stamp <path>` — alembic-style state stamping that records migrations as already-applied without executing DDL. Use after loading a SQL dump (or recovering from missing/corrupt state) so pgroll's migrations table matches the live tables. The mode is implicit in the path: a single file stamps that one migration; a directory walks every file in lex order and chains through the latest (or `--up-to <name>`). `--type pgroll|baseline|inferred` (default `pgroll`); `--materialize` also creates the `<schema>_<version>` view layer over the leaf so apps have a schema to connect to. Idempotent — already-recorded names are skipped silently. Refuses during an active migration period.
+
 ## [0.16.1-baselayer.7] - 2026-05-09
 
 ## [0.16.1-baselayer.6] - 2026-05-09
