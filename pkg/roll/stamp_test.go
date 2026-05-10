@@ -281,6 +281,47 @@ func TestStampThenMaterializeYieldsQueryableViews(t *testing.T) {
 	})
 }
 
+// TestStampSingleMigrationViaSliceOfOne is the Roll-level analogue of the
+// `pgroll stamp <file>` CLI mode. cmd/stamp.go's collectStampInputs returns
+// a one-element slice when the positional path is a regular file; this test
+// proves Roll.Stamp handles that input correctly (single row, parent
+// auto-resolved, leaf gets live schema).
+func TestStampSingleMigrationViaSliceOfOne(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		const name = "01_solo"
+
+		execNoInferred(
+			t, ctx, db,
+			"CREATE TABLE solo(id integer PRIMARY KEY, name varchar(255))",
+		)
+
+		raws := []*migrations.RawMigration{
+			rawMig(t, name, migrations.Operations{createTableOp("solo")}),
+		}
+		stamped, err := m.Stamp(ctx, raws, roll.MigrationTypePgroll)
+		require.NoError(t, err)
+		require.Equal(t, []string{name}, stamped)
+
+		var (
+			parent      *string
+			migType     string
+			done        bool
+			emptySchema bool
+		)
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT parent, migration_type, done, resulting_schema = '{}'::jsonb
+			  FROM pgroll.migrations WHERE schema = $1 AND name = $2`,
+			cSchema, name).Scan(&parent, &migType, &done, &emptySchema))
+		assert.Nil(t, parent, "single stamp with no prior history must have NULL parent")
+		assert.Equal(t, "pgroll", migType)
+		assert.True(t, done)
+		assert.False(t, emptySchema, "single stamp's row IS the leaf and must carry a live resulting_schema")
+	})
+}
+
 func TestStampEmptyInputIsNoop(t *testing.T) {
 	t.Parallel()
 

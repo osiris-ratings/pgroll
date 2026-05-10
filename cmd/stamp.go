@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pterm/pterm"
@@ -23,26 +24,29 @@ func stampCmd() *cobra.Command {
 	var yes bool
 
 	cmd := &cobra.Command{
-		Use:   "stamp <directory>",
+		Use:   "stamp <path>",
 		Short: "Record migrations as already-applied without executing DDL",
-		Long: "Stamp records every migration in <directory> from the current pgroll leaf\n" +
-			"through the latest file (or --up-to <name>) as already-applied, without\n" +
-			"executing any DDL. It is alembic-style stamping: \"the database is already\n" +
-			"in this state, just record the rows.\"\n\n" +
+		Long: "Stamp records migrations as already-applied in pgroll's state without\n" +
+			"executing any DDL. Alembic-style: \"the database is already in this state,\n" +
+			"just record the rows.\"\n\n" +
+			"The mode is implicit in <path>:\n\n" +
+			"  - <path> is a single migration file → stamp that one migration.\n" +
+			"  - <path> is a directory → walk the directory in lex order and stamp\n" +
+			"    every migration through the latest file (or --up-to <name>).\n\n" +
 			"Use after loading a SQL dump (or recovering from missing/corrupt state) so\n" +
 			"pgroll's migrations table matches the live tables. Idempotent — already-\n" +
 			"recorded names are skipped silently. Refuses if a migration is currently in\n" +
 			"progress; run `pgroll rollback` first.\n\n" +
 			"Pass --materialize to also create the <schema>_<version> view layer over\n" +
 			"the leaf, so apps have a schema to connect to. This is the typical\n" +
-			"end-to-end recovery flow: load dump → stamp → materialize.\n\n" +
+			"end-to-end recovery flow: load dump → stamp --materialize.\n\n" +
 			"For real baselines (capturing current schema as a fresh starting point), use\n" +
 			"`pgroll baseline` instead.",
 		Args:      cobra.ExactArgs(1),
-		ValidArgs: []string{"directory"},
+		ValidArgs: []string{"path"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			dir := args[0]
+			path := args[0]
 
 			switch migrationType {
 			case roll.MigrationTypePgroll, roll.MigrationTypeBaseline, roll.MigrationTypeInferred:
@@ -53,12 +57,9 @@ func stampCmd() *cobra.Command {
 				)
 			}
 
-			info, err := os.Stat(dir)
+			info, err := os.Stat(path)
 			if err != nil {
-				return fmt.Errorf("failed to stat migrations directory: %w", err)
-			}
-			if !info.IsDir() {
-				return fmt.Errorf("migrations directory %q is not a directory", dir)
+				return fmt.Errorf("failed to stat %q: %w", path, err)
 			}
 
 			m, err := NewRollWithInitCheck(ctx)
@@ -67,36 +68,9 @@ func stampCmd() *cobra.Command {
 			}
 			defer m.Close()
 
-			fsys := os.DirFS(dir)
-			files, err := migrations.CollectFilesFromDir(fsys)
+			raws, err := collectStampInputs(path, info, upTo)
 			if err != nil {
-				return fmt.Errorf("failed to list migration files in %q: %w", dir, err)
-			}
-			if len(files) == 0 {
-				return fmt.Errorf("no migration files found in %q", dir)
-			}
-
-			raws := make([]*migrations.RawMigration, 0, len(files))
-			for _, name := range files {
-				raw, err := migrations.ReadRawMigration(fsys, name)
-				if err != nil {
-					return fmt.Errorf("failed to read migration %q: %w", name, err)
-				}
-				raws = append(raws, raw)
-			}
-
-			if upTo != "" {
-				idx := -1
-				for i, r := range raws {
-					if r.Name == upTo {
-						idx = i
-						break
-					}
-				}
-				if idx < 0 {
-					return fmt.Errorf("--up-to %q not found among migration files in %q", upTo, dir)
-				}
-				raws = raws[:idx+1]
+				return err
 			}
 
 			toStamp, alreadyStamped, err := classifyStampInputs(ctx, m, raws)
@@ -104,13 +78,13 @@ func stampCmd() *cobra.Command {
 				return err
 			}
 
-			if err := printStampPreFlight(m, dir, migrationType, materialize, raws, toStamp, alreadyStamped, os.Stdout); err != nil {
+			if err := printStampPreFlight(m, path, info.IsDir(), migrationType, materialize, raws, toStamp, alreadyStamped, os.Stdout); err != nil {
 				return fmt.Errorf("pre-flight summary: %w", err)
 			}
 
 			// Allow `--materialize` to run even when there's nothing to
 			// stamp — common case is re-running the recovery flow after
-			// the schema was dropped from a previously-stamped DB.
+			// the version schema was dropped from a previously-stamped DB.
 			if len(toStamp) == 0 && !materialize {
 				return nil
 			}
@@ -147,10 +121,6 @@ func stampCmd() *cobra.Command {
 			}
 
 			if materialize {
-				// Use the chain leaf's VersionSchemaName so the materialized
-				// schema name matches what `pgroll migrate` would produce for
-				// the same migration. Falls back to the migration's name if
-				// no version_schema field is set in the file.
 				leaf, err := migrations.ParseMigration(raws[len(raws)-1])
 				if err != nil {
 					return fmt.Errorf("failed to parse leaf migration for materialize: %w", err)
@@ -174,12 +144,64 @@ func stampCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&upTo, "up-to", "", "Stop at this migration name (inclusive); default = latest file in the directory")
+	cmd.Flags().StringVar(&upTo, "up-to", "", "Stop at this migration name (inclusive); only valid when <path> is a directory")
 	cmd.Flags().StringVar(&migrationType, "type", roll.MigrationTypePgroll, "Migration type to record: pgroll, baseline, or inferred")
 	cmd.Flags().BoolVar(&materialize, "materialize", false, "After stamping, create the <schema>_<version> view layer over the leaf")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 
 	return cmd
+}
+
+// collectStampInputs returns the list of RawMigrations to stamp. Mode is
+// implicit in the path: a regular file yields a single-element slice; a
+// directory yields every migration file in lex order, optionally truncated
+// by upTo. Rejects upTo when the input is a single file (it's meaningless).
+func collectStampInputs(path string, info os.FileInfo, upTo string) ([]*migrations.RawMigration, error) {
+	if !info.IsDir() {
+		if upTo != "" {
+			return nil, fmt.Errorf("--up-to is only valid when stamping a directory; %q is a file", path)
+		}
+		dir, base := filepath.Split(path)
+		if dir == "" {
+			dir = "."
+		}
+		raw, err := migrations.ReadRawMigration(os.DirFS(dir), base)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read migration %q: %w", path, err)
+		}
+		return []*migrations.RawMigration{raw}, nil
+	}
+
+	fsys := os.DirFS(path)
+	files, err := migrations.CollectFilesFromDir(fsys)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list migration files in %q: %w", path, err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no migration files found in %q", path)
+	}
+	raws := make([]*migrations.RawMigration, 0, len(files))
+	for _, name := range files {
+		raw, err := migrations.ReadRawMigration(fsys, name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read migration %q: %w", name, err)
+		}
+		raws = append(raws, raw)
+	}
+	if upTo != "" {
+		idx := -1
+		for i, r := range raws {
+			if r.Name == upTo {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("--up-to %q not found among migration files in %q", upTo, path)
+		}
+		raws = raws[:idx+1]
+	}
+	return raws, nil
 }
 
 // classifyStampInputs partitions a slice of raw migrations into those that
@@ -205,7 +227,7 @@ func classifyStampInputs(
 // printStampPreFlight reports what `pgroll stamp` is about to do, in the
 // same visual style as the migrate / materialize pre-flight summaries.
 func printStampPreFlight(
-	m *roll.Roll, dir, migrationType string, materialize bool,
+	m *roll.Roll, path string, isDir bool, migrationType string, materialize bool,
 	raws []*migrations.RawMigration,
 	toStamp, alreadyStamped []string,
 	out io.Writer,
@@ -215,8 +237,13 @@ func printStampPreFlight(
 		fieldColWidth = 16
 	)
 
+	mode := "single"
+	if isDir {
+		mode = "chain"
+	}
+
 	title := pterm.NewStyle(pterm.FgWhite, pterm.Bold).Sprint("▶ pgroll stamp")
-	subtitle := pterm.FgGray.Sprintf("%s · %d candidate(s)", dir, len(raws))
+	subtitle := pterm.FgGray.Sprintf("%s · %s · %d candidate(s)", path, mode, len(raws))
 	fmt.Fprintf(out, "\n%s   %s\n\n", title, subtitle)
 
 	stateColor := pterm.FgCyan
@@ -240,6 +267,8 @@ func printStampPreFlight(
 	field("Source", m.Schema())
 	field("Type", migrationType)
 	if len(raws) > 0 {
+		// "Up to" reads naturally for chain mode and is still accurate for
+		// single mode (the leaf == the only migration).
 		field("Up to", raws[len(raws)-1].Name)
 	}
 	if materialize && len(raws) > 0 {
