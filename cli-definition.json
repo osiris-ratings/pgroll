@@ -37,6 +37,23 @@
       ]
     },
     {
+      "name": "check",
+      "short": "Validate migration files without requiring a database connection",
+      "use": "check <directory>",
+      "example": "  pgroll check migrations/\n  pgroll check --base origin/main migrations/",
+      "flags": [
+        {
+          "name": "base",
+          "description": "Git ref for base-branch ordering check (e.g., origin/main)",
+          "default": ""
+        }
+      ],
+      "subcommands": [],
+      "args": [
+        "directory"
+      ]
+    },
+    {
       "name": "complete",
       "short": "Complete an ongoing migration with the operations present in the given file",
       "use": "complete <file>",

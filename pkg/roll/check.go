@@ -92,7 +92,8 @@ func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 		if len(schemaName) > 63 {
 			result.addError(file, fmt.Sprintf(
 				"name too long: schema %q would be %d chars (max 63)",
-				schemaName, len(schemaName)))
+				schemaName, len(schemaName),
+			))
 		}
 
 		allNames[raw.Name] = struct{}{}
@@ -110,7 +111,8 @@ func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 		for _, dep := range p.raw.DependsOn {
 			if _, ok := allNames[dep]; !ok {
 				result.addError(p.file, fmt.Sprintf(
-					"depends_on target %q not found in migration set", dep))
+					"depends_on target %q not found in migration set", dep,
+				))
 			}
 		}
 	}
@@ -195,7 +197,10 @@ func CheckBaseOrdering(migrationsDir string, baseRef string) (*CheckResult, erro
 	sort.Strings(baseMigrations)
 	lastBase := baseMigrations[len(baseMigrations)-1]
 
-	// Find new migration files added in this branch
+	// Find new migration files added in this branch.
+	// #nosec G204 -- exec.Command does not invoke a shell; baseRef and
+	// migrationsDir are passed as literal argv args to git, not interpolated
+	// into a shell command.
 	diffOut, err := exec.Command("git", "diff", "--name-only", "--diff-filter=A",
 		mergeBase+"..HEAD", "--",
 		migrationsDir+"/*.yaml", migrationsDir+"/*.yml", migrationsDir+"/*.json").Output()
@@ -213,7 +218,8 @@ func CheckBaseOrdering(migrationsDir string, baseRef string) (*CheckResult, erro
 		if basename <= lastBase {
 			result.addError(basename, fmt.Sprintf(
 				"sorts before or equal to base branch's latest migration %q — run pgroll rebase",
-				lastBase))
+				lastBase,
+			))
 		}
 	}
 
