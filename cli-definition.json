@@ -247,6 +247,39 @@
       "args": []
     },
     {
+      "name": "stamp",
+      "short": "Record migrations as already-applied without executing DDL",
+      "use": "stamp <directory>",
+      "example": "",
+      "flags": [
+        {
+          "name": "materialize",
+          "description": "After stamping, create the <schema>_<version> view layer over the leaf",
+          "default": "false"
+        },
+        {
+          "name": "type",
+          "description": "Migration type to record: pgroll, baseline, or inferred",
+          "default": "pgroll"
+        },
+        {
+          "name": "up-to",
+          "description": "Stop at this migration name (inclusive); default = latest file in the directory",
+          "default": ""
+        },
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "Skip confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": [
+        "directory"
+      ]
+    },
+    {
       "name": "start",
       "short": "Start a migration for the operations present in the given file",
       "use": "start <file>",

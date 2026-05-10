@@ -998,13 +998,13 @@ func TestReadSchema(t *testing.T) {
 			{
 				name: "multicolumn foreign key constraint",
 				createStmt: `CREATE TABLE products(
-          customer_id INT NOT NULL, 
-          product_id INT NOT NULL, 
+          customer_id INT NOT NULL,
+          product_id INT NOT NULL,
           PRIMARY KEY(customer_id, product_id));
 
           CREATE TABLE orders(
-            customer_id INT NOT NULL, 
-            product_id INT NOT NULL, 
+            customer_id INT NOT NULL,
+            product_id INT NOT NULL,
             CONSTRAINT fk_customer_product FOREIGN KEY (customer_id, product_id) REFERENCES products (customer_id, product_id));`,
 				wantSchema: &schema.Schema{
 					Name: "public",
@@ -1070,13 +1070,13 @@ func TestReadSchema(t *testing.T) {
 			{
 				name: "multicolumn foreign key constraint with on update action",
 				createStmt: `CREATE TABLE products(
-          customer_id INT NOT NULL, 
-          product_id INT NOT NULL, 
+          customer_id INT NOT NULL,
+          product_id INT NOT NULL,
           PRIMARY KEY(customer_id, product_id));
 
           CREATE TABLE orders(
-            customer_id INT NOT NULL, 
-            product_id INT NOT NULL, 
+            customer_id INT NOT NULL,
+            product_id INT NOT NULL,
             CONSTRAINT fk_customer_product FOREIGN KEY (customer_id, product_id) REFERENCES products (customer_id, product_id) ON UPDATE CASCADE);`,
 				wantSchema: &schema.Schema{
 					Name: "public",
@@ -1461,4 +1461,99 @@ func clearOIDS(s *schema.Schema) {
 		c.OID = ""
 		s.Tables[k] = c
 	}
+}
+
+func TestStamp(t *testing.T) {
+	t.Parallel()
+
+	t.Run("inserts a row with parent auto-resolved when no prior history", func(t *testing.T) {
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, db *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, s.Stamp(ctx, "public", "01_first", []byte(`{}`), nil, nil, "pgroll"))
+
+			var parent *string
+			var migType string
+			var done bool
+			require.NoError(t, db.QueryRowContext(ctx,
+				"SELECT parent, migration_type, done FROM pgroll.migrations WHERE schema=$1 AND name=$2",
+				"public", "01_first").Scan(&parent, &migType, &done))
+			assert.Nil(t, parent, "first stamp with no history must have NULL parent")
+			assert.Equal(t, "pgroll", migType)
+			assert.True(t, done)
+		})
+	})
+
+	t.Run("auto-resolves parent from latest_migration() when prior history exists", func(t *testing.T) {
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, db *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, s.Stamp(ctx, "public", "01_a", []byte(`{}`), nil, nil, "pgroll"))
+			require.NoError(t, s.Stamp(ctx, "public", "02_b", []byte(`{}`), nil, nil, "pgroll"))
+
+			var parent *string
+			require.NoError(t, db.QueryRowContext(ctx,
+				"SELECT parent FROM pgroll.migrations WHERE schema=$1 AND name=$2",
+				"public", "02_b").Scan(&parent))
+			require.NotNil(t, parent)
+			assert.Equal(t, "01_a", *parent)
+		})
+	})
+
+	t.Run("honors explicit parent over latest_migration()", func(t *testing.T) {
+		// Roll.Stamp builds the chain explicitly to avoid relying on
+		// latest_migration() resolving correctly mid-batch — verify an
+		// explicit parent is what gets persisted. Linear-history
+		// constraint forces the explicit parent to match the leaf.
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, db *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, s.Stamp(ctx, "public", "01_a", []byte(`{}`), nil, nil, "pgroll"))
+
+			explicit := "01_a"
+			require.NoError(t, s.Stamp(ctx, "public", "02_b", []byte(`{}`), nil, &explicit, "pgroll"))
+
+			var parent *string
+			require.NoError(t, db.QueryRowContext(ctx,
+				"SELECT parent FROM pgroll.migrations WHERE schema=$1 AND name=$2",
+				"public", "02_b").Scan(&parent))
+			require.NotNil(t, parent)
+			assert.Equal(t, "01_a", *parent)
+		})
+	})
+
+	t.Run("stores supplied resulting_schema verbatim", func(t *testing.T) {
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, db *sql.DB) {
+			ctx := context.Background()
+			payload := []byte(`{"name":"public","tables":{}}`)
+			require.NoError(t, s.Stamp(ctx, "public", "01_x", []byte(`{}`), payload, nil, "pgroll"))
+
+			var stored []byte
+			require.NoError(t, db.QueryRowContext(ctx,
+				"SELECT resulting_schema FROM pgroll.migrations WHERE schema=$1 AND name=$2",
+				"public", "01_x").Scan(&stored))
+			assert.JSONEq(t, string(payload), string(stored))
+		})
+	})
+
+	t.Run("rejects duplicate (schema, name)", func(t *testing.T) {
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, _ *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, s.Stamp(ctx, "public", "01_dup", []byte(`{}`), nil, nil, "pgroll"))
+			err := s.Stamp(ctx, "public", "01_dup", []byte(`{}`), nil, nil, "pgroll")
+			require.Error(t, err)
+		})
+	})
+
+	t.Run("MigrationExists tracks stamped names", func(t *testing.T) {
+		testutils.WithStateAndConnectionToContainer(t, func(s *state.State, _ *sql.DB) {
+			ctx := context.Background()
+			exists, err := s.MigrationExists(ctx, "public", "01_x")
+			require.NoError(t, err)
+			assert.False(t, exists)
+
+			require.NoError(t, s.Stamp(ctx, "public", "01_x", []byte(`{}`), nil, nil, "pgroll"))
+
+			exists, err = s.MigrationExists(ctx, "public", "01_x")
+			require.NoError(t, err)
+			assert.True(t, exists)
+		})
+	})
 }

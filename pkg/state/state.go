@@ -499,3 +499,83 @@ func (s *State) CreateBaseline(ctx context.Context, schemaName, baselineVersion 
 
 	return nil
 }
+
+// MigrationExists reports whether a migration with the given name is already
+// recorded for the schema. Used by callers that need to skip already-recorded
+// migrations regardless of baseline boundary (which SchemaHistory respects).
+func (s *State) MigrationExists(ctx context.Context, schemaName, name string) (bool, error) {
+	var exists bool
+	err := s.pgConn.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM %s.migrations WHERE schema=$1 AND name=$2)",
+			pq.QuoteIdentifier(s.schema)),
+		schemaName, name).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("checking migration existence: %w", err)
+	}
+	return exists, nil
+}
+
+// Stamp records a single migration in the state as already-applied without
+// executing any DDL. Inserts one row into the migrations table with done=TRUE
+// and the supplied body, resulting_schema, parent, and migration_type. Used by
+// `pgroll stamp` to formalize alembic-style state stamping after loading a
+// SQL dump (or recovering from missing state).
+//
+// migration:        marshalled migration body to store. May be a real
+//
+//	parsed migration JSON or an empty `{}` placeholder.
+//
+// resultingSchema:  marshalled schema.Schema to store as the post-migration
+//
+//	state. nil falls back to the SQL default '{}'.
+//
+// parent:           explicit parent name. nil resolves to latest_migration()
+//
+//	at insert time, mirroring State.Start.
+//
+// migrationType:    one of "pgroll", "baseline", "inferred". Empty string
+//
+//	falls back to the migrations table default ("pgroll").
+func (s *State) Stamp(
+	ctx context.Context,
+	schemaName, name string,
+	migration []byte,
+	resultingSchema []byte,
+	parent *string,
+	migrationType string,
+) error {
+	parentClause := fmt.Sprintf("%s.latest_migration($1)", pq.QuoteIdentifier(s.schema))
+	args := []any{schemaName, name, migration}
+	if parent != nil {
+		parentClause = fmt.Sprintf("$%d", len(args)+1)
+		args = append(args, *parent)
+	}
+
+	resultingClause := "'{}'::jsonb"
+	if resultingSchema != nil {
+		resultingClause = fmt.Sprintf("$%d", len(args)+1)
+		args = append(args, resultingSchema)
+	}
+
+	typeClause := "DEFAULT"
+	if migrationType != "" {
+		typeClause = fmt.Sprintf("$%d", len(args)+1)
+		args = append(args, migrationType)
+	}
+
+	// Schema identifier passes through pq.QuoteIdentifier; the other
+	// formatted segments are fixed strings (parameter placeholders or
+	// literal `DEFAULT`/`'{}'::jsonb`) chosen by call-site logic above.
+	// Same shape as State.CreateBaseline / State.Start.
+	//nolint:gosec // G201: schema is identifier-quoted; segments are fixed strings.
+	stmt := fmt.Sprintf(`
+		INSERT INTO %[1]s.migrations
+		(schema, name, migration, resulting_schema, done, parent, migration_type, created_at, updated_at)
+		VALUES ($1, $2, $3, %[2]s, TRUE, %[3]s, %[4]s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		pq.QuoteIdentifier(s.schema), resultingClause, parentClause, typeClause)
+
+	if _, err := s.pgConn.ExecContext(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("failed to stamp migration %q: %w", name, err)
+	}
+	return nil
+}
