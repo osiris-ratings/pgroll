@@ -453,6 +453,64 @@ func TestMigrationDDLIsRetriedOnLockTimeouts(t *testing.T) {
 	})
 }
 
+// TestCompleteRetriesViewProjectionOnLockTimeout exercises the fix for the
+// retry-into-aborted-tx bug in ensureView. The Complete-phase view
+// re-projection used to send `BEGIN; DROP VIEW; CREATE VIEW; ALTER VIEW
+// SET DEFAULT…; COMMIT` as a single string via ExecContext. When
+// lock_timeout (55P03) fired on the DROP, the implicit transaction was
+// aborted and the pooled connection was left in "transaction aborted"
+// state; the retry re-sent the same string, the leading BEGIN became a
+// notice, the next statement returned 25P02, and the retry loop saw a
+// non-55P03 error and bailed after one attempt. With the fix (using
+// WithRetryableTransaction so the transaction is owned by `*sql.Tx`),
+// each retry opens a fresh transaction and the configured budget
+// actually runs to completion.
+func TestCompleteRetriesViewProjectionOnLockTimeout(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+		[]roll.Option{roll.WithLockTimeoutMs(50)},
+		func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+			version := "01_create_table"
+
+			// Start a migration so the version schema and its view exist.
+			if err := mig.Start(ctx,
+				&migrations.Migration{Name: version, Operations: migrations.Operations{createTableOp("table1")}},
+				backfill.NewConfig()); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+
+			// Hold an AccessShare lock on the versioned view for two seconds —
+			// long enough to force at least one lock_timeout (50ms) inside the
+			// Complete-phase view re-projection.
+			errCh := make(chan error, 1)
+			go func() {
+				tx, err := db.Begin()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				defer tx.Commit()
+				if _, err := tx.ExecContext(ctx,
+					fmt.Sprintf("LOCK TABLE %s.table1 IN ACCESS SHARE MODE",
+						roll.VersionedSchemaName(cSchema, version))); err != nil {
+					errCh <- err
+					return
+				}
+				errCh <- nil
+				time.Sleep(2 * time.Second)
+			}()
+			require.NoError(t, <-errCh)
+
+			// Complete must eventually succeed once the reader releases.
+			// Pre-fix this returned `25P02` after one retry; post-fix the
+			// retry budget produces fresh transactions until DROP VIEW gets
+			// AccessExclusive.
+			require.NoError(t, mig.Complete(ctx))
+		})
+}
+
 func TestViewsAreCreatedWithSecurityInvokerTrue(t *testing.T) {
 	t.Parallel()
 

@@ -4,6 +4,7 @@ package roll
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -699,30 +700,54 @@ func (m *Roll) ensureView(ctx context.Context, version, name string, table *sche
 		withOptions = "WITH (security_invoker = true)"
 	}
 
-	// We must set column default values for the views directly, as the
-	// values are not kept from the underlying tables.
-	var addDefaultsToView string
+	// Build the DROP + CREATE + per-column-default statements. Each is its
+	// own statement (not chained with `;`) so the surrounding transaction is
+	// owned by Go's `*sql.Tx` rather than an in-string BEGIN/COMMIT pair:
+	// a `lock_timeout` (55P03) mid-string would otherwise abort the
+	// implicit transaction and leave the pooled connection in
+	// "transaction aborted" state, so RDB's retry would re-send the same
+	// string into a poisoned session and get `25P02` on every subsequent
+	// statement (which isn't 55P03, so the retry loop bails after one
+	// attempt). WithRetryableTransaction rolls back on failure and opens a
+	// fresh tx for each retry, letting the configured retry budget actually
+	// work under view-projection lock contention.
+	schemaName := VersionedSchemaName(m.schema, version)
+	dropViewSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s",
+		pq.QuoteIdentifier(schemaName),
+		pq.QuoteIdentifier(name))
+	//nolint:gosec // G201: identifiers are pq.QuoteIdentifier'd; withOptions is a fixed string; columns is built from `"<phys>" AS "<virt>"` pairs whose components are already QuoteIdentifier'd above.
+	createViewSQL := fmt.Sprintf("CREATE VIEW %s.%s %s AS SELECT %s FROM %s",
+		pq.QuoteIdentifier(schemaName),
+		pq.QuoteIdentifier(name),
+		withOptions,
+		strings.Join(columns, ","),
+		pq.QuoteIdentifier(table.Name))
+
+	setDefaultSQLs := make([]string, 0, len(defaults))
 	for column, defaultVal := range defaults {
-		addDefaultsToView += fmt.Sprintf("ALTER VIEW %s.%s ALTER %s SET DEFAULT %s; ",
-			pq.QuoteIdentifier(VersionedSchemaName(m.schema, version)),
+		setDefaultSQLs = append(setDefaultSQLs, fmt.Sprintf(
+			"ALTER VIEW %s.%s ALTER %s SET DEFAULT %s",
+			pq.QuoteIdentifier(schemaName),
 			pq.QuoteIdentifier(name),
 			pq.QuoteIdentifier(column),
-			defaultVal)
+			defaultVal,
+		))
 	}
-	_, err := m.pgConn.ExecContext(ctx,
-		fmt.Sprintf("BEGIN; DROP VIEW IF EXISTS %s.%s; CREATE VIEW %s.%s %s AS SELECT %s FROM %s; %s COMMIT",
-			pq.QuoteIdentifier(VersionedSchemaName(m.schema, version)),
-			pq.QuoteIdentifier(name),
-			pq.QuoteIdentifier(VersionedSchemaName(m.schema, version)),
-			pq.QuoteIdentifier(name),
-			withOptions,
-			strings.Join(columns, ","),
-			pq.QuoteIdentifier(table.Name),
-			addDefaultsToView))
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, dropViewSQL); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, createViewSQL); err != nil {
+			return err
+		}
+		for _, stmt := range setDefaultSQLs {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *backfill.Config) error {

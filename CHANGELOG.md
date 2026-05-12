@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `lock_timeout` retries during Complete-phase view re-projection no longer poison the connection. `ensureView` used to send `BEGIN; DROP VIEW; CREATE VIEW; ALTER VIEW SET DEFAULT…; COMMIT` as a single multi-statement string via `ExecContext`. When `lock_timeout` (SQLSTATE 55P03) fired on the `DROP VIEW`, Postgres aborted the *implicit* transaction started by the literal `BEGIN`, but Go's `*sql.DB` had no idea — the pooled connection was returned in "transaction aborted" state. The retry path re-sent the same string; the leading `BEGIN` became a notice ("there is already a transaction in progress"), the next statement returned `25P02`, and since `25P02` isn't `55P03` the retry loop treated it as terminal. Net result: the 5-minute retry budget produced exactly one real attempt, which is unrecoverable under continuous app-pod read load on the new version views. `ensureView` now uses `WithRetryableTransaction` with separate `tx.ExecContext` calls per statement, so each retry opens a fresh `*sql.Tx`, lets Go's pool roll back cleanly on failure, and the configured budget actually runs to completion. Added regression test `TestCompleteRetriesViewProjectionOnLockTimeout`.
+
 ## [0.16.1-baselayer.10] - 2026-05-10
 
 ### Fixed
