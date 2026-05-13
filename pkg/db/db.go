@@ -10,15 +10,11 @@ import (
 
 	"github.com/cloudflare/backoff"
 	"github.com/lib/pq"
+	"github.com/lib/pq/pqerror"
 )
 
 const (
-	// pq.ErrorCode is marked deprecated in lib/pq v1.10.x with a recommendation
-	// to use `pqerror.Code`, but no such public package exists. pq.Error.Code
-	// is itself still typed `pq.ErrorCode`, so any replacement would just lose
-	// type safety.
-	//nolint:staticcheck // SA1019: pq.ErrorCode replacement does not exist in lib/pq v1.10.x.
-	lockNotAvailableErrorCode pq.ErrorCode = "55P03"
+	lockNotAvailableErrorCode pqerror.Code = "55P03"
 	maxBackoffDuration                     = 1 * time.Minute
 	backoffInterval                        = 1 * time.Second
 

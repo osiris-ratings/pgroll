@@ -275,7 +275,7 @@ func TestStampThenMaterializeYieldsQueryableViews(t *testing.T) {
 		require.True(t, schemaExists(t, db, versionSchema))
 		// versionSchema is computed by VersionedSchemaName from the test's
 		// own constants; this is a test-only sanity query.
-		//nolint:gosec // G202: schema name comes from test-controlled input.
+
 		_, err = db.ExecContext(ctx, "SELECT id, name FROM \""+versionSchema+"\".widgets")
 		require.NoError(t, err, "stamped + materialized leaf should be queryable through the version schema")
 	})

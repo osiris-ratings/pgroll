@@ -19,12 +19,12 @@ hooks = [
 
 [[repos]]
 repo = "https://github.com/golangci/golangci-lint"
-rev = "v2.11.4"
+rev = "v2.12.2"
 hooks = [
   # `golangci-lint-full` (not `golangci-lint`): the latter passes
   # `--new-from-rev HEAD --fix`, which only flags issues introduced after
   # HEAD and silently skips real ones already in the diff. The full variant
-  # lints the whole module exactly like CI does. We pin the same v2.11.4
+  # lints the whole module exactly like CI does. We pin the same v2.12.2
   # rev CI uses for byte-identical lint behavior, regardless of what version
   # `brew install golangci-lint` happens to ship locally.
   { id = "golangci-lint-full", args = ["--config=.golangci.yml", "--timeout=30m"] },
