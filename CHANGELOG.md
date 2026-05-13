@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2-baselayer.1] - 2026-05-13
+
 ### Changed
 - Merged upstream `xataio/pgroll` v0.16.2 (single commit: Go toolchain bump to 1.26.3). `go.mod` and `dev/go.mod` now declare `go 1.26.3`, CI `golangci-lint` bumped to v2.12.2, and `prek.toml` lockstep-bumped to v2.12.2 so local lint stays byte-aligned with CI. The new staticcheck `SA1019` analyzer also flagged `pq.ErrorCode` (deprecated in `lib/pq` v1.10+) and we now use the `pqerror.Code` type from `github.com/lib/pq/pqerror` — the subpackage that exists in `lib/pq` v1.12.2 (our pinned version), contrary to older nolint rationale comments that have been removed.
 
