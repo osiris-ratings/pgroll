@@ -118,6 +118,9 @@ func NewRenameTableAction(conn db.DB, from, to string) *renameTableAction {
 func (a *renameTableAction) ID() string { return a.id }
 
 func (a *renameTableAction) Execute(ctx context.Context) error {
+	// Already idempotent on re-run: the IF EXISTS guards the source table, so a
+	// rename a previous interrupted `complete` already applied (source gone)
+	// no-ops cleanly.
 	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME TO %s",
 		pq.QuoteIdentifier(a.from),
 		pq.QuoteIdentifier(a.to)))
@@ -146,11 +149,34 @@ func NewRenameColumnAction(conn db.DB, table, from, to string) *renameColumnActi
 func (a *renameColumnAction) ID() string { return a.id }
 
 func (a *renameColumnAction) Execute(ctx context.Context) error {
+	// Idempotent re-run guard (see catalog.go): RENAME COLUMN has no native
+	// column-level IF EXISTS, so a re-run after an interrupted `complete` would
+	// fail because the source column is already renamed. If the source is gone
+	// but the target is present, the rename already happened — no-op. Every
+	// other case falls through to behave exactly as before (including erroring
+	// on a missing source column when the table exists).
+	if a.alreadyRenamed(ctx) {
+		return nil
+	}
+
 	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME COLUMN %s TO %s",
 		pq.QuoteIdentifier(a.table),
 		pq.QuoteIdentifier(a.from),
 		pq.QuoteIdentifier(a.to)))
 	return err
+}
+
+// alreadyRenamed reports whether the source column is gone while the target is
+// present — the signature of a rename a previous interrupted `complete` already
+// applied. Conservative: any inability to determine this (FakeDB, query error)
+// returns false so the caller proceeds with the normal rename.
+func (a *renameColumnAction) alreadyRenamed(ctx context.Context) bool {
+	fromExists, known, err := columnExists(ctx, a.conn, a.table, a.from)
+	if err != nil || !known || fromExists {
+		return false
+	}
+	toExists, _, err := columnExists(ctx, a.conn, a.table, a.to)
+	return err == nil && toExists
 }
 
 // renameConstraintAction is a DBAction that renames a constraint in a table.
@@ -175,11 +201,28 @@ func NewRenameConstraintAction(conn db.DB, table, from, to string) *renameConstr
 func (a *renameConstraintAction) ID() string { return a.id }
 
 func (a *renameConstraintAction) Execute(ctx context.Context) error {
+	// Idempotent re-run guard (see catalog.go): RENAME CONSTRAINT has no native
+	// constraint-level IF EXISTS. If the source constraint is gone but the
+	// target is present, a previous interrupted `complete` already applied this
+	// rename — no-op. Every other case falls through to the original behavior.
+	if a.alreadyRenamed(ctx) {
+		return nil
+	}
+
 	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME CONSTRAINT %s TO %s",
 		pq.QuoteIdentifier(a.table),
 		pq.QuoteIdentifier(a.from),
 		pq.QuoteIdentifier(a.to)))
 	return err
+}
+
+func (a *renameConstraintAction) alreadyRenamed(ctx context.Context) bool {
+	fromExists, known, err := constraintExists(ctx, a.conn, a.table, a.from)
+	if err != nil || !known || fromExists {
+		return false
+	}
+	toExists, _, err := constraintExists(ctx, a.conn, a.table, a.to)
+	return err == nil && toExists
 }
 
 type addConstraintUsingUniqueIndexAction struct {
@@ -203,7 +246,18 @@ func NewAddConstraintUsingUniqueIndex(conn db.DB, table, constraint, indexName s
 func (a *addConstraintUsingUniqueIndexAction) ID() string { return a.id }
 
 func (a *addConstraintUsingUniqueIndexAction) Execute(ctx context.Context) error {
-	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s ADD CONSTRAINT %s UNIQUE USING INDEX %s",
+	// Idempotent re-run guard (see catalog.go): ADD CONSTRAINT has no native
+	// IF NOT EXISTS, so skip if a previous interrupted `complete` already
+	// promoted the unique index to a constraint of this name.
+	exists, known, err := constraintExists(ctx, a.conn, a.table, a.constraint)
+	if err != nil {
+		return err
+	}
+	if known && exists {
+		return nil
+	}
+
+	_, err = a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s ADD CONSTRAINT %s UNIQUE USING INDEX %s",
 		pq.QuoteIdentifier(a.table),
 		pq.QuoteIdentifier(a.constraint),
 		pq.QuoteIdentifier(a.indexName)))
@@ -229,7 +283,18 @@ func NewAddPrimaryKeyAction(conn db.DB, table, indexName string) *addPrimaryKeyA
 func (a *addPrimaryKeyAction) ID() string { return a.id }
 
 func (a *addPrimaryKeyAction) Execute(ctx context.Context) error {
-	_, err := a.conn.ExecContext(ctx, fmt.Sprintf(
+	// Idempotent re-run guard (see catalog.go): a table can only have one
+	// primary key and ADD PRIMARY KEY has no native IF NOT EXISTS, so skip if a
+	// previous interrupted `complete` already added it.
+	exists, known, err := primaryKeyExists(ctx, a.conn, a.table)
+	if err != nil {
+		return err
+	}
+	if known && exists {
+		return nil
+	}
+
+	_, err = a.conn.ExecContext(ctx, fmt.Sprintf(
 		"ALTER TABLE %s ADD PRIMARY KEY USING INDEX %s",
 		pq.QuoteIdentifier(a.table),
 		pq.QuoteIdentifier(a.indexName),
