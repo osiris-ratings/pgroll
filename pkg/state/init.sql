@@ -1,4 +1,12 @@
 -- SPDX-License-Identifier: Apache-2.0
+--
+-- Guard this transaction against the pgroll DDL-capture event triggers.
+-- State.New sets pgroll.no_inferred_migrations on one pooled connection,
+-- but Init's transaction may run on a different (unguarded) connection —
+-- under concurrent initialization, real DDL later in this script would
+-- fire raw_migration() before the helper functions it calls exist.
+SET LOCAL pgroll.no_inferred_migrations TO 'TRUE';
+
 CREATE SCHEMA IF NOT EXISTS placeholder;
 
 CREATE OR REPLACE FUNCTION placeholder.raw_migration ()
