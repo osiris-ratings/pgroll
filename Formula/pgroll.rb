@@ -6,21 +6,21 @@ require_relative "custom_download_strategy"
 class Pgroll < Formula
   desc "Postgres zero-downtime migrations made easy"
   homepage "https://github.com/osiris-ratings/pgroll"
-  version "0.16.2-baselayer.4"
+  version "0.16.2-baselayer.5"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.4/pgroll_0.16.2-baselayer.4_darwin_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "c25ef6f9dabb6b5b375689801c484b0b50d7d24ae13defd9942d01939ff1a3d4"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.5/pgroll_0.16.2-baselayer.5_darwin_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "09649d20d9a20cf1a1183dac389f43dae3ace4c09213b0d9ff61afb7b7054130"
 
       define_method(:install) do
         bin.install "pgroll"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.4/pgroll_0.16.2-baselayer.4_darwin_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "b7c35bf2169eb1d39e14b22bf0f7de6d06608ce6bc8c1f38470bb744e8536a8d"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.5/pgroll_0.16.2-baselayer.5_darwin_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "84bc7a90159e005f260f830add1ad3a0e4af6f3ed4f3168afc30eb1d5d839107"
 
       define_method(:install) do
         bin.install "pgroll"
@@ -30,15 +30,15 @@ class Pgroll < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.4/pgroll_0.16.2-baselayer.4_linux_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "a8aa355f0d4ae49e589b3aef8b889b8e1bf077dba2a3793f9e7b0f6c88eef829"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.5/pgroll_0.16.2-baselayer.5_linux_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "a09cf9c2bac857ef8674f45e4156ad625c2ca0aa87d727d1e353fd8a0a753164"
       define_method(:install) do
         bin.install "pgroll"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.4/pgroll_0.16.2-baselayer.4_linux_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "67ab8ce7f5889a084f6a7f2b55161881369e7cfdef95bce10f1699ead42c72b0"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.5/pgroll_0.16.2-baselayer.5_linux_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "7764b153839718e5df4c5c63778b56e75718adfc4d61fa46625f8fb5e3293408"
       define_method(:install) do
         bin.install "pgroll"
       end
