@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/xataio/pgroll/pkg/migrations"
+	"github.com/xataio/pgroll/pkg/schema"
 )
 
 // RevertTargetState classifies how a migration in the revertible window will
@@ -139,6 +140,8 @@ func (m *Roll) revertMigration(ctx context.Context, t RevertTarget) error {
 		// final names; roll back against the physical schema so operation
 		// Rollbacks resolve post-complete names (e.g. OpAddColumn drops the
 		// final column rather than its long-gone temporary name).
+		// Operations whose Complete restructures user-facing objects
+		// implement RollbackCompleted and take that path instead.
 		if err := m.dropVersionSchema(ctx, migration); err != nil {
 			return err
 		}
@@ -147,7 +150,7 @@ func (m *Roll) revertMigration(ctx context.Context, t RevertTarget) error {
 			return fmt.Errorf("unable to read schema: %w", err)
 		}
 		sch.MigrationScope = migrations.MigrationScopeFor(migration.Name)
-		if err := m.rollbackOperations(ctx, migration, sch); err != nil {
+		if err := m.rollbackCompletedOperations(ctx, migration, sch); err != nil {
 			return err
 		}
 	default:
@@ -163,5 +166,31 @@ func (m *Roll) revertMigration(ctx context.Context, t RevertTarget) error {
 	}
 
 	m.logger.LogMigrationRollbackComplete(migration)
+	return nil
+}
+
+// rollbackCompletedOperations runs each operation's post-complete rollback
+// in reverse order against the given (physical) schema, preferring
+// RollbackCompleted where the operation implements it.
+func (m *Roll) rollbackCompletedOperations(ctx context.Context, migration *migrations.Migration, sch *schema.Schema) error {
+	for i := len(migration.Operations) - 1; i >= 0; i-- {
+		op := migration.Operations[i]
+
+		var actions []migrations.DBAction
+		var err error
+		if cr, ok := op.(migrations.CompletedRollbackable); ok {
+			actions, err = cr.RollbackCompleted(m.logger, m.pgConn, sch)
+		} else {
+			actions, err = op.Rollback(m.logger, m.pgConn, sch)
+		}
+		if err != nil {
+			return fmt.Errorf("unable to collect actions for rollback operation: %w", err)
+		}
+
+		coordinator := migrations.NewCoordinator(actions)
+		if err := coordinator.Execute(ctx); err != nil {
+			return fmt.Errorf("unable to execute rollback operation: %w", err)
+		}
+	}
 	return nil
 }

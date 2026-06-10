@@ -51,6 +51,20 @@ type Createable interface {
 	Create()
 }
 
+// CompletedRollbackable is implemented by operations whose effects can be
+// undone after their Complete phase has run. The standard Rollback contract
+// only covers the expand phase (before Complete); most inline-class
+// operations' Rollbacks happen to remain valid post-complete, but operations
+// whose Complete restructures user-facing objects (e.g. OpCreateConstraint's
+// column swap) need a distinct inverse. Used by `pgroll revert` when walking
+// back migrations that completed inline within the revert window.
+type CompletedRollbackable interface {
+	// RollbackCompleted returns the actions that undo this operation after
+	// its Complete phase has already run. The schema is a fresh physical
+	// read (post-complete names).
+	RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
+}
+
 // IsolatedOperation is an operation that cannot be executed with other operations
 // in the same migration.
 type IsolatedOperation interface {
@@ -198,13 +212,7 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 			*OpDropMultiColumnConstraint,
 			*OpRenameColumn,
 			*OpRenameTable,
-			*OpAlterColumn,
-			// OpCreateConstraint is a duplicator-pattern op despite being
-			// additive in spirit: its Complete drops the original
-			// user-facing columns and renames the duplicates back, which
-			// prev-prod's views reference — inline completion hits the same
-			// pg_depend dependency error as the destructive ops above.
-			*OpCreateConstraint:
+			*OpAlterColumn:
 			return true
 		case *OpRawSQL:
 			if v.OnComplete {
@@ -212,6 +220,14 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 			}
 		}
 	}
+	// Note: OpCreateConstraint is a duplicator-pattern op (its Complete
+	// drops the original user-facing columns and renames the duplicates
+	// back), but it MUST stay inline: chained duplicators on the same
+	// columns (e.g. examples 44→48: unique, then check, then FK, then drop
+	// the check) rely on each layer's Complete having physically run before
+	// the next layer's Start duplicates the column — deferring it loses
+	// earlier layers' constraints at drain time. Post-complete revert is
+	// handled via its RollbackCompleted implementation instead.
 	return false
 }
 

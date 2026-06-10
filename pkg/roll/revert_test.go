@@ -342,6 +342,84 @@ func TestRevertIncludesInProgressMigration(t *testing.T) {
 	})
 }
 
+// TestRevertInlineCompletedCreateConstraint proves the RollbackCompleted
+// path: a create_constraint that completed inline mid-train (its Complete
+// swaps the original columns for the backfilled duplicates and attaches the
+// constraint) is reverted by dropping the constraint.
+//
+// The train's first migration runs without a version schema so no views
+// project the constrained column — inline completion of an intermediate
+// create_constraint against a live version schema hits a pre-existing
+// pg_depend limitation that exists independently of revert.
+func TestRevertInlineCompletedCreateConstraint(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		applyDelayedContractionTrain(t, mig, []*migrations.Migration{
+			{
+				Name: "00_create_users",
+				Operations: migrations.Operations{
+					&migrations.OpRawSQL{
+						Up:   `CREATE TABLE users (id integer PRIMARY KEY, name text)`,
+						Down: `DROP TABLE users`,
+					},
+				},
+			},
+			{
+				Name: "01_unique_name",
+				Operations: migrations.Operations{
+					&migrations.OpCreateConstraint{
+						Table:   "users",
+						Name:    "users_name_unique",
+						Type:    migrations.OpCreateConstraintTypeUnique,
+						Columns: []string{"name"},
+						Up:      migrations.MultiColumnUpSQL{"name": "name"},
+						Down:    migrations.MultiColumnDownSQL{"name": "name"},
+					},
+				},
+			},
+			{
+				Name: "02_create_events",
+				Operations: migrations.Operations{
+					&migrations.OpRawSQL{
+						Up:   `CREATE TABLE events (id integer PRIMARY KEY)`,
+						Down: `DROP TABLE events`,
+					},
+				},
+			},
+		})
+
+		// The inline create_constraint completed: the constraint physically
+		// exists on the swapped-in column.
+		var uniqueExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'users_name_unique' AND conrelid = to_regclass('users')
+			)`).Scan(&uniqueExists))
+		require.True(t, uniqueExists, "inline create_constraint must have completed")
+
+		targets, err := mig.RevertTargets(ctx)
+		require.NoError(t, err)
+		require.Len(t, targets, 3)
+		assert.Equal(t, roll.RevertStateApplied, targets[1].State)
+
+		reverted, err := mig.Revert(ctx)
+		require.NoError(t, err)
+		require.Len(t, reverted, 3)
+
+		// The whole train is gone, including the constraint's table; history
+		// is empty again.
+		assert.False(t, tableExists(t, db, cSchema, "users"))
+		assert.False(t, tableExists(t, db, cSchema, "events"))
+		latest, err := mig.State().LatestMigration(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Nil(t, latest)
+	})
+}
+
 // TestRevertRefusesAfterInterruptedSeal proves the defensive guard: a
 // completed destructive migration left unsealed (a seal that crashed between
 // draining and stamping) must not be revertible — the seal must be resumed
