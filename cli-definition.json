@@ -237,6 +237,27 @@
       ]
     },
     {
+      "name": "prune",
+      "short": "Remove migrations from pgroll's history without executing DDL",
+      "use": "prune --name <name> [--name <name> ...]",
+      "example": "",
+      "flags": [
+        {
+          "name": "name",
+          "description": "name of a migration to prune (repeatable)",
+          "default": "[]"
+        },
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "skip the confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": []
+    },
+    {
       "name": "pull",
       "short": "Pull migration history from the target database and write it to disk",
       "use": "pull <target directory>",

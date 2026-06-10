@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New `pgroll prune` command: removes named migrations from pgroll's history (`pgroll.migrations`) and drops their version schemas, rewiring the parent chain across the gaps so history stays linear. No user-table DDL is executed — the physical effects of completed migrations are *not* reverted. Its purpose is history reconciliation when applied migrations no longer exist on disk: the canonical case is a branch tested against a shared database and then abandoned, whose completed rows otherwise block `pgroll migrate` with "remote migration does not match local migration" (completed rows previously had no removal path short of hand-editing `pgroll.migrations`). Refuses while a migration is in progress (complete it or `pgroll rollback` first) and refuses to prune baseline rows. Version schemas are dropped before the rows so an interrupted prune is safely re-runnable. Names are passed via repeatable `--name` flags; `--yes` skips the confirmation. New `state.Prune` performs the chain surgery in one transaction using a temp-table copy/rewire/swap that satisfies the table's parent FK and linear-history unique indexes; `roll.Prune`/`roll.PruneTargets` add validation, listing, and version-schema cleanup.
+
 ## [0.16.2-baselayer.3] - 2026-05-28
 
 ### Fixed
