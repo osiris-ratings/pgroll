@@ -342,6 +342,137 @@ func TestRevertIncludesInProgressMigration(t *testing.T) {
 	})
 }
 
+// TestRevertBounded proves --steps/--to style bounded reverts: the walk
+// stops at the requested boundary, the new leaf gets a materialized version
+// schema (train intermediates never projected one), and the remaining
+// window stays revertible.
+func TestRevertBounded(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// Sealed boundary deployment.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, name text, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// The deployment under test: deferred + applied + deferred final.
+		applyDelayedContractionTrain(t, mig, []*migrations.Migration{
+			{
+				Name: "01_drop_email",
+				Operations: migrations.Operations{
+					&migrations.OpDropColumn{Table: "users", Column: "email", Down: "''"},
+				},
+			},
+			{
+				Name: "02_add_age",
+				Operations: migrations.Operations{
+					&migrations.OpAddColumn{
+						Table:  "users",
+						Up:     "18",
+						Column: migrations.Column{Name: "age", Type: "integer", Nullable: true},
+					},
+				},
+			},
+			{
+				Name: "03_create_events",
+				Operations: migrations.Operations{
+					&migrations.OpRawSQL{
+						Up:   `CREATE TABLE events (id integer PRIMARY KEY)`,
+						Down: `DROP TABLE events`,
+					},
+				},
+			},
+		})
+
+		// Bound checks are validated before any work happens.
+		_, err := mig.RevertPlan(ctx, roll.WithRevertSteps(1), roll.WithRevertTo("01_drop_email"))
+		require.Error(t, err)
+		_, err = mig.RevertPlan(ctx, roll.WithRevertTo("no_such_migration"))
+		require.ErrorContains(t, err, "not found")
+
+		// Step 1: revert only the train-final.
+		plan, err := mig.RevertPlan(ctx, roll.WithRevertSteps(1))
+		require.NoError(t, err)
+		require.Len(t, plan, 1)
+		assert.Equal(t, "03_create_events", plan[0].Name)
+
+		reverted, err := mig.Revert(ctx, roll.WithRevertSteps(1))
+		require.NoError(t, err)
+		require.Len(t, reverted, 1)
+
+		assert.False(t, tableExists(t, db, cSchema, "events"))
+		latest, err := mig.State().LatestMigration(ctx, cSchema)
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, "02_add_age", *latest)
+
+		// The new leaf was a train intermediate with no version schema; the
+		// bounded revert materialized one.
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "02_add_age")),
+			"bounded revert must materialize a version schema for the new leaf")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "03_create_events")))
+
+		// Step 2: revert down to (but keeping) the deferred intermediate.
+		reverted, err = mig.Revert(ctx, roll.WithRevertTo("01_drop_email"))
+		require.NoError(t, err)
+		require.Len(t, reverted, 1)
+		assert.Equal(t, "02_add_age", reverted[0].Name)
+
+		var ageExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'age'
+			)`, cSchema).Scan(&ageExists))
+		assert.False(t, ageExists)
+
+		// The deferred leaf's materialized projection reflects its virtual
+		// state: email is (virtually) dropped, so its view must not project
+		// the column even though it still physically exists.
+		leafSchema := roll.VersionedSchemaName(cSchema, "01_drop_email")
+		assert.True(t, schemaExists(t, db, leafSchema))
+		var emailInView bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
+			)`, leafSchema).Scan(&emailInView))
+		assert.False(t, emailInView, "deferred leaf's view must not project the virtually-dropped column")
+
+		// Step 3: revert to the sealed boundary (the whole remaining window).
+		reverted, err = mig.Revert(ctx, roll.WithRevertTo("00_create_users"))
+		require.NoError(t, err)
+		require.Len(t, reverted, 1)
+
+		latest, err = mig.State().LatestMigration(ctx, cSchema)
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, "00_create_users", *latest)
+
+		var emailExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
+			)`, cSchema).Scan(&emailExists))
+		assert.True(t, emailExists, "deferred drop must be fully undone")
+
+		// Already at the target: a no-op plan, not an error.
+		plan, err = mig.RevertPlan(ctx, roll.WithRevertTo("00_create_users"))
+		require.NoError(t, err)
+		assert.Empty(t, plan)
+	})
+}
+
 // TestRevertInlineCompletedCreateConstraint proves the RollbackCompleted
 // path: a create_constraint that completed inline mid-train (its Complete
 // swaps the original columns for the backfilled duplicates and attaches the

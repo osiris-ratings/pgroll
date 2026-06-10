@@ -14,6 +14,8 @@ import (
 
 func revertCmd() *cobra.Command {
 	var yes bool
+	var steps int
+	var toMigration string
 
 	cmd := &cobra.Command{
 		Use:   "revert",
@@ -24,12 +26,16 @@ func revertCmd() *cobra.Command {
 			"The revert is lossless: under delayed contraction, destructive DDL is\n" +
 			"queued (not executed) until the next deployment departs, so the migrations\n" +
 			"being reverted are still physically in their expand phase.\n\n" +
+			"The walk can be bounded: --steps N reverts at most N migrations (newest\n" +
+			"first); --to <name> reverts everything newer than the named migration,\n" +
+			"which becomes the history leaf. After a bounded revert, a version schema\n" +
+			"is materialized for the new leaf if it lacks one.\n\n" +
 			"The revert window closes when the deployment is sealed: by the next\n" +
 			"`pgroll migrate`, or by running `pgroll complete` with no migration in\n" +
 			"progress. Sealed migrations cannot be reverted.\n\n" +
-			"Applications pinned to the reverted deployment's version schema must be\n" +
-			"repinned to the previous deployment's schema BEFORE reverting — the newer\n" +
-			"version schemas are dropped by the revert.",
+			"Applications pinned to the reverted migrations' version schemas must be\n" +
+			"repinned to the restore target BEFORE reverting — the newer version\n" +
+			"schemas are dropped by the revert.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -40,12 +46,24 @@ func revertCmd() *cobra.Command {
 			}
 			defer m.Close()
 
-			targets, err := m.RevertTargets(ctx)
+			var revertOpts []roll.RevertOption
+			if steps > 0 {
+				revertOpts = append(revertOpts, roll.WithRevertSteps(steps))
+			}
+			if toMigration != "" {
+				revertOpts = append(revertOpts, roll.WithRevertTo(toMigration))
+			}
+
+			targets, err := m.RevertPlan(ctx, revertOpts...)
 			if err != nil {
 				return err
 			}
 			if len(targets) == 0 {
-				fmt.Println("Nothing to revert: the last deployment has been sealed (revert window closed).")
+				if toMigration != "" {
+					fmt.Printf("Nothing to revert: history is already at %q.\n", toMigration)
+				} else {
+					fmt.Println("Nothing to revert: the last deployment has been sealed (revert window closed).")
+				}
 				return nil
 			}
 
@@ -89,7 +107,7 @@ func revertCmd() *cobra.Command {
 			sp, _ := pterm.DefaultSpinner.WithText(
 				fmt.Sprintf("Reverting %d migration(s)...", len(targets)),
 			).Start()
-			reverted, err := m.Revert(ctx)
+			reverted, err := m.Revert(ctx, revertOpts...)
 			if err != nil {
 				sp.Fail(fmt.Sprintf("Failed to revert: %s", err))
 				return err
@@ -104,6 +122,9 @@ func revertCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
+	cmd.Flags().IntVar(&steps, "steps", 0, "revert at most N migrations (newest first)")
+	cmd.Flags().StringVar(&toMigration, "to", "", "revert everything newer than this migration, which becomes the history leaf")
+	cmd.MarkFlagsMutuallyExclusive("steps", "to")
 
 	return cmd
 }

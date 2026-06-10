@@ -282,6 +282,16 @@
       "example": "",
       "flags": [
         {
+          "name": "steps",
+          "description": "revert at most N migrations (newest first)",
+          "default": "0"
+        },
+        {
+          "name": "to",
+          "description": "revert everything newer than this migration, which becomes the history leaf",
+          "default": ""
+        },
+        {
           "name": "yes",
           "shorthand": "y",
           "description": "skip the confirmation prompt",
