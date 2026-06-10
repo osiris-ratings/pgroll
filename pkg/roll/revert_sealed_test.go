@@ -63,7 +63,19 @@ func TestRevertSealed(t *testing.T) {
 				},
 			},
 			{
-				Name: "03_create_events",
+				Name: "03_widen_name",
+				Operations: migrations.Operations{
+					&migrations.OpAlterColumn{
+						Table:  "users",
+						Column: "name",
+						Type:   ptr("varchar(255)"),
+						Up:     "name",
+						Down:   "name",
+					},
+				},
+			},
+			{
+				Name: "04_create_events",
 				Operations: migrations.Operations{
 					&migrations.OpRawSQL{
 						Up:   `CREATE TABLE events (id integer PRIMARY KEY)`,
@@ -74,11 +86,11 @@ func TestRevertSealed(t *testing.T) {
 		})
 
 		// SEAL it: contraction drains, email's data is physically
-		// destroyed. The drained count covers the deferred rows (01, 03);
-		// the inline 02 had no queued work but is stamped sealed too.
+		// destroyed. The drained count covers the deferred rows (01, 03,
+		// 04); the inline 02 had no queued work but is stamped sealed too.
 		sealed, err := mig.SealDeferredCompletes(ctx)
 		require.NoError(t, err)
-		require.Equal(t, 2, sealed)
+		require.Equal(t, 3, sealed)
 
 		var emailExists bool
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -101,9 +113,9 @@ func TestRevertSealed(t *testing.T) {
 		plan, err := mig.PlanRevertSealed(ctx, "00_create_users")
 		require.NoError(t, err)
 		require.NotNil(t, plan)
-		assert.Equal(t, []string{"03_create_events", "02_add_age", "01_drop_email"}, plan.Targets)
-		require.Len(t, plan.Inverses, 3)
-		assert.Equal(t, "revert_03_create_events", plan.Inverses[0].Name)
+		assert.Equal(t, []string{"04_create_events", "03_widen_name", "02_add_age", "01_drop_email"}, plan.Targets)
+		require.Len(t, plan.Inverses, 4)
+		assert.Equal(t, "revert_04_create_events", plan.Inverses[0].Name)
 		assert.Equal(t, "00_create_users", plan.BoundaryVersionSchema)
 
 		// Execute.
@@ -127,6 +139,14 @@ func TestRevertSealed(t *testing.T) {
 			)`, cSchema).Scan(&emailExists))
 		assert.True(t, emailExists, "sealed revert must restore the dropped column's shape")
 
+		// The widened column is back at its prior type.
+		var nameType string
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT data_type FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'name'
+		`, cSchema).Scan(&nameType))
+		assert.Equal(t, "text", nameType, "alter_column inverse must restore the prior type")
+
 		// Data is best-effort by construction: the original values were
 		// destroyed at the seal; the inverse re-derived them through the
 		// forward migration's down expression.
@@ -142,7 +162,7 @@ func TestRevertSealed(t *testing.T) {
 		var leftover int
 		require.NoError(t, db.QueryRowContext(ctx, `
 			SELECT count(*) FROM pgroll.migrations
-			WHERE schema = $1 AND (name LIKE 'revert_%' OR name IN ('01_drop_email', '02_add_age', '03_create_events'))
+			WHERE schema = $1 AND (name LIKE 'revert_%' OR name IN ('01_drop_email', '02_add_age', '03_widen_name', '04_create_events'))
 		`, cSchema).Scan(&leftover))
 		assert.Zero(t, leftover, "forward and inverse rows must both be pruned")
 

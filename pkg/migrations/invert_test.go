@@ -6,6 +6,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/oapi-codegen/nullable"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -21,16 +22,43 @@ func invertFixtureSchema() *schema.Schema {
 				Columns: map[string]*schema.Column{
 					"id":    {Name: "id", Type: "integer"},
 					"email": {Name: "email", Type: "text", Nullable: true, Comment: "contact address"},
+					"score": {Name: "score", Type: "integer", Nullable: true, Default: ptrString("0")},
 				},
+				PrimaryKey: []string{"id"},
 				Indexes: map[string]*schema.Index{
 					"idx_users_email": {
 						Name:       "idx_users_email",
 						Definition: `CREATE INDEX idx_users_email ON public.users USING btree (email)`,
 					},
+					"users_pkey": {
+						Name:       "users_pkey",
+						Unique:     true,
+						Definition: `CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)`,
+					},
+				},
+				CheckConstraints: map[string]*schema.CheckConstraint{
+					"score_positive": {
+						Name:       "score_positive",
+						Columns:    []string{"score"},
+						Definition: "CHECK ((score >= 0))",
+					},
+				},
+				UniqueConstraints: map[string]*schema.UniqueConstraint{
+					"users_email_key": {Name: "users_email_key", Columns: []string{"email"}},
 				},
 			},
 		},
 	}
+}
+
+func ptrString(s string) *string { return &s }
+
+func singleInverse(t *testing.T, op Invertible, pre *schema.Schema) Operation {
+	t.Helper()
+	ops, err := op.Invert(pre)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	return ops[0]
 }
 
 func TestInvertOperations(t *testing.T) {
@@ -38,45 +66,39 @@ func TestInvertOperations(t *testing.T) {
 	pre := invertFixtureSchema()
 
 	t.Run("rename column swaps direction", func(t *testing.T) {
-		inv, err := (&OpRenameColumn{Table: "users", From: "email", To: "contact"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpRenameColumn{Table: "users", From: "email", To: "contact"}, pre)
 		assert.Equal(t, &OpRenameColumn{Table: "users", From: "contact", To: "email"}, inv)
 	})
 
 	t.Run("rename table swaps direction", func(t *testing.T) {
-		inv, err := (&OpRenameTable{From: "users", To: "people"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpRenameTable{From: "users", To: "people"}, pre)
 		assert.Equal(t, &OpRenameTable{From: "people", To: "users"}, inv)
 	})
 
 	t.Run("create table inverts to drop", func(t *testing.T) {
-		inv, err := (&OpCreateTable{Name: "events"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpCreateTable{Name: "events"}, pre)
 		assert.Equal(t, &OpDropTable{Name: "events"}, inv)
 	})
 
 	t.Run("create index inverts to drop", func(t *testing.T) {
-		inv, err := (&OpCreateIndex{Name: "idx_new", Table: "users"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpCreateIndex{Name: "idx_new", Table: "users"}, pre)
 		assert.Equal(t, &OpDropIndex{Name: "idx_new"}, inv)
 	})
 
 	t.Run("add column inverts to drop with up as down", func(t *testing.T) {
-		inv, err := (&OpAddColumn{
+		inv := singleInverse(t, &OpAddColumn{
 			Table:  "users",
 			Up:     "'unknown'",
 			Column: Column{Name: "nick", Type: "text", Nullable: false},
-		}).Invert(pre)
-		require.NoError(t, err)
+		}, pre)
 		assert.Equal(t, &OpDropColumn{Table: "users", Column: "nick", Down: "'unknown'"}, inv)
 	})
 
 	t.Run("add nullable column without up inverts with NULL down", func(t *testing.T) {
-		inv, err := (&OpAddColumn{
+		inv := singleInverse(t, &OpAddColumn{
 			Table:  "users",
 			Column: Column{Name: "nick", Type: "text", Nullable: true},
-		}).Invert(pre)
-		require.NoError(t, err)
+		}, pre)
 		assert.Equal(t, &OpDropColumn{Table: "users", Column: "nick", Down: "NULL"}, inv)
 	})
 
@@ -89,8 +111,7 @@ func TestInvertOperations(t *testing.T) {
 	})
 
 	t.Run("raw SQL inverts to deferred counter-statement", func(t *testing.T) {
-		inv, err := (&OpRawSQL{Up: "CREATE TYPE t AS ENUM ('a')", Down: "DROP TYPE t"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpRawSQL{Up: "CREATE TYPE t AS ENUM ('a')", Down: "DROP TYPE t"}, pre)
 		assert.Equal(t, &OpRawSQL{Up: "DROP TYPE t", OnComplete: true}, inv)
 	})
 
@@ -100,8 +121,7 @@ func TestInvertOperations(t *testing.T) {
 	})
 
 	t.Run("drop index recreates from snapshot definition", func(t *testing.T) {
-		inv, err := (&OpDropIndex{Name: "idx_users_email"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpDropIndex{Name: "idx_users_email"}, pre)
 		raw, ok := inv.(*OpRawSQL)
 		require.True(t, ok)
 		assert.Contains(t, raw.Up, "CREATE INDEX idx_users_email")
@@ -114,8 +134,7 @@ func TestInvertOperations(t *testing.T) {
 	})
 
 	t.Run("drop column re-adds from snapshot definition", func(t *testing.T) {
-		inv, err := (&OpDropColumn{Table: "users", Column: "email", Down: "'unknown@example.com'"}).Invert(pre)
-		require.NoError(t, err)
+		inv := singleInverse(t, &OpDropColumn{Table: "users", Column: "email", Down: "'unknown@example.com'"}, pre)
 		add, ok := inv.(*OpAddColumn)
 		require.True(t, ok)
 		assert.Equal(t, "users", add.Table)
@@ -129,6 +148,110 @@ func TestInvertOperations(t *testing.T) {
 
 	t.Run("drop column without down refuses", func(t *testing.T) {
 		_, err := (&OpDropColumn{Table: "users", Column: "email"}).Invert(pre)
+		require.Error(t, err)
+	})
+
+	t.Run("alter column type restores prior type with swapped expressions", func(t *testing.T) {
+		newType := "bigint"
+		inv := singleInverse(t, &OpAlterColumn{
+			Table:  "users",
+			Column: "score",
+			Type:   &newType,
+			Up:     "score::bigint",
+			Down:   "score::integer",
+		}, pre)
+		alter, ok := inv.(*OpAlterColumn)
+		require.True(t, ok)
+		require.NotNil(t, alter.Type)
+		assert.Equal(t, "integer", *alter.Type)
+		assert.Equal(t, "score::integer", alter.Up)
+		assert.Equal(t, "score::bigint", alter.Down)
+	})
+
+	t.Run("alter column nullable restores prior nullability", func(t *testing.T) {
+		notNull := false
+		inv := singleInverse(t, &OpAlterColumn{
+			Table:    "users",
+			Column:   "score",
+			Nullable: &notNull,
+			Up:       "coalesce(score, 0)",
+			Down:     "score",
+		}, pre)
+		alter, ok := inv.(*OpAlterColumn)
+		require.True(t, ok)
+		require.NotNil(t, alter.Nullable)
+		assert.True(t, *alter.Nullable, "prior state was nullable")
+	})
+
+	t.Run("alter column default restores prior default", func(t *testing.T) {
+		inv := singleInverse(t, &OpAlterColumn{
+			Table:   "users",
+			Column:  "score",
+			Default: nullable.NewNullableWithValue("42"),
+			Up:      "score",
+			Down:    "score",
+		}, pre)
+		alter, ok := inv.(*OpAlterColumn)
+		require.True(t, ok)
+		require.True(t, alter.Default.IsSpecified())
+		prior, err := alter.Default.Get()
+		require.NoError(t, err)
+		assert.Equal(t, "0", prior)
+	})
+
+	t.Run("alter column adding a constraint refuses", func(t *testing.T) {
+		_, err := (&OpAlterColumn{
+			Table:  "users",
+			Column: "score",
+			Unique: &UniqueConstraint{Name: "score_unique"},
+			Up:     "score",
+			Down:   "score",
+		}).Invert(pre)
+		require.ErrorContains(t, err, "constraint")
+	})
+
+	t.Run("drop table recreates definition and indexes from snapshot", func(t *testing.T) {
+		ops, err := (&OpDropTable{Name: "users"}).Invert(pre)
+		require.NoError(t, err)
+		require.Len(t, ops, 2, "create_table plus the non-constraint index")
+
+		create, ok := ops[0].(*OpCreateTable)
+		require.True(t, ok)
+		assert.Equal(t, "users", create.Name)
+		require.Len(t, create.Columns, 3)
+		byName := map[string]Column{}
+		for _, c := range create.Columns {
+			byName[c.Name] = c
+		}
+		assert.True(t, byName["id"].Pk)
+		assert.Equal(t, "text", byName["email"].Type)
+		require.NotNil(t, byName["score"].Default)
+		assert.Equal(t, "0", *byName["score"].Default)
+
+		var checkC, uniqueC *Constraint
+		for i := range create.Constraints {
+			switch create.Constraints[i].Type {
+			case ConstraintTypeCheck:
+				checkC = &create.Constraints[i]
+			case ConstraintTypeUnique:
+				uniqueC = &create.Constraints[i]
+			}
+		}
+		require.NotNil(t, checkC)
+		// pg_get_constraintdef double-wraps; one layer of parens may remain
+		// and is semantically harmless inside CHECK (...).
+		assert.Contains(t, checkC.Check, "score >= 0")
+		assert.NotContains(t, checkC.Check, "CHECK")
+		require.NotNil(t, uniqueC)
+		assert.Equal(t, []string{"email"}, uniqueC.Columns)
+
+		idx, ok := ops[1].(*OpRawSQL)
+		require.True(t, ok)
+		assert.Contains(t, idx.Up, "CREATE INDEX idx_users_email")
+	})
+
+	t.Run("drop unknown table refuses", func(t *testing.T) {
+		_, err := (&OpDropTable{Name: "no_such_table"}).Invert(pre)
 		require.Error(t, err)
 	})
 }
@@ -152,6 +275,7 @@ func TestMigrationInvert(t *testing.T) {
 		inv, err := mig.Invert(ctx, invertFixtureSchema())
 		require.NoError(t, err)
 		assert.Equal(t, "revert_01_rename_and_drop", inv.Name)
+		assert.Equal(t, "01_rename_and_drop", inv.RevertOf)
 		require.Len(t, inv.Operations, 2)
 
 		add, ok := inv.Operations[0].(*OpAddColumn)

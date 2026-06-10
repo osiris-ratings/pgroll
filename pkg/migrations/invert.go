@@ -6,6 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/oapi-codegen/nullable"
 
 	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/schema"
@@ -27,11 +32,13 @@ import (
 // Operations that do not implement Invertible make their migration
 // non-invertible (callers refuse with the operation named).
 type Invertible interface {
-	// Invert returns the inverse operation. pre is the schema state
-	// immediately before this operation ran — for prior definitions
-	// (dropped columns' types, index definitions, previous defaults) that
-	// the operation itself does not record.
-	Invert(pre *schema.Schema) (Operation, error)
+	// Invert returns the inverse operations, in application order. pre is
+	// the schema state immediately before this operation ran — for prior
+	// definitions (dropped columns' types, index definitions, previous
+	// defaults) that the operation itself does not record. Most inverses
+	// are a single operation; a dropped table inverts to its re-creation
+	// plus the re-creation of its non-constraint indexes.
+	Invert(pre *schema.Schema) ([]Operation, error)
 }
 
 // Invert synthesizes the inverse migration: the original operations
@@ -93,11 +100,11 @@ func InvertSegment(ctx context.Context, migs []*Migration, base *schema.Schema) 
 			if !ok {
 				return nil, fmt.Errorf("operation %q in migration %q does not support inversion", OperationName(op), mig.Name)
 			}
-			invOp, err := inv.Invert(preStates[mi][oi])
+			invOps, err := inv.Invert(preStates[mi][oi])
 			if err != nil {
 				return nil, fmt.Errorf("unable to invert operation %q in migration %q: %w", OperationName(op), mig.Name, err)
 			}
-			ops = append(ops, invOp)
+			ops = append(ops, invOps...)
 		}
 		inverses = append(inverses, &Migration{
 			Name:       "revert_" + mig.Name,
@@ -128,36 +135,36 @@ func copySchema(s *schema.Schema) (*schema.Schema, error) {
 // upstream stays in one place.
 
 // Invert swaps the rename's direction.
-func (o *OpRenameColumn) Invert(_ *schema.Schema) (Operation, error) {
-	return &OpRenameColumn{Table: o.Table, From: o.To, To: o.From}, nil
+func (o *OpRenameColumn) Invert(_ *schema.Schema) ([]Operation, error) {
+	return []Operation{&OpRenameColumn{Table: o.Table, From: o.To, To: o.From}}, nil
 }
 
 // Invert swaps the rename's direction.
-func (o *OpRenameTable) Invert(_ *schema.Schema) (Operation, error) {
-	return &OpRenameTable{From: o.To, To: o.From}, nil
+func (o *OpRenameTable) Invert(_ *schema.Schema) ([]Operation, error) {
+	return []Operation{&OpRenameTable{From: o.To, To: o.From}}, nil
 }
 
 // Invert swaps the rename's direction.
-func (o *OpRenameConstraint) Invert(_ *schema.Schema) (Operation, error) {
-	return &OpRenameConstraint{Table: o.Table, From: o.To, To: o.From}, nil
+func (o *OpRenameConstraint) Invert(_ *schema.Schema) ([]Operation, error) {
+	return []Operation{&OpRenameConstraint{Table: o.Table, From: o.To, To: o.From}}, nil
 }
 
 // Invert drops the created table. Data written to the table since creation
 // is destroyed — that is what reverting a create means.
-func (o *OpCreateTable) Invert(_ *schema.Schema) (Operation, error) {
-	return &OpDropTable{Name: o.Name}, nil
+func (o *OpCreateTable) Invert(_ *schema.Schema) ([]Operation, error) {
+	return []Operation{&OpDropTable{Name: o.Name}}, nil
 }
 
 // Invert drops the created index.
-func (o *OpCreateIndex) Invert(_ *schema.Schema) (Operation, error) {
-	return &OpDropIndex{Name: o.Name}, nil
+func (o *OpCreateIndex) Invert(_ *schema.Schema) ([]Operation, error) {
+	return []Operation{&OpDropIndex{Name: o.Name}}, nil
 }
 
 // Invert drops the added column. The drop's down expression — which keeps
 // the column derivable while the inverse migration is itself in its expand
 // phase — is the original add's up expression; a nullable column without
 // one falls back to NULL.
-func (o *OpAddColumn) Invert(_ *schema.Schema) (Operation, error) {
+func (o *OpAddColumn) Invert(_ *schema.Schema) ([]Operation, error) {
 	down := o.Up
 	if down == "" {
 		if !o.Column.IsNullable() {
@@ -165,7 +172,7 @@ func (o *OpAddColumn) Invert(_ *schema.Schema) (Operation, error) {
 		}
 		down = "NULL"
 	}
-	return &OpDropColumn{Table: o.Table, Column: o.Column.Name, Down: down}, nil
+	return []Operation{&OpDropColumn{Table: o.Table, Column: o.Column.Name, Down: down}}, nil
 }
 
 // Invert runs the original down expression as the inverse's statement —
@@ -174,17 +181,17 @@ func (o *OpAddColumn) Invert(_ *schema.Schema) (Operation, error) {
 // the sealed train's version schemas are reaped, exactly like forward
 // destructive DDL. Until the drain, nothing has run, so rolling back an
 // interrupted inverse train is a clean no-op for this operation.
-func (o *OpRawSQL) Invert(_ *schema.Schema) (Operation, error) {
+func (o *OpRawSQL) Invert(_ *schema.Schema) ([]Operation, error) {
 	if o.Down == "" {
 		return nil, fmt.Errorf("raw SQL operation has no down expression")
 	}
-	return &OpRawSQL{Up: o.Down, OnComplete: true}, nil
+	return []Operation{&OpRawSQL{Up: o.Down, OnComplete: true}}, nil
 }
 
 // Invert recreates the dropped index from its definition in the pre-state
 // snapshot (pg_get_indexdef output — full fidelity including expressions,
 // predicates, opclasses).
-func (o *OpDropIndex) Invert(pre *schema.Schema) (Operation, error) {
+func (o *OpDropIndex) Invert(pre *schema.Schema) ([]Operation, error) {
 	for _, table := range pre.Tables {
 		if table == nil {
 			continue
@@ -193,10 +200,10 @@ func (o *OpDropIndex) Invert(pre *schema.Schema) (Operation, error) {
 			if idx.Definition == "" {
 				return nil, fmt.Errorf("index %q has no recorded definition in the parent snapshot", o.Name)
 			}
-			return &OpRawSQL{
+			return []Operation{&OpRawSQL{
 				Up:   idx.Definition,
 				Down: fmt.Sprintf("DROP INDEX IF EXISTS %q", o.Name),
-			}, nil
+			}}, nil
 		}
 	}
 	return nil, fmt.Errorf("index %q not found in the parent snapshot", o.Name)
@@ -206,7 +213,7 @@ func (o *OpDropIndex) Invert(pre *schema.Schema) (Operation, error) {
 // pre-state snapshot. The add's up expression — which re-derives the
 // column's values — is the original drop's down expression (required by
 // reversibility-by-construction).
-func (o *OpDropColumn) Invert(pre *schema.Schema) (Operation, error) {
+func (o *OpDropColumn) Invert(pre *schema.Schema) ([]Operation, error) {
 	table := pre.GetTable(o.Table)
 	if table == nil {
 		return nil, fmt.Errorf("table %q not found in the parent snapshot", o.Table)
@@ -230,9 +237,198 @@ func (o *OpDropColumn) Invert(pre *schema.Schema) (Operation, error) {
 		added.Comment = &col.Comment
 	}
 
-	return &OpAddColumn{
+	return []Operation{&OpAddColumn{
 		Table:  o.Table,
 		Column: added,
 		Up:     o.Down,
-	}, nil
+	}}, nil
+}
+
+// Invert restores the column's prior type/nullability/default/comment from
+// the pre-state snapshot, with the data expressions swapped (the original
+// down re-derives the prior values; the original up re-derives the new ones
+// while the inverse is itself in its expand phase). Constraint-adding
+// sub-operations (check/unique/references) invert to constraint drops,
+// which are not yet expressible — refused by name.
+func (o *OpAlterColumn) Invert(pre *schema.Schema) ([]Operation, error) {
+	if o.Check != nil || o.Unique != nil || o.References != nil {
+		return nil, fmt.Errorf("alter_column on %q.%q adds a constraint; constraint inverses are not supported yet", o.Table, o.Column)
+	}
+
+	table := pre.GetTable(o.Table)
+	if table == nil {
+		return nil, fmt.Errorf("table %q not found in the parent snapshot", o.Table)
+	}
+	col := table.GetColumn(o.Column)
+	if col == nil {
+		return nil, fmt.Errorf("column %q on %q not found in the parent snapshot", o.Column, o.Table)
+	}
+
+	inv := &OpAlterColumn{
+		Table:  o.Table,
+		Column: o.Column,
+		Up:     o.Down,
+		Down:   o.Up,
+	}
+	changed := false
+	if o.Type != nil {
+		priorType := col.Type
+		inv.Type = &priorType
+		changed = true
+	}
+	if o.Nullable != nil {
+		priorNullable := col.Nullable
+		inv.Nullable = &priorNullable
+		changed = true
+	}
+	if o.Default.IsSpecified() {
+		if col.Default == nil {
+			inv.Default = nullable.NewNullNullable[string]()
+		} else {
+			inv.Default = nullable.NewNullableWithValue(*col.Default)
+		}
+		changed = true
+	}
+	if o.Comment.IsSpecified() {
+		if col.Comment == "" {
+			inv.Comment = nullable.NewNullNullable[string]()
+		} else {
+			inv.Comment = nullable.NewNullableWithValue(col.Comment)
+		}
+		changed = true
+	}
+	if !changed {
+		return nil, fmt.Errorf("alter_column on %q.%q has no invertible sub-operation", o.Table, o.Column)
+	}
+
+	return []Operation{inv}, nil
+}
+
+// Invert recreates the dropped table from the pre-state snapshot: columns
+// (with types, nullability, defaults, comments, primary key), table-level
+// constraints (checks, uniques, foreign keys), and non-constraint indexes
+// (from their pg_get_indexdef definitions). The table comes back EMPTY —
+// the drop's drained contraction destroyed the rows, and no expression can
+// re-derive a whole table. That is the honest meaning of best-effort here.
+func (o *OpDropTable) Invert(pre *schema.Schema) ([]Operation, error) {
+	table := pre.GetTable(o.Name)
+	if table == nil {
+		return nil, fmt.Errorf("table %q not found in the parent snapshot", o.Name)
+	}
+
+	create := &OpCreateTable{Name: o.Name}
+	if table.Comment != "" {
+		comment := table.Comment
+		create.Comment = &comment
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(table.Columns)) {
+		c := table.Columns[key]
+		if c == nil || c.Deleted {
+			continue
+		}
+		col := Column{
+			Name:     key,
+			Type:     c.Type,
+			Nullable: c.Nullable,
+			Default:  c.Default,
+			Unique:   c.Unique,
+			Pk:       slices.Contains(table.PrimaryKey, key),
+		}
+		if c.Comment != "" {
+			comment := c.Comment
+			col.Comment = &comment
+		}
+		create.Columns = append(create.Columns, col)
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(table.CheckConstraints)) {
+		cc := table.CheckConstraints[key]
+		if cc == nil {
+			continue
+		}
+		create.Constraints = append(create.Constraints, Constraint{
+			Name:      cc.Name,
+			Type:      ConstraintTypeCheck,
+			Columns:   cc.Columns,
+			Check:     stripCheckDefinition(cc.Definition),
+			NoInherit: cc.NoInherit,
+		})
+	}
+	for _, key := range slices.Sorted(maps.Keys(table.UniqueConstraints)) {
+		uc := table.UniqueConstraints[key]
+		if uc == nil {
+			continue
+		}
+		create.Constraints = append(create.Constraints, Constraint{
+			Name:    uc.Name,
+			Type:    ConstraintTypeUnique,
+			Columns: uc.Columns,
+		})
+	}
+	for _, key := range slices.Sorted(maps.Keys(table.ForeignKeys)) {
+		fk := table.ForeignKeys[key]
+		if fk == nil {
+			continue
+		}
+		create.Constraints = append(create.Constraints, Constraint{
+			Name:    fk.Name,
+			Type:    ConstraintTypeForeignKey,
+			Columns: fk.Columns,
+			References: &TableForeignKeyReference{
+				Table:    fk.ReferencedTable,
+				Columns:  fk.ReferencedColumns,
+				OnDelete: ForeignKeyAction(fk.OnDelete),
+				OnUpdate: ForeignKeyAction(fk.OnUpdate),
+			},
+		})
+	}
+
+	ops := []Operation{create}
+
+	// Non-constraint indexes are not part of create_table; recreate them
+	// from their stored definitions. Constraint-backed indexes come back
+	// with their constraints.
+	constraintNames := map[string]bool{}
+	for name := range table.UniqueConstraints {
+		constraintNames[name] = true
+	}
+	for _, key := range slices.Sorted(maps.Keys(table.Indexes)) {
+		idx := table.Indexes[key]
+		if idx == nil || constraintNames[idx.Name] {
+			continue
+		}
+		if isPrimaryKeyIndex(idx.Name, table) {
+			continue
+		}
+		if idx.Definition == "" {
+			return nil, fmt.Errorf("index %q on dropped table %q has no recorded definition", idx.Name, o.Name)
+		}
+		ops = append(ops, &OpRawSQL{
+			Up:   idx.Definition,
+			Down: fmt.Sprintf("DROP INDEX IF EXISTS %q", idx.Name),
+		})
+	}
+
+	return ops, nil
+}
+
+// stripCheckDefinition extracts the bare expression from a
+// pg_get_constraintdef-style "CHECK ((expr))" definition.
+func stripCheckDefinition(def string) string {
+	trimmed := strings.TrimSpace(def)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "CHECK") {
+		trimmed = strings.TrimSpace(trimmed[len("CHECK"):])
+	}
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		trimmed = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	}
+	return trimmed
+}
+
+// isPrimaryKeyIndex reports whether the index backs the table's primary key
+// (recreated implicitly by the pk columns on create_table).
+func isPrimaryKeyIndex(name string, table *schema.Table) bool {
+	return len(table.PrimaryKey) > 0 && strings.HasSuffix(name, "_pkey")
 }
