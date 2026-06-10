@@ -43,48 +43,70 @@ type Invertible interface {
 // replayed. This makes multi-operation migrations invert correctly (e.g. a
 // rename followed by an alter of the renamed column).
 //
-// The inverse migration is named "revert_<name>" and carries no version
-// schema; callers (the revert orchestrator) assign one.
+// The inverse migration is named "revert_<name>", carries RevertOf, and no
+// version schema; callers (the revert orchestrator) assign one.
 func (m *Migration) Invert(ctx context.Context, parent *schema.Schema) (*Migration, error) {
-	// Capture the pre-state of every operation by replaying Starts
-	// virtually on a working copy.
-	work, err := copySchema(parent)
+	inverses, err := InvertSegment(ctx, []*Migration{m}, parent)
 	if err != nil {
-		return nil, fmt.Errorf("unable to copy parent schema: %w", err)
+		return nil, err
 	}
-	work.MigrationScope = MigrationScopeFor(m.Name)
+	return inverses[0], nil
+}
 
-	preStates := make([]*schema.Schema, len(m.Operations))
+// InvertSegment synthesizes inverse migrations for a contiguous sealed
+// segment of history, newest-inverse-first. base is the clean boundary
+// snapshot immediately below the segment (a refreshed train-final or a
+// baseline). Per-operation pre-states are reconstructed by replaying every
+// operation's Start virtually from the boundary upward — intermediate rows'
+// stored snapshots (captured mid-flight, polluted with expand artifacts)
+// are never consulted.
+func InvertSegment(ctx context.Context, migs []*Migration, base *schema.Schema) ([]*Migration, error) {
+	work, err := copySchema(base)
+	if err != nil {
+		return nil, fmt.Errorf("unable to copy boundary schema: %w", err)
+	}
+
 	fakeDB := &db.FakeDB{}
-	for i, op := range m.Operations {
-		preStates[i], err = copySchema(work)
-		if err != nil {
-			return nil, fmt.Errorf("unable to snapshot schema state: %w", err)
-		}
-		preStates[i].MigrationScope = work.MigrationScope
-		if _, err := op.Start(ctx, NewNoopLogger(), fakeDB, work); err != nil {
-			return nil, fmt.Errorf("unable to replay operation %q: %w", OperationName(op), err)
+	preStates := make([][]*schema.Schema, len(migs))
+	for mi, mig := range migs {
+		work.MigrationScope = MigrationScopeFor(mig.Name)
+		preStates[mi] = make([]*schema.Schema, len(mig.Operations))
+		for oi, op := range mig.Operations {
+			preStates[mi][oi], err = copySchema(work)
+			if err != nil {
+				return nil, fmt.Errorf("unable to snapshot schema state: %w", err)
+			}
+			preStates[mi][oi].MigrationScope = work.MigrationScope
+			if _, err := op.Start(ctx, NewNoopLogger(), fakeDB, work); err != nil {
+				return nil, fmt.Errorf("unable to replay operation %q of %q: %w", OperationName(op), mig.Name, err)
+			}
 		}
 	}
 
-	ops := make(Operations, 0, len(m.Operations))
-	for i := len(m.Operations) - 1; i >= 0; i-- {
-		op := m.Operations[i]
-		inv, ok := op.(Invertible)
-		if !ok {
-			return nil, fmt.Errorf("operation %q does not support inversion", OperationName(op))
+	inverses := make([]*Migration, 0, len(migs))
+	for mi := len(migs) - 1; mi >= 0; mi-- {
+		mig := migs[mi]
+		ops := make(Operations, 0, len(mig.Operations))
+		for oi := len(mig.Operations) - 1; oi >= 0; oi-- {
+			op := mig.Operations[oi]
+			inv, ok := op.(Invertible)
+			if !ok {
+				return nil, fmt.Errorf("operation %q in migration %q does not support inversion", OperationName(op), mig.Name)
+			}
+			invOp, err := inv.Invert(preStates[mi][oi])
+			if err != nil {
+				return nil, fmt.Errorf("unable to invert operation %q in migration %q: %w", OperationName(op), mig.Name, err)
+			}
+			ops = append(ops, invOp)
 		}
-		invOp, err := inv.Invert(preStates[i])
-		if err != nil {
-			return nil, fmt.Errorf("unable to invert operation %q: %w", OperationName(op), err)
-		}
-		ops = append(ops, invOp)
+		inverses = append(inverses, &Migration{
+			Name:       "revert_" + mig.Name,
+			Operations: ops,
+			RevertOf:   mig.Name,
+		})
 	}
 
-	return &Migration{
-		Name:       "revert_" + m.Name,
-		Operations: ops,
-	}, nil
+	return inverses, nil
 }
 
 // copySchema deep-copies a schema via its JSON representation.
@@ -146,14 +168,17 @@ func (o *OpAddColumn) Invert(_ *schema.Schema) (Operation, error) {
 	return &OpDropColumn{Table: o.Table, Column: o.Column.Name, Down: down}, nil
 }
 
-// Invert swaps up and down. onComplete SQL becomes plain SQL: the original
-// up ran when the migration's contraction drained, so the inverse must run
-// its counter-statement during its own expand phase.
+// Invert runs the original down expression as the inverse's statement —
+// deferred to the inverse train's drain (onComplete) so destructive
+// counter-statements (e.g. DROP TABLE undoing a raw CREATE) execute after
+// the sealed train's version schemas are reaped, exactly like forward
+// destructive DDL. Until the drain, nothing has run, so rolling back an
+// interrupted inverse train is a clean no-op for this operation.
 func (o *OpRawSQL) Invert(_ *schema.Schema) (Operation, error) {
 	if o.Down == "" {
 		return nil, fmt.Errorf("raw SQL operation has no down expression")
 	}
-	return &OpRawSQL{Up: o.Down, Down: o.Up}, nil
+	return &OpRawSQL{Up: o.Down, OnComplete: true}, nil
 }
 
 // Invert recreates the dropped index from its definition in the pre-state

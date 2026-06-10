@@ -88,10 +88,10 @@ func TestInvertOperations(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("raw SQL swaps up and down", func(t *testing.T) {
+	t.Run("raw SQL inverts to deferred counter-statement", func(t *testing.T) {
 		inv, err := (&OpRawSQL{Up: "CREATE TYPE t AS ENUM ('a')", Down: "DROP TYPE t"}).Invert(pre)
 		require.NoError(t, err)
-		assert.Equal(t, &OpRawSQL{Up: "DROP TYPE t", Down: "CREATE TYPE t AS ENUM ('a')"}, inv)
+		assert.Equal(t, &OpRawSQL{Up: "DROP TYPE t", OnComplete: true}, inv)
 	})
 
 	t.Run("raw SQL without down refuses", func(t *testing.T) {

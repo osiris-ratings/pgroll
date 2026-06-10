@@ -287,6 +287,11 @@
       "example": "",
       "flags": [
         {
+          "name": "past-seal",
+          "description": "revert SEALED history down to --to by running synthesized inverse migrations (schema exact, data re-derived — best effort)",
+          "default": "false"
+        },
+        {
           "name": "steps",
           "description": "revert at most N migrations (newest first)",
           "default": "0"

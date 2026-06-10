@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -16,6 +17,7 @@ func revertCmd() *cobra.Command {
 	var yes bool
 	var steps int
 	var toMigration string
+	var pastSeal bool
 
 	cmd := &cobra.Command{
 		Use:   "revert",
@@ -45,6 +47,10 @@ func revertCmd() *cobra.Command {
 				return err
 			}
 			defer m.Close()
+
+			if pastSeal {
+				return runSealedRevert(ctx, m, toMigration, yes)
+			}
 
 			var revertOpts []roll.RevertOption
 			if steps > 0 {
@@ -124,7 +130,65 @@ func revertCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
 	cmd.Flags().IntVar(&steps, "steps", 0, "revert at most N migrations (newest first)")
 	cmd.Flags().StringVar(&toMigration, "to", "", "revert everything newer than this migration, which becomes the history leaf")
+	cmd.Flags().BoolVar(&pastSeal, "past-seal", false, "revert SEALED history down to --to by running synthesized inverse migrations (schema exact, data re-derived — best effort)")
 	cmd.MarkFlagsMutuallyExclusive("steps", "to")
+	cmd.MarkFlagsRequiredTogether("past-seal", "to")
 
 	return cmd
+}
+
+// runSealedRevert drives a revert of sealed history: plan, loud preview,
+// confirmation, execution.
+func runSealedRevert(ctx context.Context, m *roll.Roll, to string, yes bool) error {
+	plan, err := m.PlanRevertSealed(ctx, to)
+	if err != nil {
+		return err
+	}
+	if plan == nil {
+		fmt.Printf("Nothing to revert: history is already at %q.\n", to)
+		return nil
+	}
+
+	restoreTo := roll.VersionedSchemaName(m.Schema(), plan.BoundaryVersionSchema)
+
+	fmt.Printf("The following %d SEALED migration(s) will be reverted via synthesized inverses (newest first):\n\n", len(plan.Targets))
+	tableData := pterm.TableData{{"Name", "Inverse"}}
+	for i, t := range plan.Targets {
+		tableData = append(tableData, []string{t, plan.Inverses[len(plan.Inverses)-1-i].Name})
+	}
+	if err := pterm.DefaultTable.WithHasHeader().WithData(tableData).Render(); err != nil {
+		return err
+	}
+	fmt.Println()
+	pterm.Warning.Printfln("These migrations' contraction has RUN. Schema shape is restored exactly;")
+	pterm.Warning.Printfln("data is re-derived through the original up/down expressions — best effort.")
+	pterm.Warning.Printfln("Applications must be pinned to %q before reverting.", restoreTo)
+
+	if !yes {
+		ok, _ := pterm.DefaultInteractiveConfirm.Show(
+			fmt.Sprintf("Revert %d sealed migration(s)?", len(plan.Targets)),
+		)
+		if !ok {
+			return nil
+		}
+	}
+
+	sp, _ := pterm.DefaultSpinner.WithText(
+		fmt.Sprintf("Reverting %d sealed migration(s)...", len(plan.Targets)),
+	).Start()
+	result, err := m.RevertSealed(ctx, to, nil)
+	if err != nil {
+		sp.Fail(fmt.Sprintf("Failed to revert: %s", err))
+		return err
+	}
+	if result == nil {
+		sp.Success("Nothing to revert.")
+		return nil
+	}
+	sp.Success(fmt.Sprintf("Reverted %d sealed migration(s)", len(result.Targets)))
+	for _, t := range result.Targets {
+		fmt.Fprintf(os.Stdout, "    %s %s\n", pterm.FgGreen.Sprint("✓"), t)
+	}
+	fmt.Printf("\nDatabase restored. Live version schema: %s\n", restoreTo)
+	return nil
 }

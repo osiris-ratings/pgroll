@@ -89,6 +89,12 @@ type (
 		DependsOn     []string       `json:"depends_on,omitempty"`
 		Preconditions []Precondition `json:"preconditions,omitempty"`
 		Irreversible  bool           `json:"irreversible,omitempty"`
+		// RevertOf marks an engine-synthesized inverse migration with the
+		// name of the sealed migration it reverts. Never set on authored
+		// migrations; used by the sealed-revert orchestrator for durable
+		// crash recovery (a leaf with RevertOf set identifies an
+		// interrupted sealed revert).
+		RevertOf string `json:"revert_of,omitempty"`
 	}
 	RawMigration struct {
 		Name          string          `json:"-"`
