@@ -229,6 +229,11 @@
           "name": "expect-one",
           "description": "Abort if there is more than one migration to be applied",
           "default": "false"
+        },
+        {
+          "name": "to",
+          "description": "apply migrations only up to (and including) this one; already applied is a no-op",
+          "default": ""
         }
       ],
       "subcommands": [],

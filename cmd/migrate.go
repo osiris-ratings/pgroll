@@ -23,6 +23,7 @@ func migrateCmd() *cobra.Command {
 	var complete, expectOne bool
 	var batchSize int
 	var batchDelay time.Duration
+	var toMigration string
 
 	migrateCmd := &cobra.Command{
 		Use:       "migrate <directory>",
@@ -62,6 +63,31 @@ func migrateCmd() *cobra.Command {
 			rawMigs, err := m.UnappliedMigrations(ctx, os.DirFS(migrationsDir))
 			if err != nil {
 				return fmt.Errorf("failed to get migrations to apply: %w", err)
+			}
+
+			// Bound the train: apply only up to (and including) the target.
+			// An already-applied target is a successful no-op so callers can
+			// use --to for idempotent converging.
+			if toMigration != "" {
+				idx := -1
+				for i, rm := range rawMigs {
+					if rm.Name == toMigration {
+						idx = i
+						break
+					}
+				}
+				if idx == -1 {
+					exists, err := m.State().MigrationExists(ctx, m.Schema(), toMigration)
+					if err != nil {
+						return fmt.Errorf("unable to check for migration %q: %w", toMigration, err)
+					}
+					if exists {
+						fmt.Printf("Database is already at %q; nothing to apply.\n", toMigration)
+						return nil
+					}
+					return fmt.Errorf("migration %q not found among unapplied migrations", toMigration)
+				}
+				rawMigs = rawMigs[:idx+1]
 			}
 
 			// Pre-flight summary: print the deployment state and the plan for
@@ -196,6 +222,7 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().StringVar(&toMigration, "to", "", "apply migrations only up to (and including) this one; already applied is a no-op")
 
 	return migrateCmd
 }
