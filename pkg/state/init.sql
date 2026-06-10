@@ -106,11 +106,15 @@ INTO
     ELSE
         pg_catalog.format('00000_initial_%s', pg_catalog.to_char(pg_catalog.clock_timestamp(), 'YYYYMMDDHH24MISSUS'))
     END;
-    INSERT INTO placeholder.migrations (schema, name, migration, resulting_schema, done, parent, migration_type, created_at, updated_at)
+    -- Inferred rows are sealed at insert: the captured DDL already ran
+    -- outside pgroll's expand/contract lifecycle, so there is no expand
+    -- state to revert to.
+    INSERT INTO placeholder.migrations (schema, name, migration, resulting_schema, done, sealed, parent, migration_type, created_at, updated_at)
         VALUES (schemaname, migration_id, pg_catalog.json_build_object('version_schema', 'sql_' || substring(md5(random()::text), 1, 8), 'operations', (
                 SELECT
                     pg_catalog.json_agg(pg_catalog.json_build_object('sql', pg_catalog.json_build_object('up', pg_catalog.current_query()))))),
             placeholder.read_schema (schemaname),
+            TRUE,
             TRUE,
             placeholder.latest_migration (schemaname),
             'inferred',
@@ -177,6 +181,41 @@ ALTER TABLE placeholder.migrations
 -- previous-production version schema has been dropped.
 ALTER TABLE placeholder.migrations
     ADD COLUMN IF NOT EXISTS complete_deferred boolean NOT NULL DEFAULT FALSE;
+
+-- Revert-window boundary. Rows with sealed=FALSE form the revertible window:
+-- the most recent deployment, still physically in its expand phase (its
+-- destructive DDL queued, not drained). Sealing happens when the deferred
+-- queue drains — at the start of the next `pgroll migrate`, or at any
+-- non-deferred Complete. Sealed rows must never be reverted: their
+-- contraction has run and the prior state is not physically recoverable.
+--
+-- The backfill runs exactly once, when the column is first added: rows
+-- completed by the pre-delayed-contraction flow were contracted at their own
+-- Complete and are therefore sealed. In-flight (done=FALSE) and
+-- deferred-pending rows stay unsealed.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT
+            1
+        FROM
+            pg_attribute
+        WHERE
+            attrelid = 'placeholder.migrations'::regclass
+            AND attname = 'sealed'
+            AND NOT attisdropped) THEN
+    ALTER TABLE placeholder.migrations
+        ADD COLUMN sealed boolean NOT NULL DEFAULT FALSE;
+    UPDATE
+        placeholder.migrations
+    SET
+        sealed = TRUE
+    WHERE
+        done = TRUE
+        AND complete_deferred = FALSE;
+END IF;
+END
+$$;
 
 -- Table to track pgroll binary version
 CREATE TABLE IF NOT EXISTS placeholder.pgroll_version (

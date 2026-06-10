@@ -276,6 +276,22 @@
       ]
     },
     {
+      "name": "revert",
+      "short": "Revert the most recent deployment, restoring the previous schema and data",
+      "use": "revert",
+      "example": "",
+      "flags": [
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "skip the confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": []
+    },
+    {
       "name": "rollback",
       "short": "Roll back an ongoing migration",
       "use": "rollback",

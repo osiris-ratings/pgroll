@@ -23,6 +23,10 @@ type options struct {
 	// whether to skip validation
 	skipValidation bool
 
+	// require every migration to be revertible (or explicitly marked
+	// `irreversible: true`)
+	requireReversible bool
+
 	migrationHooks MigrationHooks
 
 	verbose bool
@@ -99,6 +103,18 @@ func WithSearchPath(schemas ...string) Option {
 func WithSkipValidation(skip bool) Option {
 	return func(o *options) {
 		o.skipValidation = skip
+	}
+}
+
+// WithRequireReversible requires every migration to pass
+// Migration.ValidateReversibility before it can be started: operations that
+// need a 'down' expression to be revertible must declare one, unless the
+// migration is explicitly marked `irreversible: true`. The pgroll CLI always
+// sets this; it ensures `pgroll revert` can walk back out of any applied
+// migration.
+func WithRequireReversible() Option {
+	return func(o *options) {
+		o.requireReversible = true
 	}
 }
 

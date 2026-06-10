@@ -44,6 +44,10 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 		roll.WithSkipValidation(skipValidation),
 		roll.WithLogging(verbose),
 		roll.WithVersionSchema(useVersionSchema),
+		// Reversibility by construction: the CLI always requires migrations
+		// to be revertible (or explicitly marked `irreversible: true`) so
+		// `pgroll revert` can walk back out of any applied migration.
+		roll.WithRequireReversible(),
 	)
 }
 
@@ -124,6 +128,7 @@ func Prepare() *cobra.Command {
 	rootCmd.AddCommand(materializeCmd())
 	rootCmd.AddCommand(stampCmd())
 	rootCmd.AddCommand(pruneCmd())
+	rootCmd.AddCommand(revertCmd())
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(checkCmd())
 

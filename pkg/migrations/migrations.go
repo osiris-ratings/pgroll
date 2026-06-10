@@ -74,6 +74,7 @@ type (
 		Operations    Operations     `json:"operations"`
 		DependsOn     []string       `json:"depends_on,omitempty"`
 		Preconditions []Precondition `json:"preconditions,omitempty"`
+		Irreversible  bool           `json:"irreversible,omitempty"`
 	}
 	RawMigration struct {
 		Name          string          `json:"-"`
@@ -81,6 +82,7 @@ type (
 		Operations    json.RawMessage `json:"operations"`
 		DependsOn     []string        `json:"depends_on,omitempty"`
 		Preconditions []Precondition  `json:"preconditions,omitempty"`
+		Irreversible  bool            `json:"irreversible,omitempty"`
 	}
 
 	StartResult struct {
@@ -96,6 +98,44 @@ func (m *Migration) VersionSchemaName() string {
 		return m.VersionSchema
 	}
 	return m.Name
+}
+
+// ValidateReversibility checks that every operation in the migration can be
+// reverted, unless the migration is explicitly marked `irreversible: true`.
+// Reversibility is required by construction: a migration without it can leave
+// the database in a state that `pgroll revert` cannot walk back out of.
+//
+// Schema-independent, so it is enforced both by `pgroll check` (filesystem
+// only) and at Start time via Validate.
+//
+// Raw SQL with `onComplete: true` is exempt: its `up` does not run until the
+// deferred-complete queue drains, so within the revert window there is
+// nothing to undo and `down` is structurally disallowed for it.
+func (m *Migration) ValidateReversibility() error {
+	if m.Irreversible {
+		return nil
+	}
+
+	for _, op := range m.Operations {
+		switch v := op.(type) {
+		case *OpRawSQL:
+			if !v.OnComplete && v.Down == "" {
+				return InvalidMigrationError{Reason: fmt.Sprintf(
+					"operation %q requires a 'down' expression so the migration can be reverted; add one or mark the migration 'irreversible: true'",
+					OperationName(op),
+				)}
+			}
+		case *OpDropColumn:
+			if v.Down == "" {
+				return InvalidMigrationError{Reason: fmt.Sprintf(
+					"operation %q on %s.%s requires a 'down' expression to restore column data on revert; add one or mark the migration 'irreversible: true'",
+					OperationName(op), v.Table, v.Column,
+				)}
+			}
+		}
+	}
+
+	return nil
 }
 
 // Validate will check that the migration can be applied to the given schema
@@ -158,7 +198,13 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 			*OpDropMultiColumnConstraint,
 			*OpRenameColumn,
 			*OpRenameTable,
-			*OpAlterColumn:
+			*OpAlterColumn,
+			// OpCreateConstraint is a duplicator-pattern op despite being
+			// additive in spirit: its Complete drops the original
+			// user-facing columns and renames the duplicates back, which
+			// prev-prod's views reference — inline completion hits the same
+			// pg_depend dependency error as the destructive ops above.
+			*OpCreateConstraint:
 			return true
 		case *OpRawSQL:
 			if v.OnComplete {

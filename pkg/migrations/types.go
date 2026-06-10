@@ -487,6 +487,11 @@ type PgRollMigration struct {
 	// explicit ordering constraints for migrations that are not commutative.
 	DependsOn []string `json:"depends_on,omitempty"`
 
+	// Explicitly marks this migration as not revertible by pgroll revert. Without
+	// this marker, operations that need a 'down' expression are required to declare
+	// one.
+	Irreversible bool `json:"irreversible,omitempty"`
+
 	// Name of the migration
 	Name *string `json:"name,omitempty"`
 
