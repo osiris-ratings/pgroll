@@ -54,6 +54,8 @@ func (r *CheckResult) addWarning(file, msg string) {
 //   - depends_on targets exist in the migration set
 //   - Dependency cycle detection
 //   - Advisory: raw SQL operations without preconditions
+//   - Reversibility: ops that need a 'down' expression have one, unless the
+//     migration is marked 'irreversible: true'
 func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 	result := &CheckResult{}
 
@@ -135,6 +137,19 @@ func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 		if hasRawSQLOps(p.raw.Operations) {
 			result.addWarning(p.file,
 				"contains raw SQL operations without preconditions")
+		}
+	}
+
+	// Reversibility by construction: every migration must be revertible or
+	// explicitly marked `irreversible: true`
+	for _, p := range parsed {
+		mig, err := migrations.ParseMigration(p.raw)
+		if err != nil {
+			result.addError(p.file, fmt.Sprintf("invalid operations: %v", err))
+			continue
+		}
+		if err := mig.ValidateReversibility(); err != nil {
+			result.addError(p.file, err.Error())
 		}
 	}
 

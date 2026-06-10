@@ -229,6 +229,11 @@
           "name": "expect-one",
           "description": "Abort if there is more than one migration to be applied",
           "default": "false"
+        },
+        {
+          "name": "to",
+          "description": "apply migrations only up to (and including) this one; already applied is a no-op",
+          "default": ""
         }
       ],
       "subcommands": [],
@@ -274,6 +279,37 @@
       "args": [
         "directory"
       ]
+    },
+    {
+      "name": "revert",
+      "short": "Revert the most recent deployment, restoring the previous schema and data",
+      "use": "revert",
+      "example": "",
+      "flags": [
+        {
+          "name": "past-seal",
+          "description": "revert SEALED history down to --to by running synthesized inverse migrations (schema exact, data re-derived — best effort)",
+          "default": "false"
+        },
+        {
+          "name": "steps",
+          "description": "revert at most N migrations (newest first)",
+          "default": "0"
+        },
+        {
+          "name": "to",
+          "description": "revert everything newer than this migration, which becomes the history leaf",
+          "default": ""
+        },
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "skip the confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": []
     },
     {
       "name": "rollback",

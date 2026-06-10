@@ -41,10 +41,11 @@ type Roll struct {
 	// disable pgroll version schemas creation and deletion
 	disableVersionSchemas bool
 
-	migrationHooks MigrationHooks
-	state          *state.State
-	pgVersion      PGVersion
-	skipValidation bool
+	migrationHooks    MigrationHooks
+	state             *state.State
+	pgVersion         PGVersion
+	skipValidation    bool
+	requireReversible bool
 }
 
 // New creates a new Roll instance
@@ -84,6 +85,7 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 		disableVersionSchemas: rollOpts.disableVersionSchemas,
 		migrationHooks:        rollOpts.migrationHooks,
 		skipValidation:        rollOpts.skipValidation,
+		requireReversible:     rollOpts.requireReversible,
 	}, nil
 }
 

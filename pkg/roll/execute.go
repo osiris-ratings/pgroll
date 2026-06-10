@@ -41,6 +41,11 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 	if m.skipValidation {
 		return nil
 	}
+	if m.requireReversible {
+		if err := migration.ValidateReversibility(); err != nil {
+			return fmt.Errorf("migration '%s' is invalid: %w", migration.Name, err)
+		}
+	}
 	lastSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return err
@@ -590,6 +595,18 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		return fmt.Errorf("unable to complete migration: %w", err)
 	}
 
+	// A non-deferred Complete is a seal point: this migration's own
+	// contraction ran, and the drain above flushed any queued deferred
+	// completes. Everything done is now past the point of no return for
+	// `pgroll revert`. Inline intermediates (WithSkipSchemaDrop) skip this —
+	// their Completes touch only pgroll-internal artifacts and they remain
+	// revertible until their train seals.
+	if !o.skipSchemaDrop {
+		if err := m.state.MarkSealed(ctx, m.schema); err != nil {
+			return err
+		}
+	}
+
 	m.logger.LogMigrationComplete(migration)
 
 	return nil
@@ -605,25 +622,55 @@ func (m *Roll) Rollback(ctx context.Context) error {
 
 	m.logger.LogMigrationRollback(migration)
 
-	// delete the schema and views for the new version
-	versionSchema := VersionedSchemaName(m.schema, migration.VersionSchemaName())
-	_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
-	if err != nil {
-		return err
-	}
-
-	m.logger.LogSchemaDeletion(migration.Name, versionSchema)
-
 	// get the name of the previous migration
 	previousMigration, err := m.state.PreviousMigration(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to get name of previous version: %w", err)
 	}
 
-	// get the schema after the previous migration was applied
+	if err := m.rollbackExpandPhase(ctx, migration, previousMigration); err != nil {
+		return err
+	}
+
+	// roll back the migration
+	err = m.state.Rollback(ctx, m.schema, migration.Name)
+	if err != nil {
+		return fmt.Errorf("unable to rollback migration: %w", err)
+	}
+
+	m.logger.LogMigrationRollbackComplete(migration)
+
+	return nil
+}
+
+// dropVersionSchema deletes the migration's version schema and its views, if
+// they exist.
+func (m *Roll) dropVersionSchema(ctx context.Context, migration *migrations.Migration) error {
+	versionSchema := VersionedSchemaName(m.schema, migration.VersionSchemaName())
+	_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
+	if err != nil {
+		return err
+	}
+
+	m.logger.LogSchemaDeletion(migration.Name, versionSchema)
+	return nil
+}
+
+// rollbackExpandPhase reverts a migration that is still in its expand phase
+// (in-progress or complete-deferred): drops its version schema, rebuilds the
+// schema state its Start ran against (parent snapshot + virtual replay of
+// its own Start), and runs each operation's Rollback in reverse order.
+func (m *Roll) rollbackExpandPhase(ctx context.Context, migration *migrations.Migration, parent *string) error {
+	// delete the schema and views for the new version
+	if err := m.dropVersionSchema(ctx, migration); err != nil {
+		return err
+	}
+
+	// get the schema after the parent migration was applied
 	schema := schema.New()
-	if previousMigration != nil {
-		schema, err = m.state.SchemaAfterMigration(ctx, m.schema, *previousMigration)
+	if parent != nil {
+		var err error
+		schema, err = m.state.SchemaAfterMigration(ctx, m.schema, *parent)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)
 		}
@@ -639,7 +686,12 @@ func (m *Roll) Rollback(ctx context.Context) error {
 		return fmt.Errorf("unable to replay changes to in-memory schema: %w", err)
 	}
 
-	// roll back operations in reverse order
+	return m.rollbackOperations(ctx, migration, schema)
+}
+
+// rollbackOperations runs each operation's Rollback in reverse order against
+// the given schema.
+func (m *Roll) rollbackOperations(ctx context.Context, migration *migrations.Migration, schema *schema.Schema) error {
 	for i := len(migration.Operations) - 1; i >= 0; i-- {
 		actions, err := migration.Operations[i].Rollback(m.logger, m.pgConn, schema)
 		if err != nil {
@@ -650,15 +702,6 @@ func (m *Roll) Rollback(ctx context.Context) error {
 			return fmt.Errorf("unable to execute rollback operation: %w", err)
 		}
 	}
-
-	// roll back the migration
-	err = m.state.Rollback(ctx, m.schema, migration.Name)
-	if err != nil {
-		return fmt.Errorf("unable to rollback migration: %w", err)
-	}
-
-	m.logger.LogMigrationRollbackComplete(migration)
-
 	return nil
 }
 
@@ -805,6 +848,23 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 // (the temp/trigger/marker names installed by the same migration's
 // earlier Start).
 func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migration) error {
+	if err := m.applyDeferredComplete(ctx, dm); err != nil {
+		return err
+	}
+
+	if err := m.state.ClearCompleteDeferred(ctx, m.schema, dm.Name); err != nil {
+		return fmt.Errorf("unable to clear complete_deferred for %q: %w", dm.Name, err)
+	}
+	m.logger.Info("drained deferred complete", "migration", dm.Name)
+	return nil
+}
+
+// applyDeferredComplete constructs and executes a deferred migration's
+// Complete actions against the current physical schema, without clearing
+// its complete_deferred flag. Callers that need to order other durable
+// steps before the flag clears (see SealDeferredCompletes) use this
+// directly; everyone else uses drainDeferredMigration.
+func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migration) error {
 	drainSchema, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
@@ -825,10 +885,6 @@ func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migrat
 		return fmt.Errorf("unable to execute deferred complete %q: %w", dm.Name, err)
 	}
 
-	if err := m.state.ClearCompleteDeferred(ctx, m.schema, dm.Name); err != nil {
-		return fmt.Errorf("unable to clear complete_deferred for %q: %w", dm.Name, err)
-	}
-	m.logger.Info("drained deferred complete", "migration", dm.Name)
 	return nil
 }
 

@@ -175,6 +175,7 @@ func ParseMigration(raw *RawMigration) (*Migration, error) {
 		Operations:    ops,
 		DependsOn:     raw.DependsOn,
 		Preconditions: raw.Preconditions,
+		Irreversible:  raw.Irreversible,
 	}, nil
 }
 

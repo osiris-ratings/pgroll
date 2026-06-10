@@ -204,6 +204,21 @@ func (o *OpCreateConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([
 	}, nil
 }
 
+// RollbackCompleted undoes a create_constraint whose Complete has already
+// run. By then the original columns are gone and the backfilled duplicates
+// have been renamed into their place, with the new constraint attached —
+// dropping the constraint by name restores the prior schema shape. The
+// column contents keep the `up`-transformed values; for the standard
+// add-a-constraint-to-valid-data case `up` is the identity, so this is
+// lossless.
+func (o *OpCreateConstraint) RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
+	l.LogOperationRollback(o)
+
+	return []DBAction{
+		NewDropConstraintAction(conn, o.Table, o.Name),
+	}, nil
+}
+
 func (o *OpCreateConstraint) removeTriggers(conn db.DB, scope string) DBAction {
 	dropFuncs := make([]string, 0, len(o.Columns)*2)
 	for _, column := range o.Columns {

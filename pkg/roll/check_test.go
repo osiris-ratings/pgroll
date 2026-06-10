@@ -17,7 +17,7 @@ import (
 func validMigrationJSON(t *testing.T) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
-		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1"}}},
+		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1", "down": "SELECT 1"}}},
 	})
 	require.NoError(t, err)
 	return data
@@ -26,7 +26,7 @@ func validMigrationJSON(t *testing.T) []byte {
 func migrationWithDependsOn(t *testing.T, deps []string) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
-		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1"}}},
+		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1", "down": "SELECT 1"}}},
 		"depends_on": deps,
 	})
 	require.NoError(t, err)
@@ -36,7 +36,7 @@ func migrationWithDependsOn(t *testing.T, deps []string) []byte {
 func migrationWithPreconditions(t *testing.T) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
-		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1"}}},
+		"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1", "down": "SELECT 1"}}},
 		"preconditions": []map[string]any{
 			{"table_exists": "users"},
 		},
@@ -208,5 +208,105 @@ func TestCheckMigrationsDir(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 		assert.Empty(t, result.Warnings)
+	})
+
+	t.Run("raw SQL without down is an error", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1"}}},
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_raw_sql.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		require.Len(t, result.Errors, 1)
+		assert.Contains(t, result.Errors[0].Message, "down")
+		assert.Contains(t, result.Errors[0].Message, "irreversible")
+	})
+
+	t.Run("raw SQL without down marked irreversible passes", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations":   []map[string]any{{"sql": map[string]any{"up": "SELECT 1"}}},
+			"irreversible": true,
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_raw_sql.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		assert.Empty(t, result.Errors)
+	})
+
+	t.Run("onComplete raw SQL without down passes", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations": []map[string]any{{"sql": map[string]any{"up": "SELECT 1", "onComplete": true}}},
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_on_complete.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		assert.Empty(t, result.Errors)
+	})
+
+	t.Run("drop_column without down is an error", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations": []map[string]any{
+				{"drop_column": map[string]any{"table": "users", "column": "email"}},
+			},
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_drop_email.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		require.Len(t, result.Errors, 1)
+		assert.Contains(t, result.Errors[0].Message, "down")
+		assert.Contains(t, result.Errors[0].Message, "users.email")
+	})
+
+	t.Run("drop_column with down passes", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations": []map[string]any{
+				{"drop_column": map[string]any{"table": "users", "column": "email", "down": "''"}},
+			},
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_drop_email.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		assert.Empty(t, result.Errors)
+	})
+
+	t.Run("unparseable operations are an error", func(t *testing.T) {
+		data, err := json.Marshal(map[string]any{
+			"operations": []map[string]any{{"no_such_op": map[string]any{}}},
+		})
+		require.NoError(t, err)
+
+		fs := fstest.MapFS{
+			"01_unknown_op.json": &fstest.MapFile{Data: data},
+		}
+
+		result, err := CheckMigrationsDir(fs)
+		require.NoError(t, err)
+		require.Len(t, result.Errors, 1)
+		assert.Contains(t, result.Errors[0].Message, "invalid operations")
 	})
 }

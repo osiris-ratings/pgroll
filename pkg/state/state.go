@@ -394,6 +394,57 @@ func (s *State) ClearCompleteDeferred(ctx context.Context, schema, name string) 
 	return err
 }
 
+// GetMigration returns the named migration from the history, parsed from its
+// stored JSON definition.
+func (s *State) GetMigration(ctx context.Context, schema, name string) (*migrations.Migration, error) {
+	var rawMigration string
+	err := s.pgConn.QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT migration FROM %s.migrations WHERE schema=$1 AND name=$2",
+		pq.QuoteIdentifier(s.schema),
+	), schema, name).Scan(&rawMigration)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("migration %q not found in history", name)
+		}
+		return nil, err
+	}
+
+	var migration migrations.Migration
+	if err := json.Unmarshal([]byte(rawMigration), &migration); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal migration %q: %w", name, err)
+	}
+	migration.Name = name
+
+	return &migration, nil
+}
+
+// RefreshResultingSchema re-captures the resulting_schema of the named
+// migration from the live physical schema. MarkCompleteDeferred snapshots
+// the schema mid-flight, while pgroll temp artifacts from the migration's
+// own (and sibling) expand phases are still physically present; once the
+// deferred queue has fully drained, the physical schema is the clean
+// post-contraction state and the boundary row's snapshot must reflect it —
+// SchemaAfterMigration consumers (rollback, revert) depend on this.
+func (s *State) RefreshResultingSchema(ctx context.Context, schema, name string) error {
+	res, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %[1]s.migrations SET resulting_schema=(SELECT %[1]s.read_schema($1)) WHERE schema=$1 AND name=$2",
+		pq.QuoteIdentifier(s.schema),
+	), schema, name)
+	if err != nil {
+		return err
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("no migration found with name %s", name)
+	}
+
+	return nil
+}
+
 // ReadSchema reads the schema for the specified schema name
 func (s *State) ReadSchema(ctx context.Context, schemaName string) (*schema.Schema, error) {
 	var rawSchema []byte
@@ -485,11 +536,13 @@ func (s *State) CreateBaseline(ctx context.Context, schemaName, baselineVersion 
 		return fmt.Errorf("unable to marshal schema: %w", err)
 	}
 
-	// Insert a baseline migration record
+	// Insert a baseline migration record. Baselines are sealed at insert:
+	// they capture pre-existing state pgroll knows nothing about, so there
+	// is nothing to revert to behind them.
 	stmt := fmt.Sprintf(`
 		INSERT INTO %[1]s.migrations
-		(schema, name, migration, resulting_schema, done, parent, migration_type, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, TRUE,  %[1]s.latest_migration($1), 'baseline', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		(schema, name, migration, resulting_schema, done, sealed, parent, migration_type, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, TRUE, TRUE, %[1]s.latest_migration($1), 'baseline', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 		pq.QuoteIdentifier(s.schema))
 
 	_, err = s.pgConn.ExecContext(ctx, stmt, schemaName, baselineVersion, rawMigration, rawSchema)
@@ -567,11 +620,15 @@ func (s *State) Stamp(
 	// formatted segments are fixed strings (parameter placeholders or
 	// literal `DEFAULT`/`'{}'::jsonb`) chosen by call-site logic above.
 	// Same shape as State.CreateBaseline / State.Start.
+	//
+	// Stamped rows are sealed at insert: the recorded DDL already happened
+	// outside pgroll (dump load, state recovery), so there is no expand
+	// state to revert to.
 	//nolint:gosec // G201: schema is identifier-quoted; segments are fixed strings.
 	stmt := fmt.Sprintf(`
 		INSERT INTO %[1]s.migrations
-		(schema, name, migration, resulting_schema, done, parent, migration_type, created_at, updated_at)
-		VALUES ($1, $2, $3, %[2]s, TRUE, %[3]s, %[4]s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		(schema, name, migration, resulting_schema, done, sealed, parent, migration_type, created_at, updated_at)
+		VALUES ($1, $2, $3, %[2]s, TRUE, TRUE, %[3]s, %[4]s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
 		pq.QuoteIdentifier(s.schema), resultingClause, parentClause, typeClause)
 
 	if _, err := s.pgConn.ExecContext(ctx, stmt, args...); err != nil {

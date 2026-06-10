@@ -23,6 +23,7 @@ func migrateCmd() *cobra.Command {
 	var complete, expectOne bool
 	var batchSize int
 	var batchDelay time.Duration
+	var toMigration string
 
 	migrateCmd := &cobra.Command{
 		Use:       "migrate <directory>",
@@ -62,6 +63,31 @@ func migrateCmd() *cobra.Command {
 			rawMigs, err := m.UnappliedMigrations(ctx, os.DirFS(migrationsDir))
 			if err != nil {
 				return fmt.Errorf("failed to get migrations to apply: %w", err)
+			}
+
+			// Bound the train: apply only up to (and including) the target.
+			// An already-applied target is a successful no-op so callers can
+			// use --to for idempotent converging.
+			if toMigration != "" {
+				idx := -1
+				for i, rm := range rawMigs {
+					if rm.Name == toMigration {
+						idx = i
+						break
+					}
+				}
+				if idx == -1 {
+					exists, err := m.State().MigrationExists(ctx, m.Schema(), toMigration)
+					if err != nil {
+						return fmt.Errorf("unable to check for migration %q: %w", toMigration, err)
+					}
+					if exists {
+						fmt.Printf("Database is already at %q; nothing to apply.\n", toMigration)
+						return nil
+					}
+					return fmt.Errorf("migration %q not found among unapplied migrations", toMigration)
+				}
+				rawMigs = rawMigs[:idx+1]
 			}
 
 			// Pre-flight summary: print the deployment state and the plan for
@@ -120,6 +146,22 @@ func migrateCmd() *cobra.Command {
 				backfill.WithBatchDelay(batchDelay),
 			)
 
+			// Seal the previous deployment before applying this one. Under
+			// delayed contraction every migration in a train — including the
+			// final one — defers its destructive DDL, keeping the whole train
+			// in its expand phase (and therefore losslessly revertible) for a
+			// full release cycle. The next train departing is the previous
+			// train's point of no return: drain its queued contraction now,
+			// while production apps stay pinned to its (briefly recreated)
+			// version schema.
+			sealed, err := m.SealDeferredCompletes(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to seal previous deployment: %w", err)
+			}
+			if sealed > 0 {
+				fmt.Printf("Sealed previous deployment: %d deferred completion(s) drained. The revert window now covers only this deployment.\n\n", sealed)
+			}
+
 			// Apply each intermediate migration without projecting a version
 			// schema. No apps will ever connect to an intermediate version, so
 			// projecting it would just waste a schema and create view
@@ -157,13 +199,18 @@ func migrateCmd() *cobra.Command {
 			}
 
 			// Run the final migration. Its Start projects the new target
-			// version schema. If --complete is set, the final Complete()
-			// reaps every other version schema (the production-active
-			// version goes away). If --complete is not set, the final
-			// migration is left in-progress; the production-active version
-			// schema is preserved until the operator runs `pgroll complete`
-			// after deploying apps to the new target.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
+			// version schema. If --complete is set, the final migration is
+			// marked done with its contraction deferred (delayed
+			// contraction): the previous-production version schema survives
+			// and the whole train remains losslessly revertible via `pgroll
+			// revert` until the next train departs (or `pgroll complete`
+			// seals it manually). If --complete is not set, the final
+			// migration is left in-progress for a later `pgroll complete`.
+			finalOpts := []migrationOption{}
+			if complete {
+				finalOpts = append(finalOpts, AsCompleteOption(roll.WithDeferComplete()))
+			}
+			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, finalOpts...); err != nil {
 				return err
 			}
 
@@ -175,6 +222,7 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().StringVar(&toMigration, "to", "", "apply migrations only up to (and including) this one; already applied is a no-op")
 
 	return migrateCmd
 }
@@ -373,6 +421,16 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		count := pterm.FgGray.Sprintf("(%d %s)", remainingCount, unit)
 		plan := fmt.Sprintf("%s %s %s %s", source, pterm.FgGray.Sprint("→"), target, count)
 		field("Plan", plan)
+
+		// Surface the point of no return: applying this batch seals the
+		// previous deployment by draining its deferred contraction DDL.
+		deferred, err := m.State().DeferredCompletes(ctx, m.Schema())
+		if err != nil {
+			return "", fmt.Errorf("reading deferred completes: %w", err)
+		}
+		if len(deferred) > 0 {
+			field("Seals", fmt.Sprintf("%d deferred completion(s) — closes the previous deployment's revert window", len(deferred)))
+		}
 
 		names := make([]string, len(unapplied))
 		for i, mig := range unapplied {

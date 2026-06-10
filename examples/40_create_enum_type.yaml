@@ -1,3 +1,4 @@
 operations:
   - sql:
       up: CREATE TYPE fruit_size AS ENUM ('small', 'medium', 'large');
+      down: DROP TYPE fruit_size;

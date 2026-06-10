@@ -1350,6 +1350,11 @@
           "items": {
             "$ref": "#/$defs/Precondition"
           }
+        },
+        "irreversible": {
+          "description": "Explicitly marks this migration as not revertible by pgroll revert. Without this marker, operations that need a 'down' expression are required to declare one.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": ["operations"],

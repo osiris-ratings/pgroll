@@ -51,6 +51,20 @@ type Createable interface {
 	Create()
 }
 
+// CompletedRollbackable is implemented by operations whose effects can be
+// undone after their Complete phase has run. The standard Rollback contract
+// only covers the expand phase (before Complete); most inline-class
+// operations' Rollbacks happen to remain valid post-complete, but operations
+// whose Complete restructures user-facing objects (e.g. OpCreateConstraint's
+// column swap) need a distinct inverse. Used by `pgroll revert` when walking
+// back migrations that completed inline within the revert window.
+type CompletedRollbackable interface {
+	// RollbackCompleted returns the actions that undo this operation after
+	// its Complete phase has already run. The schema is a fresh physical
+	// read (post-complete names).
+	RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
+}
+
 // IsolatedOperation is an operation that cannot be executed with other operations
 // in the same migration.
 type IsolatedOperation interface {
@@ -74,6 +88,13 @@ type (
 		Operations    Operations     `json:"operations"`
 		DependsOn     []string       `json:"depends_on,omitempty"`
 		Preconditions []Precondition `json:"preconditions,omitempty"`
+		Irreversible  bool           `json:"irreversible,omitempty"`
+		// RevertOf marks an engine-synthesized inverse migration with the
+		// name of the sealed migration it reverts. Never set on authored
+		// migrations; used by the sealed-revert orchestrator for durable
+		// crash recovery (a leaf with RevertOf set identifies an
+		// interrupted sealed revert).
+		RevertOf string `json:"revert_of,omitempty"`
 	}
 	RawMigration struct {
 		Name          string          `json:"-"`
@@ -81,6 +102,7 @@ type (
 		Operations    json.RawMessage `json:"operations"`
 		DependsOn     []string        `json:"depends_on,omitempty"`
 		Preconditions []Precondition  `json:"preconditions,omitempty"`
+		Irreversible  bool            `json:"irreversible,omitempty"`
 	}
 
 	StartResult struct {
@@ -96,6 +118,44 @@ func (m *Migration) VersionSchemaName() string {
 		return m.VersionSchema
 	}
 	return m.Name
+}
+
+// ValidateReversibility checks that every operation in the migration can be
+// reverted, unless the migration is explicitly marked `irreversible: true`.
+// Reversibility is required by construction: a migration without it can leave
+// the database in a state that `pgroll revert` cannot walk back out of.
+//
+// Schema-independent, so it is enforced both by `pgroll check` (filesystem
+// only) and at Start time via Validate.
+//
+// Raw SQL with `onComplete: true` is exempt: its `up` does not run until the
+// deferred-complete queue drains, so within the revert window there is
+// nothing to undo and `down` is structurally disallowed for it.
+func (m *Migration) ValidateReversibility() error {
+	if m.Irreversible {
+		return nil
+	}
+
+	for _, op := range m.Operations {
+		switch v := op.(type) {
+		case *OpRawSQL:
+			if !v.OnComplete && v.Down == "" {
+				return InvalidMigrationError{Reason: fmt.Sprintf(
+					"operation %q requires a 'down' expression so the migration can be reverted; add one or mark the migration 'irreversible: true'",
+					OperationName(op),
+				)}
+			}
+		case *OpDropColumn:
+			if v.Down == "" {
+				return InvalidMigrationError{Reason: fmt.Sprintf(
+					"operation %q on %s.%s requires a 'down' expression to restore column data on revert; add one or mark the migration 'irreversible: true'",
+					OperationName(op), v.Table, v.Column,
+				)}
+			}
+		}
+	}
+
+	return nil
 }
 
 // Validate will check that the migration can be applied to the given schema
@@ -166,6 +226,14 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 			}
 		}
 	}
+	// Note: OpCreateConstraint is a duplicator-pattern op (its Complete
+	// drops the original user-facing columns and renames the duplicates
+	// back), but it MUST stay inline: chained duplicators on the same
+	// columns (e.g. examples 44→48: unique, then check, then FK, then drop
+	// the check) rely on each layer's Complete having physically run before
+	// the next layer's Start duplicates the column — deferring it loses
+	// earlier layers' constraints at drain time. Post-complete revert is
+	// handled via its RollbackCompleted implementation instead.
 	return false
 }
 
