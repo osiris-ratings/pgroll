@@ -384,6 +384,22 @@ func (s *State) DeferredCompletes(ctx context.Context, schema string) ([]*migrat
 	return out, nil
 }
 
+// HasSealedDeferred reports whether any migration is both sealed and still
+// queued (complete_deferred). Because the seal stamps before draining, this
+// is the durable signature of an interrupted seal: the drain must be resumed
+// before anything else touches the queue.
+func (s *State) HasSealedDeferred(ctx context.Context, schema string) (bool, error) {
+	var exists bool
+	err := s.pgConn.QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT EXISTS(SELECT 1 FROM %s.migrations WHERE schema=$1 AND complete_deferred AND sealed)",
+		pq.QuoteIdentifier(s.schema),
+	), schema).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("unable to check for sealed deferred migrations: %w", err)
+	}
+	return exists, nil
+}
+
 // ClearCompleteDeferred clears the complete_deferred flag on a migration
 // after its queued operations have successfully replayed.
 func (s *State) ClearCompleteDeferred(ctx context.Context, schema, name string) error {

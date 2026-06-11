@@ -5,6 +5,7 @@ package roll
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/lib/pq"
 )
@@ -76,6 +77,35 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 		// means the queue predates delayed contraction or was manipulated.
 		m.logger.Info("latest migration is not the last deferred migration",
 			"latest", live.Name, "lastDeferred", last.Name)
+	}
+
+	// A non-empty queue is normally the previous train's — but it is also
+	// what a crashed `pgroll migrate` leaves mid-train: the applied prefix's
+	// defer-class rows, with the train never finished. Sealing that queue
+	// would fire the point of no return mid-train AND, because the latest
+	// migration is then a version-schema-less intermediate, drop the
+	// previous train-final's schema — the one production apps are still
+	// pinned to. Distinguish the two by physics:
+	//   - any sealed row still queued  → an interrupted seal; resume it.
+	//   - queue unsealed and the latest migration has no physical version
+	//     schema → an unfinished train; skip the seal entirely so the
+	//     caller (migrate) resumes the train. The whole train — crashed
+	//     prefix and resumed suffix — seals together at the next departure.
+	resuming, err := m.state.HasSealedDeferred(ctx, m.schema)
+	if err != nil {
+		return 0, err
+	}
+	if !resuming && !m.disableVersionSchemas {
+		existing, err := m.ExistingVersionSchemas(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !slices.Contains(existing, VersionedSchemaName(m.schema, live.VersionSchemaName())) {
+			m.logger.Info("skipping seal: the deferred queue belongs to an unfinished deployment "+
+				"(latest migration has no version schema); re-run `pgroll migrate` to resume it",
+				"latest", live.Name, "queued", len(queued))
+			return 0, nil
+		}
 	}
 
 	m.logger.Info("sealing previous deployment: draining deferred completes",
