@@ -32,13 +32,21 @@ var completeCmd = &cobra.Command{
 			// contraction trigger — drain the queue and close the revert
 			// window on demand.
 			if errors.Is(err, state.ErrNoActiveMigration) {
-				sealed, sealErr := m.SealDeferredCompletes(cmd.Context())
+				drained, sealErr := m.SealDeferredCompletes(cmd.Context())
 				if sealErr != nil {
 					sp.Fail(fmt.Sprintf("Failed to drain deferred completions: %s", sealErr))
 					return sealErr
 				}
-				if sealed > 0 {
-					sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) from the previous deployment. The revert window is now closed.", sealed))
+				// A manual seal closes the window completely: also stamp
+				// unsealed rows with nothing queued (inline-only windows,
+				// e.g. a train re-opened by a bounded revert).
+				stamped, sealErr := m.SealWindow(cmd.Context())
+				if sealErr != nil {
+					sp.Fail(fmt.Sprintf("Failed to seal the revert window: %s", sealErr))
+					return sealErr
+				}
+				if drained > 0 || stamped > 0 {
+					sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) and sealed %d migration(s). The revert window is now closed.", drained, stamped))
 					return nil
 				}
 			}

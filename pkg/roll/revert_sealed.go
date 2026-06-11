@@ -10,6 +10,7 @@ import (
 
 	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/migrations"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 // SealedRevertPlan describes a revert of SEALED history: the forward
@@ -143,6 +144,52 @@ func (m *Roll) PlanRevertSealed(ctx context.Context, to string) (*SealedRevertPl
 	}, nil
 }
 
+// PendingSealedRevertResume reports whether the database is in one of the
+// intermediate states an interrupted sealed revert leaves behind, returning
+// a short operator-facing description of what resuming will do, or "" when
+// there is nothing to resume. The CLI checks this BEFORE planning a fresh
+// revert: PlanRevertSealed refuses exactly these states (open window, active
+// migration), so without the check the in-engine resume in RevertSealed
+// would be unreachable from the command line.
+func (m *Roll) PendingSealedRevertResume(ctx context.Context) (string, error) {
+	// A partially-applied inverse train: unsealed rows that are all
+	// engine-synthesized RevertOf rows.
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return "", err
+	}
+	if len(unsealed) > 0 {
+		for _, r := range unsealed {
+			if r.Migration.RevertOf == "" {
+				return "", nil
+			}
+		}
+		return fmt.Sprintf(
+			"an interrupted sealed revert left %d partially-applied inverse migration(s); "+
+				"they will be rolled back losslessly and the revert re-run from the start",
+			len(unsealed),
+		), nil
+	}
+
+	// A fully-applied inverse train that was never pruned: the history leaf
+	// is a (sealed) inverse row.
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil || latest == nil {
+		return "", err
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return "", err
+	}
+	if leaf.RevertOf != "" {
+		return fmt.Sprintf(
+			"a previous sealed revert applied its inverse migrations (leaf %q) but was "+
+				"interrupted before pruning history; the prune will be completed", leaf.Name,
+		), nil
+	}
+	return "", nil
+}
+
 // RevertSealed executes a sealed-history revert: the synthesized inverse
 // train runs forward through the normal expand/contract engine (so the
 // revert is itself zero-downtime), is completed and drained, and then both
@@ -273,6 +320,10 @@ func (m *Roll) finishSealedRevert(ctx context.Context, to string) (*SealedRevert
 		return nil, nil
 	}
 
+	if boundaryMig, err := m.state.GetMigration(ctx, m.schema, to); err == nil {
+		plan.BoundaryVersionSchema = boundaryMig.VersionSchemaName()
+	}
+
 	m.logger.Info("finishing an interrupted sealed revert", "inverses", len(plan.Inverses))
 	if err := m.pruneSealedRevert(ctx, plan); err != nil {
 		return nil, err
@@ -282,8 +333,29 @@ func (m *Roll) finishSealedRevert(ctx context.Context, to string) (*SealedRevert
 
 // pruneSealedRevert removes the forward migrations and their inverses from
 // history in one transaction, leaving the boundary as the leaf, and ensures
-// its version schema exists.
+// its version schema exists. Before pruning it records re-application
+// tombstones for the forward migrations: pruning makes their unchanged
+// files look unapplied again, and without a tombstone the next convergent
+// deploy would silently re-run the DDL this revert just undid. Recording
+// before the prune is crash-safe — a tombstone for a still-applied
+// migration is inert.
 func (m *Roll) pruneSealedRevert(ctx context.Context, plan *SealedRevertPlan) error {
+	tombstones := make([]state.Tombstone, 0, len(plan.Targets))
+	for _, name := range plan.Targets {
+		mig, err := m.state.GetMigration(ctx, m.schema, name)
+		if err != nil {
+			return fmt.Errorf("unable to load reverted migration %q for its tombstone: %w", name, err)
+		}
+		hash, err := mig.ContentHash()
+		if err != nil {
+			return err
+		}
+		tombstones = append(tombstones, state.Tombstone{Name: name, ContentHash: hash})
+	}
+	if err := m.state.RecordRevertedMigrations(ctx, m.schema, tombstones); err != nil {
+		return err
+	}
+
 	names := make([]string, 0, 2*len(plan.Inverses))
 	names = append(names, plan.Targets...)
 	for _, inv := range plan.Inverses {

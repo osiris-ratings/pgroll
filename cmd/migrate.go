@@ -141,6 +141,36 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("failed to run migrate: %w", err)
 			}
 
+			// Re-application tombstones: a sealed revert prunes its targets
+			// from history, which makes their unchanged files look unapplied
+			// again — re-running them would silently re-apply the DDL the
+			// revert just undid. Refuse while the content still matches the
+			// tombstone; any edit to the file changes the hash and confirms
+			// intent.
+			tombstones, err := m.State().RevertedMigrations(ctx, m.Schema())
+			if err != nil {
+				return fmt.Errorf("failed to check reverted migrations: %w", err)
+			}
+			if len(tombstones) > 0 {
+				for _, mig := range migs {
+					want, ok := tombstones[mig.Name]
+					if !ok {
+						continue
+					}
+					hash, err := mig.ContentHash()
+					if err != nil {
+						return err
+					}
+					if hash == want {
+						return fmt.Errorf(
+							"migration %q was undone by a sealed revert and its content is unchanged; "+
+								"re-applying would re-run the reverted DDL. Edit the migration to confirm "+
+								"intent, or remove it from the migrations directory", mig.Name,
+						)
+					}
+				}
+			}
+
 			backfillConfig := backfill.NewConfig(
 				backfill.WithBatchSize(batchSize),
 				backfill.WithBatchDelay(batchDelay),
@@ -212,6 +242,21 @@ func migrateCmd() *cobra.Command {
 			}
 			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, finalOpts...); err != nil {
 				return err
+			}
+
+			// The batch applied: clear any tombstones its (necessarily
+			// edited) migrations matched by name — the engineer has
+			// confirmed intent and the tombstones have served their purpose.
+			if len(tombstones) > 0 {
+				applied := make([]string, 0, len(migs))
+				for _, mig := range migs {
+					if _, ok := tombstones[mig.Name]; ok {
+						applied = append(applied, mig.Name)
+					}
+				}
+				if err := m.State().ClearRevertedMigrations(ctx, m.Schema(), applied); err != nil {
+					return fmt.Errorf("failed to clear re-application tombstones: %w", err)
+				}
 			}
 
 			return nil

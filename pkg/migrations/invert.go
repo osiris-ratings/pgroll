@@ -75,17 +75,33 @@ func InvertSegment(ctx context.Context, migs []*Migration, base *schema.Schema) 
 
 	fakeDB := &db.FakeDB{}
 	preStates := make([][]*schema.Schema, len(migs))
+	// Raw SQL is opaque to the virtual replay: its Up never mutates the
+	// work schema (the real engine compensates with a physical re-read the
+	// replay does not have). Once a raw-SQL operation has been replayed,
+	// every later pre-state in the segment is untrustworthy for operations
+	// whose inverse reads it — refuse those loudly at plan time instead of
+	// synthesizing a silently wrong restoration.
+	taintedBy := ""
 	for mi, mig := range migs {
 		work.MigrationScope = MigrationScopeFor(mig.Name)
 		preStates[mi] = make([]*schema.Schema, len(mig.Operations))
 		for oi, op := range mig.Operations {
+			if _, isRaw := op.(*OpRawSQL); isRaw {
+				taintedBy = mig.Name
+			} else if taintedBy != "" && invertReadsPreState(op) {
+				return nil, fmt.Errorf(
+					"cannot invert: migration %q contains raw SQL whose schema effects cannot be replayed, "+
+						"so the pre-state for %q in %q is untrustworthy; revert this segment manually or "+
+						"choose a boundary above %q", taintedBy, OperationName(op), mig.Name, taintedBy,
+				)
+			}
 			preStates[mi][oi], err = copySchema(work)
 			if err != nil {
 				return nil, fmt.Errorf("unable to snapshot schema state: %w", err)
 			}
 			preStates[mi][oi].MigrationScope = work.MigrationScope
-			if _, err := op.Start(ctx, NewNoopLogger(), fakeDB, work); err != nil {
-				return nil, fmt.Errorf("unable to replay operation %q of %q: %w", OperationName(op), mig.Name, err)
+			if err := replayStart(ctx, op, mig.Name, fakeDB, work); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -106,6 +122,19 @@ func InvertSegment(ctx context.Context, migs []*Migration, base *schema.Schema) 
 			}
 			ops = append(ops, invOps...)
 		}
+		// Structural validation: the inverse runs through the normal engine,
+		// whose Migration.Validate rejects isolated operations combined with
+		// others. Catch that here, at plan time, rather than mid-train.
+		if len(ops) > 1 {
+			for _, op := range ops {
+				if iso, ok := op.(IsolatedOperation); ok && iso.IsIsolated() {
+					return nil, fmt.Errorf(
+						"internal: synthesized inverse of %q combines isolated operation %q with other operations",
+						mig.Name, OperationName(op),
+					)
+				}
+			}
+		}
 		inverses = append(inverses, &Migration{
 			Name:       "revert_" + mig.Name,
 			Operations: ops,
@@ -116,7 +145,43 @@ func InvertSegment(ctx context.Context, migs []*Migration, base *schema.Schema) 
 	return inverses, nil
 }
 
-// copySchema deep-copies a schema via its JSON representation.
+// replayStart virtually applies an operation's Start to the work schema,
+// converting panics into errors: typed operations dereference tables their
+// Start expects to exist, and a segment whose raw SQL created those objects
+// leaves the virtual schema without them.
+func replayStart(ctx context.Context, op Operation, migName string, fakeDB db.DB, work *schema.Schema) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf(
+				"unable to replay operation %q of %q against the reconstructed schema "+
+					"(it likely references objects created by raw SQL in the segment): %v",
+				OperationName(op), migName, r,
+			)
+		}
+	}()
+	if _, err := op.Start(ctx, NewNoopLogger(), fakeDB, work); err != nil {
+		return fmt.Errorf("unable to replay operation %q of %q: %w", OperationName(op), migName, err)
+	}
+	return nil
+}
+
+// invertReadsPreState reports whether the operation's Invert consults the
+// pre-state snapshot (prior definitions, types, defaults). Only these are
+// at risk from raw-SQL replay blindness; renames, creates, and adds invert
+// from their own fields.
+func invertReadsPreState(op Operation) bool {
+	switch op.(type) {
+	case *OpDropColumn, *OpDropTable, *OpDropIndex, *OpAlterColumn:
+		return true
+	default:
+		return false
+	}
+}
+
+// copySchema deep-copies a schema via its JSON representation, preserving
+// the Deleted markers that json:"-" would otherwise silently drop — losing
+// them resurrects dropped tables/columns in later pre-states, synthesizing
+// inverses that collide mid-train.
 func copySchema(s *schema.Schema) (*schema.Schema, error) {
 	raw, err := json.Marshal(s)
 	if err != nil {
@@ -125,6 +190,24 @@ func copySchema(s *schema.Schema) (*schema.Schema, error) {
 	var out schema.Schema
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
+	}
+	for name, tbl := range s.Tables {
+		if tbl == nil {
+			continue
+		}
+		ot := out.Tables[name]
+		if ot == nil {
+			continue
+		}
+		ot.Deleted = tbl.Deleted
+		for cname, col := range tbl.Columns {
+			if col == nil || !col.Deleted {
+				continue
+			}
+			if oc := ot.Columns[cname]; oc != nil {
+				oc.Deleted = true
+			}
+		}
 	}
 	return &out, nil
 }
@@ -162,15 +245,19 @@ func (o *OpCreateIndex) Invert(_ *schema.Schema) ([]Operation, error) {
 
 // Invert drops the added column. The drop's down expression — which keeps
 // the column derivable while the inverse migration is itself in its expand
-// phase — is the original add's up expression; a nullable column without
-// one falls back to NULL.
+// phase — is the original add's up expression; a column without one falls
+// back to its default, then (if nullable) to NULL.
 func (o *OpAddColumn) Invert(_ *schema.Schema) ([]Operation, error) {
 	down := o.Up
 	if down == "" {
-		if !o.Column.IsNullable() {
-			return nil, fmt.Errorf("add_column %q on %q has no up expression and is not nullable; its inverse drop cannot re-derive values", o.Column.Name, o.Table)
+		switch {
+		case o.Column.HasDefault():
+			down = *o.Column.Default
+		case o.Column.IsNullable():
+			down = "NULL"
+		default:
+			return nil, fmt.Errorf("add_column %q on %q has no up expression, no default, and is not nullable; its inverse drop cannot re-derive values", o.Column.Name, o.Table)
 		}
-		down = "NULL"
 	}
 	return []Operation{&OpDropColumn{Table: o.Table, Column: o.Column.Name, Down: down}}, nil
 }
@@ -200,9 +287,13 @@ func (o *OpDropIndex) Invert(pre *schema.Schema) ([]Operation, error) {
 			if idx.Definition == "" {
 				return nil, fmt.Errorf("index %q has no recorded definition in the parent snapshot", o.Name)
 			}
+			// OnComplete: a bare raw-SQL op IsIsolated and would be rejected
+			// by Migration.Validate when the inverse combines it with other
+			// operations; deferring to the drain also matches forward
+			// semantics (and onComplete structurally forbids down).
 			return []Operation{&OpRawSQL{
-				Up:   idx.Definition,
-				Down: fmt.Sprintf("DROP INDEX IF EXISTS %q", o.Name),
+				Up:         idx.Definition,
+				OnComplete: true,
 			}}, nil
 		}
 	}
@@ -225,6 +316,12 @@ func (o *OpDropColumn) Invert(pre *schema.Schema) ([]Operation, error) {
 	if o.Down == "" {
 		return nil, fmt.Errorf("drop_column %q on %q has no down expression; its inverse add cannot re-derive values", o.Column, o.Table)
 	}
+	if col.Identity != "" {
+		return nil, fmt.Errorf(
+			"column %q on %q was a GENERATED AS IDENTITY column; identity restoration is not supported "+
+				"and recreating it as a plain column would silently break inserts", o.Column, o.Table,
+		)
+	}
 
 	added := Column{
 		Name:     o.Column,
@@ -232,6 +329,15 @@ func (o *OpDropColumn) Invert(pre *schema.Schema) ([]Operation, error) {
 		Nullable: col.Nullable,
 		Default:  col.Default,
 		Unique:   col.Unique,
+	}
+	// A serial column's owned sequence was dropped with the column; the
+	// default would reference a nonexistent regclass and the re-add would
+	// fail. Recreate via the serial pseudo-type, which recreates the
+	// sequence too. The new sequence restarts at 1 — callers re-derive the
+	// column's values via down, but future inserts draw fresh numbers.
+	if st, ok := serialTypeFor(col, o.Table, o.Column); ok {
+		added.Type = st
+		added.Default = nil
 	}
 	if col.Comment != "" {
 		added.Comment = &col.Comment
@@ -327,6 +433,13 @@ func (o *OpDropTable) Invert(pre *schema.Schema) ([]Operation, error) {
 		if c == nil || c.Deleted {
 			continue
 		}
+		if c.Identity != "" {
+			return nil, fmt.Errorf(
+				"column %q on dropped table %q was a GENERATED AS IDENTITY column; identity restoration "+
+					"is not supported and recreating it as a plain column would silently break inserts",
+				key, o.Name,
+			)
+		}
 		col := Column{
 			Name:     key,
 			Type:     c.Type,
@@ -334,6 +447,15 @@ func (o *OpDropTable) Invert(pre *schema.Schema) ([]Operation, error) {
 			Default:  c.Default,
 			Unique:   c.Unique,
 			Pk:       slices.Contains(table.PrimaryKey, key),
+		}
+		// Serial columns: the owned sequence was dropped with the table, so
+		// the recorded nextval default references a nonexistent regclass and
+		// CREATE TABLE would fail. Recreate via the serial pseudo-type
+		// (which recreates the sequence; it restarts at 1 — the table comes
+		// back empty, so only the counter is lost).
+		if st, ok := serialTypeFor(c, o.Name, key); ok {
+			col.Type = st
+			col.Default = nil
 		}
 		if c.Comment != "" {
 			comment := c.Comment
@@ -404,13 +526,42 @@ func (o *OpDropTable) Invert(pre *schema.Schema) ([]Operation, error) {
 		if idx.Definition == "" {
 			return nil, fmt.Errorf("index %q on dropped table %q has no recorded definition", idx.Name, o.Name)
 		}
+		// OnComplete: see OpDropIndex.Invert — a non-onComplete raw-SQL op
+		// IsIsolated and Migration.Validate rejects it alongside the
+		// create_table, which made every drop_table with a secondary index
+		// uninvertible.
 		ops = append(ops, &OpRawSQL{
-			Up:   idx.Definition,
-			Down: fmt.Sprintf("DROP INDEX IF EXISTS %q", idx.Name),
+			Up:         idx.Definition,
+			OnComplete: true,
 		})
 	}
 
 	return ops, nil
+}
+
+// serialTypeFor maps an integer column whose default draws from the
+// sequence pgroll/Postgres would own for (table, column) — the serial
+// pattern — to the serial pseudo-type that recreates both the column and
+// its owned sequence. Defaults drawing from other (shared) sequences are
+// returned unchanged: those sequences are not owned by the dropped object
+// and survive it.
+func serialTypeFor(c *schema.Column, table, column string) (string, bool) {
+	if c.Default == nil {
+		return "", false
+	}
+	def := *c.Default
+	if !strings.Contains(def, "nextval(") || !strings.Contains(def, fmt.Sprintf("%s_%s_seq", table, column)) {
+		return "", false
+	}
+	switch c.Type {
+	case "integer", "int4", "int":
+		return "serial", true
+	case "bigint", "int8":
+		return "bigserial", true
+	case "smallint", "int2":
+		return "smallserial", true
+	}
+	return "", false
 }
 
 // stripCheckDefinition extracts the bare expression from a

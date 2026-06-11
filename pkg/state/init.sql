@@ -225,6 +225,20 @@ END IF;
 END
 $$;
 
+-- Re-application tombstones. A sealed revert prunes the reverted forward
+-- migrations from history, which makes their unchanged files look unapplied
+-- again — the next deploy would silently re-run the DDL the revert just
+-- undid. Each sealed revert records (name, content hash) here; `pgroll
+-- migrate` refuses to re-apply a migration whose content still matches its
+-- tombstone, and clears the tombstone when a changed version applies.
+CREATE TABLE IF NOT EXISTS placeholder.reverted_migrations (
+    schema NAME NOT NULL,
+    name text NOT NULL,
+    content_hash text NOT NULL,
+    reverted_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (schema, name)
+);
+
 -- Table to track pgroll binary version
 CREATE TABLE IF NOT EXISTS placeholder.pgroll_version (
     version text NOT NULL,
@@ -380,7 +394,11 @@ BEGIN
                                             json_object_agg(name, c)
                                     FROM (
                                         SELECT
-                                            attr.attname AS name, CASE WHEN attr.attgenerated = '' THEN
+                                            attr.attname AS name, CASE WHEN attr.attidentity <> '' THEN
+                                                attr.attidentity
+                                            ELSE
+                                                NULL
+                                            END AS IDENTITY, CASE WHEN attr.attgenerated = '' THEN
                                                 pg_get_expr(def.adbin, def.adrelid)
                                             ELSE
                                                 NULL

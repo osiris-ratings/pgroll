@@ -138,8 +138,45 @@ func revertCmd() *cobra.Command {
 }
 
 // runSealedRevert drives a revert of sealed history: plan, loud preview,
-// confirmation, execution.
+// confirmation, execution. If a previous sealed revert was interrupted, it
+// resumes that run instead — PlanRevertSealed refuses exactly the states an
+// interruption leaves behind (open window of inverse rows, unpruned inverse
+// leaf), so the resume check must come first or the in-engine recovery in
+// RevertSealed is unreachable.
 func runSealedRevert(ctx context.Context, m *roll.Roll, to string, yes bool) error {
+	resume, err := m.PendingSealedRevertResume(ctx)
+	if err != nil {
+		return err
+	}
+	if resume != "" {
+		pterm.Warning.Printfln("Resuming an interrupted sealed revert: %s.", resume)
+		if !yes {
+			ok, _ := pterm.DefaultInteractiveConfirm.Show("Resume the interrupted sealed revert?")
+			if !ok {
+				return nil
+			}
+		}
+		sp, _ := pterm.DefaultSpinner.WithText("Resuming sealed revert...").Start()
+		result, err := m.RevertSealed(ctx, to, nil)
+		if err != nil {
+			sp.Fail(fmt.Sprintf("Failed to resume: %s", err))
+			return err
+		}
+		if result == nil {
+			sp.Success("Nothing to revert.")
+			return nil
+		}
+		sp.Success(fmt.Sprintf("Reverted %d sealed migration(s)", len(result.Targets)))
+		for _, t := range result.Targets {
+			fmt.Fprintf(os.Stdout, "    %s %s\n", pterm.FgGreen.Sprint("✓"), t)
+		}
+		if result.BoundaryVersionSchema != "" {
+			fmt.Printf("\nDatabase restored. Live version schema: %s\n",
+				roll.VersionedSchemaName(m.Schema(), result.BoundaryVersionSchema))
+		}
+		return nil
+	}
+
 	plan, err := m.PlanRevertSealed(ctx, to)
 	if err != nil {
 		return err

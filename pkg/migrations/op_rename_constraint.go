@@ -9,7 +9,10 @@ import (
 	"github.com/xataio/pgroll/pkg/schema"
 )
 
-var _ Operation = (*OpRenameConstraint)(nil)
+var (
+	_ Operation             = (*OpRenameConstraint)(nil)
+	_ CompletedRollbackable = (*OpRenameConstraint)(nil)
+)
 
 func (o *OpRenameConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
@@ -30,8 +33,23 @@ func (o *OpRenameConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 func (o *OpRenameConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
 
-	// no-op
+	// no-op: the rename only happens at Complete, so there is nothing to
+	// undo while the migration is still in its expand phase.
 	return nil, nil
+}
+
+// RollbackCompleted undoes a rename_constraint whose Complete has already
+// run: the physical rename happened, so renaming To back to From restores
+// the prior schema. Without this, an inline-completed rename_constraint
+// reverted as a silent no-op — the history row was deleted while the
+// constraint kept its new name, and re-applying the train failed Validate
+// because From no longer existed.
+func (o *OpRenameConstraint) RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
+	l.LogOperationRollback(o)
+
+	return []DBAction{
+		NewRenameConstraintAction(conn, o.Table, o.To, o.From),
+	}, nil
 }
 
 func (o *OpRenameConstraint) Validate(ctx context.Context, s *schema.Schema) error {

@@ -72,17 +72,41 @@ func (s *State) UnsealedMigrations(ctx context.Context, schema string) ([]*Migra
 	return out, nil
 }
 
-// MarkSealed stamps every unsealed done migration as sealed. Called when the
-// deferred-complete queue drains (the previous deployment's contraction has
-// physically run) — sealed rows are past the point of no return and must
-// never be reverted.
-func (s *State) MarkSealed(ctx context.Context, schema string) error {
-	_, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
+// MarkSealed stamps every unsealed done migration as sealed and returns the
+// number of rows stamped. Called at the *start* of a drain (seal at intent:
+// the stamp must precede any contraction DDL, so that no crash window can
+// leave a physically-contracted row looking revertible) and again after a
+// non-deferred Complete (to stamp the just-completed row itself). Sealed
+// rows are past the point of no return and must never be reverted.
+func (s *State) MarkSealed(ctx context.Context, schema string) (int64, error) {
+	res, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
 		"UPDATE %s.migrations SET sealed=TRUE WHERE schema=$1 AND sealed=FALSE AND done=TRUE",
 		pq.QuoteIdentifier(s.schema),
 	), schema)
 	if err != nil {
-		return fmt.Errorf("unable to mark migrations sealed: %w", err)
+		return 0, fmt.Errorf("unable to mark migrations sealed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("unable to count sealed migrations: %w", err)
+	}
+	return n, nil
+}
+
+// MarkSealedByName stamps the named migrations as sealed. Used to heal
+// stranded rows (drained defer-class migrations left unsealed by a crash
+// between a Complete's drain and its seal stamp on an older binary) without
+// touching other unsealed rows, whose window may legitimately still be open.
+func (s *State) MarkSealedByName(ctx context.Context, schema string, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	_, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s.migrations SET sealed=TRUE WHERE schema=$1 AND name = ANY($2)",
+		pq.QuoteIdentifier(s.schema),
+	), schema, pq.Array(names))
+	if err != nil {
+		return fmt.Errorf("unable to mark migrations sealed by name: %w", err)
 	}
 	return nil
 }
