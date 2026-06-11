@@ -9,6 +9,7 @@ import (
 
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/schema"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 // RevertTargetState classifies how a migration in the revertible window will
@@ -66,25 +67,61 @@ func WithRevertTo(name string) RevertOption {
 	return func(o *revertOptions) { o.to = name }
 }
 
-// RevertTargets computes the revertible window: every unsealed migration,
-// newest first. The window is the most recent deployment — sealing (the
-// next train departing, or a manual `pgroll complete`) is the point of no
-// return that closes it.
+// RevertTargets computes the revertible window: the contiguous unsealed
+// suffix of history, walked parent-ward from the leaf, newest first. The
+// window is the most recent deployment — sealing (the next train departing,
+// or a manual `pgroll complete`) is the point of no return that closes it.
+//
+// The walk is anchored at the actual history leaf rather than trusting row
+// order: a sealed row sitting ABOVE unsealed rows (an inferred DDL capture
+// or a `pgroll stamp` landing while the window was open) means the window is
+// no longer the history suffix, and reverting a non-leaf would execute
+// destructive rollback DDL only to fail on the parent FK at the history
+// delete. Refused up front instead.
 //
 // Returns an error if the window contains rows that cannot be reverted:
-// inferred DDL captures, or completed destructive migrations left unsealed
-// by an interrupted seal (resume the seal instead of reverting).
+// inferred DDL captures, migrations marked irreversible, or completed
+// destructive migrations left unsealed by an interrupted seal on an older
+// binary (re-run the seal instead of reverting).
 func (m *Roll) RevertTargets(ctx context.Context) ([]RevertTarget, error) {
 	records, err := m.state.UnsealedMigrations(ctx, m.schema)
 	if err != nil {
 		return nil, err
 	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	byName := make(map[string]*state.MigrationRecord, len(records))
+	for _, r := range records {
+		byName[r.Name] = r
+	}
+
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine latest migration: %w", err)
+	}
+	if latest == nil || byName[*latest] == nil {
+		leaf := "(none)"
+		if latest != nil {
+			leaf = *latest
+		}
+		return nil, fmt.Errorf(
+			"history has advanced past the revert window: the leaf %q is sealed but %d unsealed "+
+				"migration(s) sit beneath it (out-of-band DDL was captured, or history was stamped, "+
+				"while the window was open); run `pgroll complete` to seal the window",
+			leaf, len(records),
+		)
+	}
 
 	targets := make([]RevertTarget, 0, len(records))
-	for _, r := range records {
-		// Defensive: baselines and inferred rows are sealed at insert, but
-		// guard against manually manipulated state.
+	visited := 0
+	for name := *latest; ; {
+		r := byName[name]
+		// Defensive: baselines are sealed at insert, but guard against
+		// manually manipulated state — a baseline bounds the walk.
 		if r.MigrationType == MigrationTypeBaseline {
+			visited++
 			break
 		}
 		if r.MigrationType == MigrationTypeInferred {
@@ -93,13 +130,19 @@ func (m *Roll) RevertTargets(ctx context.Context) ([]RevertTarget, error) {
 					"run `pgroll complete` to seal it", r.Name,
 			)
 		}
+		if r.Migration.Irreversible {
+			return nil, fmt.Errorf(
+				"migration %q is marked irreversible and cannot be reverted; "+
+					"run `pgroll complete` to seal the window", r.Name,
+			)
+		}
 
-		var state RevertTargetState
+		var targetState RevertTargetState
 		switch {
 		case !r.Done:
-			state = RevertStateInProgress
+			targetState = RevertStateInProgress
 		case r.CompleteDeferred:
-			state = RevertStateDeferred
+			targetState = RevertStateDeferred
 		default:
 			if r.Migration.CompleteMustBeDeferred() {
 				return nil, fmt.Errorf(
@@ -108,18 +151,47 @@ func (m *Roll) RevertTargets(ctx context.Context) ([]RevertTarget, error) {
 						"to finish draining before reverting", r.Name,
 				)
 			}
-			state = RevertStateApplied
+			targetState = RevertStateApplied
 		}
 
 		targets = append(targets, RevertTarget{
 			Name:           r.Name,
-			State:          state,
+			State:          targetState,
 			OperationCount: len(r.Migration.Operations),
 			VersionSchema:  r.Migration.VersionSchemaName(),
 			Parent:         r.Parent,
 			migration:      r.Migration,
 		})
+		visited++
+
+		if r.Parent == nil {
+			break
+		}
+		if _, ok := byName[*r.Parent]; !ok {
+			break // parent is sealed: the window's lower boundary
+		}
+		name = *r.Parent
 	}
+
+	// Every unsealed row must have been reached by the leaf-anchored walk;
+	// leftovers mean the unsealed set is not a contiguous suffix of history.
+	if visited != len(records) {
+		stray := make([]string, 0, len(records)-visited)
+		seen := make(map[string]bool, len(targets))
+		for _, t := range targets {
+			seen[t.Name] = true
+		}
+		for _, r := range records {
+			if !seen[r.Name] && r.MigrationType != MigrationTypeBaseline {
+				stray = append(stray, r.Name)
+			}
+		}
+		return nil, fmt.Errorf(
+			"the revert window is not contiguous: unsealed migration(s) %v are not ancestors of the "+
+				"leaf %q; run `pgroll complete` to seal the window", stray, *latest,
+		)
+	}
+
 	return targets, nil
 }
 
