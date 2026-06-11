@@ -4,6 +4,7 @@ package migrations
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/oapi-codegen/nullable"
@@ -125,7 +126,11 @@ func TestInvertOperations(t *testing.T) {
 		raw, ok := inv.(*OpRawSQL)
 		require.True(t, ok)
 		assert.Contains(t, raw.Up, "CREATE INDEX idx_users_email")
-		assert.Contains(t, raw.Down, "DROP INDEX")
+		// OnComplete: a bare raw-SQL op IsIsolated and would be rejected by
+		// Migration.Validate when combined with other inverse operations
+		// (e.g. inside a drop_table inverse); onComplete forbids down.
+		assert.True(t, raw.OnComplete)
+		assert.Empty(t, raw.Down)
 	})
 
 	t.Run("drop unknown index refuses", func(t *testing.T) {
@@ -299,4 +304,203 @@ func TestMigrationInvert(t *testing.T) {
 		_, err := mig.Invert(ctx, invertFixtureSchema())
 		require.ErrorContains(t, err, "does not support inversion")
 	})
+
+	t.Run("drop_table inverse combines no isolated operations", func(t *testing.T) {
+		// The synthesized index restore must be onComplete raw SQL: a bare
+		// raw-SQL op IsIsolated, and Migration.Validate rejects isolated ops
+		// combined with the create_table — making every drop_table with a
+		// secondary index uninvertible mid-train.
+		mig := &Migration{
+			Name:       "03_drop_users",
+			Operations: Operations{&OpDropTable{Name: "users"}},
+		}
+		inv, err := mig.Invert(ctx, invertFixtureSchema())
+		require.NoError(t, err)
+		require.Greater(t, len(inv.Operations), 1)
+		for _, op := range inv.Operations {
+			if iso, ok := op.(IsolatedOperation); ok {
+				assert.False(t, iso.IsIsolated(), "synthesized inverse op %q is isolated", OperationName(op))
+			}
+		}
+	})
+}
+
+func TestInvertSegmentFidelity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("deleted columns stay deleted across pre-state snapshots", func(t *testing.T) {
+		// drop_column email, then drop_table users: the table recreation in
+		// the drop_table inverse must NOT resurrect email — its Deleted
+		// marker is json:"-" and a naive JSON deep-copy of the work schema
+		// silently loses it, synthesizing an add_column collision mid-train.
+		segment := []*Migration{
+			{Name: "01_drop_email", Operations: Operations{
+				&OpDropColumn{Table: "users", Column: "email", Down: "''"},
+			}},
+			{Name: "02_drop_users", Operations: Operations{
+				&OpDropTable{Name: "users"},
+			}},
+		}
+		inverses, err := InvertSegment(ctx, segment, invertFixtureSchema())
+		require.NoError(t, err)
+		require.Len(t, inverses, 2)
+
+		create, ok := inverses[0].Operations[0].(*OpCreateTable)
+		require.True(t, ok, "newest-first: the drop_table inverse comes first")
+		for _, c := range create.Columns {
+			assert.NotEqual(t, "email", c.Name, "deleted column resurrected in the recreated table")
+		}
+	})
+
+	t.Run("raw SQL taints pre-states for snapshot-reading inverses", func(t *testing.T) {
+		segment := []*Migration{
+			{Name: "01_raw", Operations: Operations{
+				&OpRawSQL{Up: "ALTER TABLE users ADD COLUMN extra text", Down: "ALTER TABLE users DROP COLUMN extra"},
+			}},
+			{Name: "02_drop_email", Operations: Operations{
+				&OpDropColumn{Table: "users", Column: "email", Down: "''"},
+			}},
+		}
+		_, err := InvertSegment(ctx, segment, invertFixtureSchema())
+		require.ErrorContains(t, err, "untrustworthy")
+	})
+
+	t.Run("raw SQL does not taint inverses that ignore pre-state", func(t *testing.T) {
+		segment := []*Migration{
+			{Name: "01_raw", Operations: Operations{
+				&OpRawSQL{Up: "UPDATE users SET score = 0 WHERE score IS NULL", Down: "SELECT 1"},
+			}},
+			{Name: "02_rename", Operations: Operations{
+				&OpRenameColumn{Table: "users", From: "email", To: "contact"},
+			}},
+		}
+		inverses, err := InvertSegment(ctx, segment, invertFixtureSchema())
+		require.NoError(t, err)
+		require.Len(t, inverses, 2)
+	})
+
+	t.Run("replaying a typed op against raw-SQL-created objects errors instead of panicking", func(t *testing.T) {
+		segment := []*Migration{
+			{Name: "01_raw_create", Operations: Operations{
+				&OpRawSQL{Up: "CREATE TABLE widgets (id int)", Down: "DROP TABLE widgets"},
+			}},
+			{Name: "02_rename_widgets", Operations: Operations{
+				&OpRenameColumn{Table: "widgets", From: "id", To: "widget_id"},
+			}},
+		}
+		_, err := InvertSegment(ctx, segment, invertFixtureSchema())
+		require.Error(t, err)
+		require.ErrorContains(t, err, "replay")
+	})
+}
+
+func TestInvertSequenceAndIdentityColumns(t *testing.T) {
+	t.Parallel()
+
+	serialFixture := func() *schema.Schema {
+		return &schema.Schema{
+			Name: "public",
+			Tables: map[string]*schema.Table{
+				"orders": {
+					Name: "orders",
+					Columns: map[string]*schema.Column{
+						"id":   {Name: "id", Type: "integer", Default: ptrString("nextval('orders_id_seq'::regclass)")},
+						"note": {Name: "note", Type: "text", Nullable: true},
+					},
+					PrimaryKey: []string{"id"},
+				},
+			},
+		}
+	}
+
+	t.Run("drop_table recreates serial columns via the serial pseudo-type", func(t *testing.T) {
+		// The owned sequence was dropped with the table; carrying the
+		// recorded nextval default verbatim references a nonexistent
+		// regclass and the CREATE TABLE fails mid-inverse-train.
+		ops, err := (&OpDropTable{Name: "orders"}).Invert(serialFixture())
+		require.NoError(t, err)
+		create, ok := ops[0].(*OpCreateTable)
+		require.True(t, ok)
+		byName := map[string]Column{}
+		for _, c := range create.Columns {
+			byName[c.Name] = c
+		}
+		assert.Equal(t, "serial", byName["id"].Type)
+		assert.Nil(t, byName["id"].Default)
+	})
+
+	t.Run("drop_column of a serial column re-adds via the serial pseudo-type", func(t *testing.T) {
+		inv, err := (&OpDropColumn{Table: "orders", Column: "id", Down: "0"}).Invert(serialFixture())
+		require.NoError(t, err)
+		add, ok := inv[0].(*OpAddColumn)
+		require.True(t, ok)
+		assert.Equal(t, "serial", add.Column.Type)
+		assert.Nil(t, add.Column.Default)
+	})
+
+	t.Run("shared (non-owned) sequence defaults are carried verbatim", func(t *testing.T) {
+		fix := serialFixture()
+		fix.Tables["orders"].Columns["id"].Default = ptrString("nextval('global_seq'::regclass)")
+		ops, err := (&OpDropTable{Name: "orders"}).Invert(fix)
+		require.NoError(t, err)
+		create, ok := ops[0].(*OpCreateTable)
+		require.True(t, ok)
+		for _, c := range create.Columns {
+			if c.Name == "id" {
+				require.NotNil(t, c.Default)
+				assert.Contains(t, *c.Default, "global_seq")
+			}
+		}
+	})
+
+	t.Run("identity columns refuse inversion loudly", func(t *testing.T) {
+		fix := serialFixture()
+		fix.Tables["orders"].Columns["id"].Identity = "a"
+		fix.Tables["orders"].Columns["id"].Default = nil
+
+		_, err := (&OpDropTable{Name: "orders"}).Invert(fix)
+		require.ErrorContains(t, err, "IDENTITY")
+
+		_, err = (&OpDropColumn{Table: "orders", Column: "id", Down: "0"}).Invert(fix)
+		require.ErrorContains(t, err, "IDENTITY")
+	})
+}
+
+func TestInvertAddColumnDefaultFallback(t *testing.T) {
+	t.Parallel()
+	pre := invertFixtureSchema()
+
+	t.Run("NOT NULL column with default and no up falls back to the default", func(t *testing.T) {
+		inv := singleInverse(t, &OpAddColumn{
+			Table:  "users",
+			Column: Column{Name: "flag", Type: "boolean", Nullable: false, Default: ptrString("false")},
+		}, pre)
+		drop, ok := inv.(*OpDropColumn)
+		require.True(t, ok)
+		assert.Equal(t, "false", drop.Down)
+	})
+}
+
+func TestRevertOfSurvivesHistoryRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// The sealed-revert orchestrator's crash recovery identifies leftover
+	// inverse rows in history by RevertOf; it must survive the stored-JSON →
+	// RawMigration → ParseMigration round-trip or the resume becomes a
+	// double-inverse re-execution.
+	stored, err := json.Marshal(&Migration{
+		Name:       "revert_01_drop_email",
+		Operations: Operations{&OpRawSQL{Up: "SELECT 1", OnComplete: true}},
+		RevertOf:   "01_drop_email",
+	})
+	require.NoError(t, err)
+
+	var raw RawMigration
+	require.NoError(t, json.Unmarshal(stored, &raw))
+	raw.Name = "revert_01_drop_email"
+
+	parsed, err := ParseMigration(&raw)
+	require.NoError(t, err)
+	assert.Equal(t, "01_drop_email", parsed.RevertOf)
 }

@@ -380,7 +380,11 @@ BEGIN
                                             json_object_agg(name, c)
                                     FROM (
                                         SELECT
-                                            attr.attname AS name, CASE WHEN attr.attgenerated = '' THEN
+                                            attr.attname AS name, CASE WHEN attr.attidentity <> '' THEN
+                                                attr.attidentity
+                                            ELSE
+                                                NULL
+                                            END AS IDENTITY, CASE WHEN attr.attgenerated = '' THEN
                                                 pg_get_expr(def.adbin, def.adrelid)
                                             ELSE
                                                 NULL
