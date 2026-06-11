@@ -10,6 +10,7 @@ import (
 
 	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/migrations"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 // SealedRevertPlan describes a revert of SEALED history: the forward
@@ -332,8 +333,29 @@ func (m *Roll) finishSealedRevert(ctx context.Context, to string) (*SealedRevert
 
 // pruneSealedRevert removes the forward migrations and their inverses from
 // history in one transaction, leaving the boundary as the leaf, and ensures
-// its version schema exists.
+// its version schema exists. Before pruning it records re-application
+// tombstones for the forward migrations: pruning makes their unchanged
+// files look unapplied again, and without a tombstone the next convergent
+// deploy would silently re-run the DDL this revert just undid. Recording
+// before the prune is crash-safe — a tombstone for a still-applied
+// migration is inert.
 func (m *Roll) pruneSealedRevert(ctx context.Context, plan *SealedRevertPlan) error {
+	tombstones := make([]state.Tombstone, 0, len(plan.Targets))
+	for _, name := range plan.Targets {
+		mig, err := m.state.GetMigration(ctx, m.schema, name)
+		if err != nil {
+			return fmt.Errorf("unable to load reverted migration %q for its tombstone: %w", name, err)
+		}
+		hash, err := mig.ContentHash()
+		if err != nil {
+			return err
+		}
+		tombstones = append(tombstones, state.Tombstone{Name: name, ContentHash: hash})
+	}
+	if err := m.state.RecordRevertedMigrations(ctx, m.schema, tombstones); err != nil {
+		return err
+	}
+
 	names := make([]string, 0, 2*len(plan.Inverses))
 	names = append(names, plan.Targets...)
 	for _, inv := range plan.Inverses {

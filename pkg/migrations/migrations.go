@@ -4,6 +4,8 @@ package migrations
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -116,6 +118,21 @@ type (
 		BackfillTask *backfill.Task
 	}
 )
+
+// ContentHash returns a deterministic hash of the migration's content (its
+// canonical JSON form; the name is excluded by its json:"-" tag and tracked
+// separately). Used by re-application tombstones: a sealed revert records
+// the hash of what it undid, and `pgroll migrate` refuses to re-apply a
+// same-named migration whose content still matches — any edit changes the
+// hash and confirms intent.
+func (m *Migration) ContentHash() (string, error) {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("unable to marshal migration %q for hashing: %w", m.Name, err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
 
 // VersionSchemaName returns the version schema name for the migration.
 // It defaults to the migration name if no version schema is set.
