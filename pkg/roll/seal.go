@@ -31,20 +31,30 @@ import (
 // `--complete` drain has always had, shifted one deployment later.
 //
 // Returns the number of deferred migrations drained. Idempotent and
-// crash-safe: every drained migration except the last clears its flag
-// independently, so a re-run resumes where the previous attempt stopped;
-// the last migration's flag clears only after the live projection has been
-// recreated and the boundary snapshot refreshed, so no crash can leave the
-// queue empty with the live schema missing. Re-running already-applied
-// Complete actions is safe — they are idempotent by construction (catalog
-// probes guard renames and constraint adds).
+// crash-safe under one invariant: *sealed precedes contraction*. Every
+// queued row is stamped sealed before any contraction DDL runs, so no crash
+// window can leave a physically-contracted row looking revertible —
+// `pgroll revert` refuses sealed rows, and the still-set complete_deferred
+// flags drive the resume: a re-run picks up where the previous attempt
+// stopped. The last migration's flag clears only after the live projection
+// has been recreated and the boundary snapshot refreshed, so no crash can
+// leave the queue empty with the live schema missing. Re-running
+// already-applied Complete actions is safe — they are idempotent by
+// construction (catalog probes guard renames and constraint adds).
 func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 	queued, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return 0, fmt.Errorf("unable to query deferred completes: %w", err)
 	}
 	if len(queued) == 0 {
-		return 0, nil
+		// Nothing to drain — but heal strands: drained defer-class rows
+		// left done-and-unsealed by a crash between an older binary's
+		// Complete drain and its (post-drain) seal stamp. Those rows brick
+		// every revert (the window guard refuses them) and no drain will
+		// ever stamp them, since the queue is empty. Inline-class unsealed
+		// rows are NOT touched: their window may legitimately still be
+		// open (e.g. a bounded revert re-opened the train).
+		return 0, m.sealStrandedCompletes(ctx)
 	}
 
 	// The live projection belongs to the latest done migration — under
@@ -70,6 +80,16 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 
 	m.logger.Info("sealing previous deployment: draining deferred completes",
 		"count", len(queued), "live", live.Name)
+
+	// Seal at intent: stamp the whole deployment (deferred and inline rows
+	// alike) BEFORE any contraction DDL runs. From this point `pgroll
+	// revert` refuses every row, so no crash window below can present a
+	// physically-contracted row as losslessly revertible. The still-set
+	// complete_deferred flags — not the sealed bit — drive the resume of an
+	// interrupted seal.
+	if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
+		return 0, err
+	}
 
 	if !m.disableVersionSchemas {
 		// Reap every version schema except the live one, then drop the live
@@ -112,15 +132,6 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Stamp the whole drained deployment (deferred and inline rows alike) as
-	// sealed — past the point of no return for `pgroll revert`. Stamped
-	// before the last flag clears: a crash in between leaves a sealed row
-	// still in the queue, so revert refuses (contraction partially ran) and
-	// a re-run of the seal finishes the job.
-	if err := m.state.MarkSealed(ctx, m.schema); err != nil {
-		return 0, err
-	}
-
 	if err := m.state.ClearCompleteDeferred(ctx, m.schema, last.Name); err != nil {
 		return 0, fmt.Errorf("unable to clear complete_deferred for %q: %w", last.Name, err)
 	}
@@ -128,4 +139,39 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 	m.logger.Info("previous deployment sealed", "drained", len(queued))
 
 	return len(queued), nil
+}
+
+// sealStrandedCompletes stamps drained-but-unsealed defer-class rows: done
+// migrations with destructive (defer-class) operations whose complete_deferred
+// flag has cleared but which were never sealed. That state arises only from a
+// crash between a drain and its seal stamp on an older binary (current code
+// stamps before draining) or from manual state manipulation — the row's
+// contraction has physically run, so it must be sealed, and the revert-window
+// guard refuses every revert until it is.
+func (m *Roll) sealStrandedCompletes(ctx context.Context) error {
+	records, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return err
+	}
+	var stranded []string
+	for _, r := range records {
+		if r.Done && !r.CompleteDeferred && r.Migration.CompleteMustBeDeferred() {
+			stranded = append(stranded, r.Name)
+		}
+	}
+	if len(stranded) == 0 {
+		return nil
+	}
+	m.logger.Info("sealing stranded drained migrations from an interrupted complete", "migrations", stranded)
+	return m.state.MarkSealedByName(ctx, m.schema, stranded)
+}
+
+// SealWindow stamps every unsealed done migration as sealed without draining
+// anything, returning the number of rows stamped. This is the explicit
+// "close the revert window now" affordance for windows with nothing queued —
+// e.g. an inline-only window left by a bounded revert. `pgroll complete`
+// uses it after SealDeferredCompletes so a manual seal always closes the
+// window completely.
+func (m *Roll) SealWindow(ctx context.Context) (int64, error) {
+	return m.state.MarkSealed(ctx, m.schema)
 }

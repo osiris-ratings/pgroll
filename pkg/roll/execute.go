@@ -494,6 +494,14 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		if len(queued) > 0 {
 			m.logger.Info("draining deferred completes", "count", len(queued))
 
+			// Seal at intent: stamp every done row sealed BEFORE the drain's
+			// contraction DDL runs, so no crash window can leave a drained
+			// row looking losslessly revertible. The active migration itself
+			// is not yet done and is stamped by the post-Complete seal below.
+			if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
+				return err
+			}
+
 			// Drop the active migration's version schema (and its views)
 			// before drain runs. Drain DDL frequently drops/renames
 			// user-facing columns the active version schema's views
@@ -597,12 +605,14 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 
 	// A non-deferred Complete is a seal point: this migration's own
 	// contraction ran, and the drain above flushed any queued deferred
-	// completes. Everything done is now past the point of no return for
-	// `pgroll revert`. Inline intermediates (WithSkipSchemaDrop) skip this —
-	// their Completes touch only pgroll-internal artifacts and they remain
-	// revertible until their train seals.
+	// completes (stamped sealed before the drain). This second stamp covers
+	// the just-completed migration itself, which only became done at
+	// state.Complete above. A crash between state.Complete and here leaves
+	// it unsealed: if inline-class, it stays correctly revertible
+	// (RevertStateApplied); if defer-class, the revert-window guard refuses
+	// it and the next seal's strand-heal stamps it.
 	if !o.skipSchemaDrop {
-		if err := m.state.MarkSealed(ctx, m.schema); err != nil {
+		if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 			return err
 		}
 	}
