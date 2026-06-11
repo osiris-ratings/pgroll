@@ -103,6 +103,12 @@ type (
 		DependsOn     []string        `json:"depends_on,omitempty"`
 		Preconditions []Precondition  `json:"preconditions,omitempty"`
 		Irreversible  bool            `json:"irreversible,omitempty"`
+		// RevertOf mirrors Migration.RevertOf. It MUST survive the
+		// SchemaHistory → RawMigration → ParseMigration round-trip: the
+		// sealed-revert orchestrator's crash recovery identifies leftover
+		// inverse rows in history by this field, and losing it turns an
+		// interrupted revert's resume into a double-inverse re-execution.
+		RevertOf string `json:"revert_of,omitempty"`
 	}
 
 	StartResult struct {
