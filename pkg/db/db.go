@@ -76,6 +76,14 @@ func (db *RDB) retryBudget() time.Duration {
 	return db.LockRetryTimeout
 }
 
+// RetryBudget returns the effective wall-clock budget for lock_timeout
+// retries (negative when retries are disabled). Exposed so long-running
+// operations like concurrent index builds can align their own deadlines
+// with the retry layer instead of inventing a second budget.
+func (db *RDB) RetryBudget() time.Duration {
+	return db.retryBudget()
+}
+
 // ExecContext wraps sql.DB.ExecContext, retrying queries on lock_timeout
 // errors up to the configured retry budget.
 func (db *RDB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
