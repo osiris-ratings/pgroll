@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrent index builds now honor the lock-retry budget (ENG-6174). A
+  failed build leaves an INVALID index that `CREATE ... IF NOT EXISTS`
+  silently no-ops against, which defeated the retry layer and capped
+  effective retries at ~6 seconds regardless of the configured budget.
+  Invalid leftovers are healed before and between attempts, and the
+  attempt loop is deadline-driven.
+- During a concurrent index build the session `lock_timeout` is raised to
+  the retry budget (and restored afterwards): CIC's locks block no
+  application traffic, so the aggressive timeout that protects
+  strong-lock DDL only caused create/drop churn here.
+
+### Added
+
+- When a concurrent index build fails, the error now lists the oldest
+  snapshot-holding sessions from `pg_stat_activity` (pid, source, state,
+  transaction age, query) — the transactions the build must out-wait,
+  regardless of which tables they touch.
+
 ## [0.16.2-baselayer.7] - 2026-06-11
 
 ## [0.16.2-baselayer.6] - 2026-06-11

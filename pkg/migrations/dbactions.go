@@ -358,32 +358,54 @@ func NewCreateIndexConcurrentlyAction(conn db.DB, table, name, method string, un
 func (a *createIndexConcurrentlyAction) ID() string { return a.id }
 
 func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
-	quotedIndexName := pq.QuoteIdentifier(a.name)
+	return buildIndexConcurrently(ctx, a.conn, a.name, pq.QuoteIdentifier(a.name), a.buildCreateIndexSQL())
+}
 
-	for range 5 {
-		createSQL := a.buildCreateIndexSQL()
-		if _, err := a.conn.ExecContext(ctx, createSQL); err != nil {
-			return fmt.Errorf("failed to create index %q: %w", a.name, err)
-		}
+// buildIndexConcurrently runs a CREATE [UNIQUE] INDEX CONCURRENTLY ... IF NOT
+// EXISTS statement to completion, retrying failed builds until the
+// connection's lock-retry budget is exhausted.
+//
+// Two behaviors here are load-bearing (ENG-6174):
+//
+//   - A failed build leaves an INVALID index behind, and IF NOT EXISTS
+//     silently no-ops against it — without healing, every retry (including
+//     the ones inside RDB.ExecContext) "succeeds" without building anything,
+//     so the retry budget never engages. Invalid leftovers are dropped before
+//     the first attempt and between attempts.
+//
+//   - The aggressive session lock_timeout exists to keep strong-lock DDL from
+//     stalling application traffic while queued. CIC holds only locks that
+//     block no traffic (ShareUpdateExclusive on the table, virtualxid waits
+//     on concurrent transactions), so for the duration of the build the
+//     timeout is raised to the retry budget: one productive wait instead of
+//     create/drop churn at every timeout.
+func buildIndexConcurrently(ctx context.Context, conn db.DB, indexName, quotedQualifiedIndexName, createSQL string) error {
+	budget := lockRetryBudget(conn)
+	deadline := time.Now().Add(budget)
 
-		// Wait for concurrent index creation to finish
-		inProgress, err := isIndexInProgress(ctx, a.conn, quotedIndexName)
+	if err := dropIndexIfInvalid(ctx, conn, quotedQualifiedIndexName); err != nil {
+		return err
+	}
+
+	if budget > 0 {
+		restore, err := raiseLockTimeout(ctx, conn, budget)
 		if err != nil {
 			return err
 		}
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		for inProgress {
-			<-ticker.C
-			inProgress, err = isIndexInProgress(ctx, a.conn, quotedIndexName)
-			if err != nil {
-				return err
-			}
+		defer restore()
+	}
+
+	for attempt := 1; ; attempt++ {
+		if _, err := conn.ExecContext(ctx, createSQL); err != nil {
+			return fmt.Errorf("failed to create index %q: %w%s",
+				indexName, err, snapshotHolderDiagnostics(ctx, conn))
 		}
 
-		// Check if the index is valid — CREATE INDEX CONCURRENTLY can leave
-		// behind an INVALID index on failure since it runs outside a transaction.
-		valid, err := isIndexValid(ctx, a.conn, quotedIndexName)
+		if err := waitForIndexBuild(ctx, conn, quotedQualifiedIndexName); err != nil {
+			return err
+		}
+
+		valid, err := isIndexValid(ctx, conn, quotedQualifiedIndexName)
 		if err != nil {
 			return err
 		}
@@ -391,13 +413,151 @@ func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
 			return nil
 		}
 
-		// Invalid index will remain invalid forever. Drop and retry.
-		if _, err := a.conn.ExecContext(ctx, fmt.Sprintf("DROP INDEX IF EXISTS %s", quotedIndexName)); err != nil {
-			return fmt.Errorf("failed to drop invalid index %q: %w", a.name, err)
+		// The build failed and left an INVALID index; drop it so the next
+		// attempt's IF NOT EXISTS cannot no-op against it.
+		if err := dropIndexIfInvalid(ctx, conn, quotedQualifiedIndexName); err != nil {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("failed to create index %q: %d attempt(s) over %s all ended INVALID%s",
+				indexName, attempt, budget, snapshotHolderDiagnostics(ctx, conn))
 		}
 	}
+}
 
-	return fmt.Errorf("failed to create index %q after 5 attempts", a.name)
+// lockRetryBudget mirrors the retry budget of the underlying connection when
+// it is an RDB; plain connections get the package default.
+func lockRetryBudget(conn db.DB) time.Duration {
+	if rdb, ok := conn.(*db.RDB); ok {
+		return rdb.RetryBudget()
+	}
+	return db.DefaultLockRetryTimeout
+}
+
+// dropIndexIfInvalid drops the named index iff it exists and is INVALID (the
+// leftover of a failed CREATE INDEX CONCURRENTLY). A valid index is left
+// alone so the IF NOT EXISTS in the build still treats it as success.
+func dropIndexIfInvalid(ctx context.Context, conn db.DB, quotedQualifiedIndexName string) error {
+	rows, err := conn.QueryContext(ctx, `SELECT NOT indisvalid
+		FROM pg_catalog.pg_index
+		WHERE indexrelid = pg_catalog.to_regclass($1)`,
+		quotedQualifiedIndexName)
+	if err != nil {
+		return fmt.Errorf("checking index %q for INVALID leftover: %w", quotedQualifiedIndexName, err)
+	}
+	if rows == nil {
+		// FakeDB used by unit tests: nothing to heal.
+		return nil
+	}
+	defer rows.Close()
+
+	invalid := false
+	if err := db.ScanFirstValue(rows, &invalid); err != nil {
+		return fmt.Errorf("scanning INVALID check for index %q: %w", quotedQualifiedIndexName, err)
+	}
+	if !invalid {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("DROP INDEX IF EXISTS %s", quotedQualifiedIndexName)); err != nil {
+		return fmt.Errorf("failed to drop invalid index %q: %w", quotedQualifiedIndexName, err)
+	}
+	return nil
+}
+
+// raiseLockTimeout sets the session lock_timeout to the given duration and
+// returns a function that restores the previous value. Relies on the
+// migration session being a single dedicated connection — the same assumption
+// the session-level SETs in roll.New already make.
+func raiseLockTimeout(ctx context.Context, conn db.DB, d time.Duration) (func(), error) {
+	rows, err := conn.QueryContext(ctx, "SHOW lock_timeout")
+	if err != nil {
+		return nil, fmt.Errorf("reading current lock_timeout: %w", err)
+	}
+	if rows == nil {
+		// FakeDB used by unit tests: leave the timeout alone.
+		return func() {}, nil
+	}
+	prev := ""
+	scanErr := db.ScanFirstValue(rows, &prev)
+	rows.Close()
+	if scanErr != nil || prev == "" {
+		return func() {}, nil
+	}
+
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET lock_timeout TO '%dms'", d.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("raising lock_timeout for index build: %w", err)
+	}
+	return func() {
+		// Best effort: restore must run even when ctx is already canceled,
+		// or the lowered timeout leaks into subsequent strong-lock DDL.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("SET lock_timeout TO '%s'", prev))
+	}, nil
+}
+
+// waitForIndexBuild polls until no concurrent build is in progress for the
+// index.
+func waitForIndexBuild(ctx context.Context, conn db.DB, quotedQualifiedIndexName string) error {
+	inProgress, err := isIndexInProgress(ctx, conn, quotedQualifiedIndexName)
+	if err != nil {
+		return err
+	}
+	if !inProgress {
+		return nil
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for inProgress {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		inProgress, err = isIndexInProgress(ctx, conn, quotedQualifiedIndexName)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// snapshotHolderDiagnostics reports, best effort, the oldest transactions
+// holding snapshots — what a concurrent index build must out-wait, regardless
+// of which tables they touch. Returns "" when nothing useful is available;
+// diagnostics must never mask the original error.
+func snapshotHolderDiagnostics(ctx context.Context, conn db.DB) string {
+	rows, err := conn.QueryContext(ctx, `SELECT
+			a.pid,
+			coalesce(nullif(a.application_name, ''), a.backend_type) AS source,
+			a.state,
+			coalesce((clock_timestamp() - a.xact_start)::text, '-') AS xact_age,
+			left(coalesce(a.query, ''), 120) AS query
+		FROM pg_catalog.pg_stat_activity a
+		WHERE a.backend_xmin IS NOT NULL
+			AND a.pid <> pg_catalog.pg_backend_pid()
+			AND a.backend_type = 'client backend'
+		ORDER BY a.xact_start
+		LIMIT 5`)
+	if err != nil || rows == nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var (
+			pid                       int
+			source, state, age, query string
+		)
+		if rows.Scan(&pid, &source, &state, &age, &query) != nil {
+			return ""
+		}
+		fmt.Fprintf(&sb, "\n  pid=%d source=%s state=%q xact_age=%s query=%q", pid, source, state, age, query)
+	}
+	if rows.Err() != nil || sb.Len() == 0 {
+		return ""
+	}
+	return "\nconcurrent index builds must out-wait every transaction holding an older snapshot (any table); oldest snapshot holders:" + sb.String()
 }
 
 func (a *createIndexConcurrentlyAction) buildCreateIndexSQL() string {
@@ -539,51 +699,7 @@ func (a *createUniqueIndexConcurrentlyAction) Execute(ctx context.Context) error
 	if a.schemaName != "" {
 		quotedQualifiedIndexName = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(a.schemaName), pq.QuoteIdentifier(a.indexName))
 	}
-	for range 5 {
-		// Add a unique index to the new column
-		// Indexes are created in the same schema with the table automatically. Instead of the qualified one, just pass the index name.
-		createIndexSQL := a.getCreateUniqueIndexConcurrentlySQL()
-		if _, err := a.conn.ExecContext(ctx, createIndexSQL); err != nil {
-			return fmt.Errorf("failed to add unique index %q: %w", a.indexName, err)
-		}
-
-		// Make sure Postgres is done creating the index
-		isInProgress, err := isIndexInProgress(ctx, a.conn, quotedQualifiedIndexName)
-		if err != nil {
-			return err
-		}
-
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		for isInProgress {
-			<-ticker.C
-			isInProgress, err = isIndexInProgress(ctx, a.conn, quotedQualifiedIndexName)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Check pg_index to see if it's valid or not. Break if it's valid.
-		isValid, err := isIndexValid(ctx, a.conn, quotedQualifiedIndexName)
-		if err != nil {
-			return err
-		}
-
-		if isValid {
-			// success
-			return nil
-		}
-
-		// If not valid, since Postgres has already given up validating the index,
-		// it will remain invalid forever. Drop it and try again.
-		_, err = a.conn.ExecContext(ctx, fmt.Sprintf("DROP INDEX IF EXISTS %s", quotedQualifiedIndexName))
-		if err != nil {
-			return fmt.Errorf("failed to drop index: %w", err)
-		}
-	}
-
-	// ran out of retries, return an error
-	return fmt.Errorf("failed to create unique index %q", a.indexName)
+	return buildIndexConcurrently(ctx, a.conn, a.indexName, quotedQualifiedIndexName, a.getCreateUniqueIndexConcurrentlySQL())
 }
 
 func (a *createUniqueIndexConcurrentlyAction) getCreateUniqueIndexConcurrentlySQL() string {
