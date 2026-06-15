@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recreated columns now keep a deterministic physical order (ENG-6193).
+  Adding a constraint over existing columns — e.g. a `unique`
+  `create_constraint` — makes pgroll duplicate those columns. The order the
+  duplicate columns were `ADD`ed fixes their final `attnum` (completion only
+  drops the originals and renames the duplicates, which never changes
+  `attnum`), but that add order came from ranging a Go map, so it was
+  randomized per process: the same migration could seal as `(name,
+  person_id)` on one deploy and `(person_id, name)` on another. The
+  duplicator now emits the duplicate `ADD COLUMN`s in the operation's
+  declared column order, so every application — per-migration replay and
+  deferred train+seal alike — converges on the same column order.
+
 ## [0.16.2-baselayer.9] - 2026-06-12
 
 ### Fixed
