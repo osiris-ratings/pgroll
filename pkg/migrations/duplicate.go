@@ -23,6 +23,7 @@ type duplicator struct {
 	stmtBuilder       *duplicatorStmtBuilder
 	conn              db.DB
 	columns           map[string]*columnToDuplicate
+	columnOrder       []string
 	withoutConstraint []string
 }
 
@@ -57,17 +58,17 @@ const (
 // `_pgroll_new__pgroll_new_<base>_<otherScope>_<scope>`.
 func NewColumnDuplicator(conn db.DB, scope string, table *schema.Table, columns ...*schema.Column) *duplicator {
 	cols := make(map[string]*columnToDuplicate, len(columns))
-	columsID := make([]string, 0, len(columns))
+	columnOrder := make([]string, 0, len(columns))
 	for _, column := range columns {
 		cols[column.Name] = &columnToDuplicate{
 			column:   column,
 			asName:   temporaryNameRebase(scope, column.Name),
 			withType: column.Type,
 		}
-		columsID = append(columsID, column.Name)
+		columnOrder = append(columnOrder, column.Name)
 	}
 	return &duplicator{
-		id:    fmt.Sprintf("duplicate_%s_%s", table.Name, strings.Join(columsID, "_")),
+		id:    fmt.Sprintf("duplicate_%s_%s", table.Name, strings.Join(columnOrder, "_")),
 		scope: scope,
 		stmtBuilder: &duplicatorStmtBuilder{
 			scope: scope,
@@ -75,6 +76,7 @@ func NewColumnDuplicator(conn db.DB, scope string, table *schema.Table, columns 
 		},
 		conn:              conn,
 		columns:           cols,
+		columnOrder:       columnOrder,
 		withoutConstraint: make([]string, 0),
 	}
 }
@@ -132,7 +134,18 @@ func (d *duplicator) WithName(columnName, asName string) *duplicator {
 // comments.
 func (d *duplicator) Execute(ctx context.Context) error {
 	colNames := make([]string, 0, len(d.columns))
-	for name, c := range d.columns {
+	// Iterate columns in the order they were provided rather than ranging
+	// the map: the order in which the duplicate `_pgroll_new_*` columns are
+	// added (ADD COLUMN) fixes their physical position (attnum) in the
+	// completed table — completion only drops the originals and renames the
+	// duplicates, which never changes attnum. Ranging Go's map randomized
+	// that order, so a recreated table's column order was non-deterministic
+	// across applications. The replay (per-migration start+complete) and the
+	// deferred train+seal paths share this code, so both could diverge — e.g.
+	// a `create_constraint` unique over `[name, person_id]` sealed as either
+	// `name, person_id` or `person_id, name`. See ENG-6193.
+	for _, name := range d.columnOrder {
+		c := d.columns[name]
 		colNames = append(colNames, name)
 
 		// Duplicate the column with the new type
