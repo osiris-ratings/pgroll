@@ -96,6 +96,70 @@ func TestSealStampsBeforeContraction(t *testing.T) {
 	})
 }
 
+// TestOrphanedSchemaIsDistinctFromRevertTarget proves the system can tell a
+// deferred orphan apart from a schema in the open revert window. A best-effort
+// reap (ReapVersionSchemasExcept) leaves a sealed migration's version schema in
+// place when a backend still holds it; that orphan must never be mistaken for a
+// schema you can revert to. The discriminator is the sealed flag — the same
+// source of truth revert uses: an orphan is sealed (its contraction has run, so
+// it is not revertible), a window schema is unsealed.
+func TestOrphanedSchemaIsDistinctFromRevertTarget(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// Two completed migrations whose version schemas both survive
+		// (WithSkipSchemaDrop), as a deferred reap would have left them.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "00_base",
+			Operations: migrations.Operations{createTableOp("t_base")},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "01_live",
+			Operations: migrations.Operations{createTableOp("t_live")},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		// Drive the state the seal produces: the previous train (00_base) is
+		// sealed — its contraction has run — while the live train (01_live)
+		// stays in its open, revertible window. 00_base's schema survives only
+		// because its reap was deferred: it is now an orphan.
+		_, err := db.ExecContext(ctx,
+			`UPDATE pgroll.migrations SET sealed = TRUE WHERE schema = $1 AND name = '00_base'`, cSchema)
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			`UPDATE pgroll.migrations SET sealed = FALSE WHERE schema = $1 AND name = '01_live'`, cSchema)
+		require.NoError(t, err)
+
+		base := roll.VersionedSchemaName(cSchema, "00_base")
+		live := roll.VersionedSchemaName(cSchema, "01_live")
+		require.True(t, schemaExists(t, db, base))
+		require.True(t, schemaExists(t, db, live))
+
+		// The orphan is identified as such; the live/revertible schema is not.
+		orphans, err := mig.OrphanedVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{base}, orphans,
+			"the sealed, non-live leftover must be reported as an orphan")
+		assert.NotContains(t, orphans, live,
+			"the live, unsealed schema must never be reported as an orphan")
+
+		// Revert agrees: the window is the unsealed train only; the sealed
+		// orphan is not a revert target.
+		targets, err := mig.RevertTargets(ctx)
+		require.NoError(t, err)
+		names := make([]string, 0, len(targets))
+		for _, tg := range targets {
+			names = append(names, tg.Name)
+		}
+		assert.Contains(t, names, "01_live", "the unsealed migration is revertible")
+		assert.NotContains(t, names, "00_base", "the sealed orphan is not a revert target")
+	})
+}
+
 // TestSealSkipsUnfinishedTrain covers the mid-train-crash recovery contract:
 // a `pgroll migrate` that died mid-batch leaves the applied prefix's
 // defer-class rows queued with a version-schema-less intermediate as the

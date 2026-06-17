@@ -1254,6 +1254,127 @@ func TestDropVersionSchemasExceptKeepsSpecifiedSchemas(t *testing.T) {
 	})
 }
 
+// holdAccessShareOnView holds an AccessShare lock on the given relation until
+// the returned release func is called, simulating a live backend still reading
+// through a (dead) version schema's view. release blocks until the holding
+// transaction has committed and the lock is gone.
+func holdAccessShareOnView(t *testing.T, db *sql.DB, qualifiedView string) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	acquired := make(chan error, 1)
+	unblock := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tx, err := db.Begin()
+		if err != nil {
+			acquired <- err
+			return
+		}
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("LOCK TABLE %s IN ACCESS SHARE MODE", qualifiedView)); err != nil {
+			_ = tx.Rollback()
+			acquired <- err
+			return
+		}
+		acquired <- nil
+		<-unblock
+		_ = tx.Commit()
+	}()
+	require.NoError(t, <-acquired)
+	return func() {
+		close(unblock)
+		<-done
+	}
+}
+
+// TestReapVersionSchemasExceptDefersLockedSchema verifies the best-effort reap
+// path the seal uses: a dead version schema that a live backend is still
+// reading through is carried forward instead of failing the caller, while
+// unlocked dead schemas are dropped and kept schemas are untouched. This is the
+// fix for a seal/GC drop wedging an entire deployment behind one straggler
+// connection (e.g. an idle-in-transaction worker still pinned to an old schema).
+func TestReapVersionSchemasExceptDefersLockedSchema(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+		// Short lock_timeout so the blocked DROP fails fast; disabled retry
+		// budget (negative) so the 55P03 is surfaced immediately and deferred
+		// rather than retried for minutes.
+		[]roll.Option{roll.WithLockTimeoutMs(50), roll.WithLockRetryTimeout(-1)},
+		func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+
+			versions := []string{"v1", "v2", "v3", "v4"}
+			tables := []string{"t1", "t2", "t3", "t4"}
+			for i, v := range versions {
+				require.NoError(t, mig.Start(ctx, &migrations.Migration{
+					Name:       v,
+					Operations: migrations.Operations{createTableOp(tables[i])},
+				}, backfill.NewConfig()))
+				require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+			}
+
+			// A live backend still reads through v2's view.
+			release := holdAccessShareOnView(t, db,
+				roll.VersionedSchemaName(cSchema, "v2")+".t2")
+
+			// Reap everything except v1 and v4. v2 is locked → deferred (not
+			// fatal); v3 is free → dropped.
+			deferred, err := mig.ReapVersionSchemasExcept(ctx, "v1", "v4")
+			require.NoError(t, err)
+			assert.Equal(t, []string{roll.VersionedSchemaName(cSchema, "v2")}, deferred)
+
+			assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v1")))
+			assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v4")))
+			assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v2")),
+				"locked schema must be deferred, not dropped")
+			assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v3")),
+				"unlocked dead schema must be dropped")
+
+			// Once the reader releases, a follow-up reap collects the
+			// previously-deferred schema — it is retried, not lost.
+			release()
+			deferred, err = mig.ReapVersionSchemasExcept(ctx, "v1", "v4")
+			require.NoError(t, err)
+			assert.Empty(t, deferred)
+			assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v2")),
+				"previously-deferred schema reaped once the reader released")
+		})
+}
+
+// TestDropVersionSchemasExceptIsStrictWhenLocked locks in the safety boundary:
+// the (non-best-effort) DropVersionSchemasExcept — used by the Complete path
+// and, via the live-schema drop, by the seal — still aborts when a drop is
+// blocked, rather than silently skipping.
+func TestDropVersionSchemasExceptIsStrictWhenLocked(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+		[]roll.Option{roll.WithLockTimeoutMs(50), roll.WithLockRetryTimeout(-1)},
+		func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+
+			for i, v := range []string{"v1", "v2"} {
+				require.NoError(t, mig.Start(ctx, &migrations.Migration{
+					Name:       v,
+					Operations: migrations.Operations{createTableOp([]string{"t1", "t2"}[i])},
+				}, backfill.NewConfig()))
+				require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+			}
+
+			release := holdAccessShareOnView(t, db,
+				roll.VersionedSchemaName(cSchema, "v1")+".t1")
+			defer release()
+
+			// v1 is locked; the strict path must surface the error.
+			err := mig.DropVersionSchemasExcept(ctx, "v2")
+			require.Error(t, err)
+			assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "v1")),
+				"strict drop must leave the locked schema in place after failing")
+		})
+}
+
 // TestDependentMigrationsResolveWithDeferredCleanup mirrors the production
 // pgroll-migrate flow: a stack of additive migrations where each one uses
 // objects created by previous migrations. It proves that intermediate

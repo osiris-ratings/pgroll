@@ -34,6 +34,7 @@ type Logger interface {
 	LogRollbackOnFailure(reason string)
 
 	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
 }
 
 type migrationLogger struct {
@@ -154,6 +155,10 @@ func (l migrationLogger) LogOperationRollback(op Operation) {
 
 func (l migrationLogger) Info(msg string, args ...any) {
 	l.logger.Info(msg, l.logger.Args(args...))
+}
+
+func (l migrationLogger) Warn(msg string, args ...any) {
+	l.logger.Warn(msg, l.logger.Args(args...))
 }
 
 func (l migrationLogger) extractOpArgs(op Operation) []any {
@@ -353,6 +358,7 @@ func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)  
 func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration) {}
 func (l *noopLogger) LogRollbackOnFailure(reason string)                            {}
 func (l *noopLogger) Info(msg string, args ...any)                                  {}
+func (l *noopLogger) Warn(msg string, args ...any)                                  {}
 
 // truncateQuery returns a single-line, length-bounded form of a SQL query
 // suitable for logging without flooding the terminal.

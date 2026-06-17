@@ -303,6 +303,25 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		return "", fmt.Errorf("listing existing version schemas: %w", err)
 	}
 
+	// Orphaned schemas (sealed leftovers a best-effort reap could not drop)
+	// physically exist but are not the live projection or a revert target.
+	// Split them out so they are never displayed as a live schema or as the
+	// plan's source — apps are not pinned to them and cannot roll back to them.
+	orphanSchemas, err := m.OrphanedVersionSchemas(ctx)
+	if err != nil {
+		return "", fmt.Errorf("listing orphaned version schemas: %w", err)
+	}
+	orphanSet := make(map[string]bool, len(orphanSchemas))
+	for _, s := range orphanSchemas {
+		orphanSet[s] = true
+	}
+	liveSchemas := make([]string, 0, len(existingSchemas))
+	for _, s := range existingSchemas {
+		if !orphanSet[s] {
+			liveSchemas = append(liveSchemas, s)
+		}
+	}
+
 	stateLatestVersion, err := m.State().LatestVersion(ctx, m.Schema())
 	if err != nil {
 		return "", fmt.Errorf("reading state.LatestVersion: %w", err)
@@ -423,12 +442,12 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 			field(label, inProgressName)
 		}
 		liveLabel := "Live schema"
-		if len(existingSchemas) != 1 {
+		if len(liveSchemas) != 1 {
 			liveLabel = "Live schemas"
 		}
 		liveValue := "—"
-		if len(existingSchemas) > 0 {
-			liveValue = strings.Join(existingSchemas, ", ")
+		if len(liveSchemas) > 0 {
+			liveValue = strings.Join(liveSchemas, ", ")
 		}
 		field(liveLabel, liveValue)
 		fmt.Fprintln(out)
@@ -439,17 +458,17 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 	case cycleNoOp:
 		current := "—"
-		if len(existingSchemas) > 0 {
-			current = strings.Join(existingSchemas, ", ")
+		if len(liveSchemas) > 0 {
+			current = strings.Join(liveSchemas, ", ")
 		}
 		field("Current", current)
 	default:
 		// Plan: "<source> → <target> (N migrations)"
 		source := pterm.FgGray.Sprint("(empty)")
-		if len(existingSchemas) == 1 {
-			source = existingSchemas[0]
-		} else if len(existingSchemas) > 1 {
-			source = strings.Join(existingSchemas, ", ")
+		if len(liveSchemas) == 1 {
+			source = liveSchemas[0]
+		} else if len(liveSchemas) > 1 {
+			source = strings.Join(liveSchemas, ", ")
 		}
 
 		finalRaw := unapplied[len(unapplied)-1]
@@ -489,6 +508,15 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 				pterm.FgYellow.Sprint("⚠"), *stateLatestVersion)
 			fmt.Fprintln(out, pterm.FgYellow.Sprint("    A previous migrate completed migrations whose schema was never deployed."))
 		}
+	}
+
+	// Orphaned version schemas: physically present but sealed leftovers a
+	// best-effort reap could not drop. Surfaced distinctly so operators do not
+	// mistake them for the live schema or a revert target — a later deployment
+	// reaps them once the holding session releases.
+	if len(orphanSchemas) > 0 {
+		field("Orphaned", fmt.Sprintf("%s (sealed; pending GC, not a revert target)",
+			strings.Join(orphanSchemas, ", ")))
 	}
 
 	fmt.Fprintln(out)

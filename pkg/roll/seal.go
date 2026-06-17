@@ -124,8 +124,22 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 	if !m.disableVersionSchemas {
 		// Reap every version schema except the live one, then drop the live
 		// one itself so the drain DDL is unblocked (see doc comment).
-		if err := m.DropVersionSchemasExcept(ctx, live.VersionSchemaName()); err != nil {
+		//
+		// The reap is best-effort: a dead intermediate schema that a live
+		// backend is still reading through must not be dropped (it would break
+		// that session) and, more importantly, must not fail the deployment —
+		// collecting garbage cannot sit on the critical path of applying new
+		// work. Such schemas are carried forward and reaped by a later
+		// deployment once they fall idle. The live-schema drop below stays
+		// strict: it is required for the drain and self-heals under the short
+		// reads of apps already on the live schema.
+		deferred, err := m.ReapVersionSchemasExcept(ctx, live.VersionSchemaName())
+		if err != nil {
 			return 0, fmt.Errorf("unable to drop old version schemas: %w", err)
+		}
+		if len(deferred) > 0 {
+			m.logger.Warn("deferred schema cleanup: intermediate schemas still in use; "+
+				"a later deployment will reap them", "schemas", deferred)
 		}
 		versionSchema := VersionedSchemaName(m.schema, live.VersionSchemaName())
 		if _, err := m.pgConn.ExecContext(ctx,
