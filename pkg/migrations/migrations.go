@@ -260,6 +260,37 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
+// CompleteAffectsLiveProjection reports whether replaying this migration's
+// Complete actions would drop or rename a user-facing identifier that the live
+// (previous-production) version schema's views project. That is the only
+// reason the seal must drop the live version schema before draining: Postgres
+// rejects such a Complete while the view still references the object (the
+// view→column edge is recorded in pg_depend as deptype=n).
+//
+// It is a superset of CompleteMustBeDeferred. The extra case is
+// OpCreateConstraint — a duplicator that runs inline (it must; see
+// CompleteMustBeDeferred) but whose Complete drops the original user-facing
+// columns and renames the duplicates back. A train's final migration is
+// deferred for the revert window regardless of its ops, so an OpCreateConstraint
+// final can reach the drain and would then need the live schema dropped.
+//
+// When this is false for every queued migration the drain is
+// projection-preserving — it touches only pgroll-internal artifacts (temp
+// names, trigger machinery) that the live views never reference — so the seal
+// can leave the live schema untouched instead of fighting live traffic for the
+// AccessExclusive lock needed to drop it.
+func (m *Migration) CompleteAffectsLiveProjection() bool {
+	if m.CompleteMustBeDeferred() {
+		return true
+	}
+	for _, op := range m.Operations {
+		if _, ok := op.(*OpCreateConstraint); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateVirtualSchema updates the in-memory schema representation with the changes
 // made by the migration. No changes are made to the physical database.
 func (m *Migration) UpdateVirtualSchema(ctx context.Context, s *schema.Schema) error {
