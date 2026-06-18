@@ -160,6 +160,69 @@ func TestOrphanedSchemaIsDistinctFromRevertTarget(t *testing.T) {
 	})
 }
 
+// TestSealKeepsLiveSchemaForAdditiveDrain proves the live-schema drop is
+// skipped when the drain has nothing to contract. A create-table deployment
+// left deferred only for the revert window (the incident shape:
+// add_onboarding_sessions) is projection-preserving — its Complete does not
+// drop or rename anything the live views project — so the live version schema
+// need not be dropped. The seal must succeed even while a backend holds the
+// live schema open with the AccessShare lock that would otherwise wedge the
+// (unnecessary) DROP SCHEMA, with retries disabled so a drop attempt would
+// fail outright.
+func TestSealKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+		[]roll.Option{roll.WithLockTimeoutMs(50), roll.WithLockRetryTimeout(-1)},
+		func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+
+			// Base deployment: the users table becomes the live projection.
+			require.NoError(t, mig.Start(ctx, &migrations.Migration{
+				Name: "00_create_users",
+				Operations: migrations.Operations{
+					&migrations.OpRawSQL{
+						Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+						Down: `DROP TABLE users`,
+					},
+				},
+			}, backfill.NewConfig()))
+			require.NoError(t, mig.Complete(ctx))
+
+			// An additive deployment left deferred (queued) for the revert
+			// window: a new table whose Complete touches neither users nor any
+			// identifier the live views project.
+			applyDelayedContractionTrain(t, mig, []*migrations.Migration{
+				{Name: "01_create_sessions", Operations: migrations.Operations{createTableOp("sessions")}},
+			})
+
+			live := roll.VersionedSchemaName(cSchema, "01_create_sessions")
+
+			// A live backend holds the live schema's users view open. Dropping
+			// the live schema would need AccessExclusive on this view and fail
+			// immediately (retries disabled); the drain itself never touches
+			// users, so nothing legitimately blocks.
+			release := holdAccessShareOnView(t, db, live+".users")
+			defer release()
+
+			// The seal must still succeed: the additive drain needs no
+			// contraction, so the live schema is left in place rather than
+			// dropped.
+			drained, err := mig.SealDeferredCompletes(ctx)
+			require.NoError(t, err)
+			require.Equal(t, 1, drained)
+
+			assert.True(t, schemaExists(t, db, live),
+				"a projection-preserving drain must keep the live schema in place")
+
+			var queued int
+			require.NoError(t, db.QueryRowContext(ctx,
+				`SELECT count(*) FROM pgroll.migrations WHERE schema = $1 AND complete_deferred`,
+				cSchema).Scan(&queued))
+			assert.Zero(t, queued, "the drain must clear the deferred queue")
+		})
+}
+
 // TestSealSkipsUnfinishedTrain covers the mid-train-crash recovery contract:
 // a `pgroll migrate` that died mid-batch leaves the applied prefix's
 // defer-class rows queued with a version-schema-less intermediate as the

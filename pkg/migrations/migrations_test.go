@@ -132,6 +132,51 @@ func TestCompleteMustBeDeferred(t *testing.T) {
 	}
 }
 
+func TestCompleteAffectsLiveProjection(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		ops    migrations.Operations
+		expect bool
+	}{
+		"add column is projection-preserving": {
+			ops:    migrations.Operations{&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}}},
+			expect: false,
+		},
+		"create table is projection-preserving": {
+			ops:    migrations.Operations{&migrations.OpCreateTable{Name: "t"}},
+			expect: false,
+		},
+		"raw SQL without OnComplete is projection-preserving": {
+			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
+			expect: false,
+		},
+		"drop column affects the projection": {
+			ops:    migrations.Operations{&migrations.OpDropColumn{Table: "t", Column: "c"}},
+			expect: true,
+		},
+		"rename column affects the projection": {
+			ops:    migrations.Operations{&migrations.OpRenameColumn{Table: "t", From: "a", To: "b"}},
+			expect: true,
+		},
+		// The case CompleteMustBeDeferred misses: a duplicator that runs inline
+		// but whose Complete drops/renames user-facing columns. A deferred
+		// final migration can carry it into the drain, so it must still force
+		// the live-schema drop.
+		"create constraint affects the projection though it runs inline": {
+			ops:    migrations.Operations{&migrations.OpCreateConstraint{}},
+			expect: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &migrations.Migration{Name: "x", Operations: tc.ops}
+			assert.Equal(t, tc.expect, m.CompleteAffectsLiveProjection())
+		})
+	}
+}
+
 func TestCollectFilesFromDir(t *testing.T) {
 	t.Parallel()
 

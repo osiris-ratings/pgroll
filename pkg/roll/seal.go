@@ -121,18 +121,27 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// The live version schema only needs to be dropped (and rebuilt afterwards)
+	// when the drain will actually contract a user-facing identifier its views
+	// project — a DROP/RENAME of a column or table, or a duplicator's Complete.
+	// An additive drain (e.g. a deferred final migration kept queued only for
+	// the revert window) touches just pgroll-internal artifacts the live views
+	// never reference, so dropping the live schema is unnecessary and only
+	// risks an unwinnable lock fight with the apps actively reading it.
+	needsLiveDrop := false
+	for _, dm := range queued {
+		if dm.CompleteAffectsLiveProjection() {
+			needsLiveDrop = true
+			break
+		}
+	}
+
 	if !m.disableVersionSchemas {
-		// Reap every version schema except the live one, then drop the live
-		// one itself so the drain DDL is unblocked (see doc comment).
-		//
-		// The reap is best-effort: a dead intermediate schema that a live
-		// backend is still reading through must not be dropped (it would break
-		// that session) and, more importantly, must not fail the deployment —
-		// collecting garbage cannot sit on the critical path of applying new
-		// work. Such schemas are carried forward and reaped by a later
-		// deployment once they fall idle. The live-schema drop below stays
-		// strict: it is required for the drain and self-heals under the short
-		// reads of apps already on the live schema.
+		// Reap every dead intermediate version schema. Best-effort: a schema a
+		// live backend is still reading must not be dropped (it would break
+		// that session) and must not fail the deployment — collecting garbage
+		// cannot sit on the critical path of applying new work. Such schemas
+		// are carried forward and reaped by a later deployment once idle.
 		deferred, err := m.ReapVersionSchemasExcept(ctx, live.VersionSchemaName())
 		if err != nil {
 			return 0, fmt.Errorf("unable to drop old version schemas: %w", err)
@@ -141,10 +150,26 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 			m.logger.Warn("deferred schema cleanup: intermediate schemas still in use; "+
 				"a later deployment will reap them", "schemas", deferred)
 		}
+
 		versionSchema := VersionedSchemaName(m.schema, live.VersionSchemaName())
-		if _, err := m.pgConn.ExecContext(ctx,
-			fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema))); err != nil {
-			return 0, fmt.Errorf("unable to drop live version schema before drain: %w", err)
+		if needsLiveDrop {
+			// Required for contraction and therefore strict: it cannot be
+			// deferred (the drain's DROP/RENAME would fail on the view's
+			// deptype=n dependency), so a blocked drop must fail the seal
+			// rather than corrupt it. Name the blocking sessions so the
+			// straggler (apps still reading the live schema) can be cleared.
+			if _, err := m.pgConn.ExecContext(ctx,
+				fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema))); err != nil {
+				if isLockNotAvailable(err) {
+					return 0, fmt.Errorf("unable to drop live version schema %q before contraction "+
+						"(apps still reading it must move off it first); blocked by:%s: %w",
+						versionSchema, m.schemaLockHolders(ctx, versionSchema), err)
+				}
+				return 0, fmt.Errorf("unable to drop live version schema before drain: %w", err)
+			}
+		} else {
+			m.logger.Info("seal drain is projection-preserving; keeping the live version schema in place",
+				"schema", versionSchema)
 		}
 	}
 
@@ -166,7 +191,11 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("unable to refresh boundary snapshot for %q: %w", live.Name, err)
 	}
 
-	if !m.disableVersionSchemas {
+	if !m.disableVersionSchemas && needsLiveDrop {
+		// Only rebuild what was dropped. A projection-preserving drain left the
+		// live schema in place, so its views are still valid and re-running
+		// ensureViews would needlessly reacquire the AccessExclusive locks the
+		// drop was skipped to avoid.
 		currentSchema, err := m.state.ReadSchema(ctx, m.schema)
 		if err != nil {
 			return 0, fmt.Errorf("unable to read schema after drain: %w", err)
