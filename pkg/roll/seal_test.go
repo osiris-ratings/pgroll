@@ -223,6 +223,120 @@ func TestSealKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
 		})
 }
 
+// TestSealLiveSchemaHandlingPerOp is the empirical gate for skipping the
+// live-schema drop. Each case applies a deferred train that contracts table
+// `t`, while a backend holds the live view of an UNRELATED table `hot` (which
+// the migration never touches) with retries disabled. For every typed
+// contraction the seal must succeed WITHOUT dropping the live schema — so the
+// held `hot` view never blocks it, proving we did not drop the live schema (the
+// old behavior would have). Only opaque onComplete raw SQL forces the
+// whole-schema drop, which the held view then blocks.
+func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		op          migrations.Operation
+		wantSealErr bool // opaque raw SQL: full-schema drop blocked by the held view
+		tViewGone   bool // drop_table removes t's own view
+	}{
+		{
+			name: "rename_column",
+			op:   &migrations.OpRenameColumn{Table: "t", From: "value", To: "label"},
+		},
+		{
+			name: "drop_column",
+			op:   &migrations.OpDropColumn{Table: "t", Column: "value", Down: "''"},
+		},
+		{
+			name: "alter_column",
+			op:   &migrations.OpAlterColumn{Table: "t", Column: "value", Type: ptr("text"), Up: "value", Down: "value"},
+		},
+		{
+			name: "create_constraint",
+			op: &migrations.OpCreateConstraint{
+				Table:   "t",
+				Name:    "t_value_unique",
+				Type:    migrations.OpCreateConstraintTypeUnique,
+				Columns: []string{"value"},
+				Up:      migrations.MultiColumnUpSQL{"value": "value"},
+				Down:    migrations.MultiColumnDownSQL{"value": "value"},
+			},
+		},
+		{
+			name:      "drop_table",
+			op:        &migrations.OpDropTable{Name: "t"},
+			tViewGone: true,
+		},
+		{
+			name:        "opaque_oncomplete_raw_sql",
+			op:          &migrations.OpRawSQL{Up: "SELECT 1", OnComplete: true},
+			wantSealErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+				[]roll.Option{roll.WithLockTimeoutMs(50), roll.WithLockRetryTimeout(-1)},
+				func(mig *roll.Roll, db *sql.DB) {
+					ctx := context.Background()
+
+					// Base deployment: `t` (to be contracted) and an unrelated
+					// hot table `hot`.
+					require.NoError(t, mig.Start(ctx, &migrations.Migration{
+						Name: "00_base",
+						Operations: migrations.Operations{
+							&migrations.OpCreateTable{Name: "t", Columns: []migrations.Column{
+								{Name: "id", Type: "integer", Pk: true},
+								{Name: "value", Type: "varchar(255)", Nullable: true},
+							}},
+							createTableOp("hot"),
+						},
+					}, backfill.NewConfig()))
+					require.NoError(t, mig.Complete(ctx))
+
+					// The deferred contraction train (the previous deployment).
+					version := "01_" + tc.name
+					applyDelayedContractionTrain(t, mig, []*migrations.Migration{
+						{Name: version, Operations: migrations.Operations{tc.op}},
+					})
+					live := roll.VersionedSchemaName(cSchema, version)
+
+					// A live backend holds the unrelated `hot` view open. Dropping
+					// the live SCHEMA needs AccessExclusive on it and would fail
+					// immediately (retries disabled); the contraction touches only
+					// `t`, so nothing legitimately blocks.
+					release := holdAccessShareOnView(t, db, live+".hot")
+					defer release()
+
+					_, err := mig.SealDeferredCompletes(ctx)
+					if tc.wantSealErr {
+						require.Error(t, err,
+							"opaque drain must take the full-schema drop, which the held view blocks")
+						return
+					}
+					require.NoError(t, err,
+						"a typed contraction must seal without dropping the live schema")
+
+					assert.True(t, schemaExists(t, db, live), "live schema must remain")
+					assert.True(t, viewExists(t, db, live, "hot"),
+						"the unrelated view held open must be untouched")
+					if tc.tViewGone {
+						assert.False(t, viewExists(t, db, live, "t"),
+							"a dropped table's view must be gone")
+					} else {
+						assert.True(t, viewExists(t, db, live, "t"),
+							"the contracted table's view must remain (auto-maintained)")
+						// The view is still valid/queryable post-contraction.
+						MustSelect(t, db, cSchema, version, "t")
+					}
+				})
+		})
+	}
+}
+
 // TestSealSkipsUnfinishedTrain covers the mid-train-crash recovery contract:
 // a `pgroll migrate` that died mid-batch leaves the applied prefix's
 // defer-class rows queued with a version-schema-less intermediate as the

@@ -486,12 +486,28 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	// the prev-production schema around, which would block destructive
 	// drained DDL with the same dependency error the deferral was set up
 	// to avoid. Leave the queue for the next non-deferred Complete.
+	// The active version schema only needs to be dropped before the drain for
+	// an onComplete raw SQL Complete, whose arbitrary statements may drop or
+	// rename an object its views project. Typed contractions never invalidate
+	// the live views (renames auto-follow; drops/duplicators don't touch the
+	// projected names; dropped tables are filtered out of the view), so the
+	// drop — and the matching recreate below — are skipped, leaving the views
+	// (and any apps reading them) untouched. See SealDeferredCompletes for the
+	// same reasoning; per-op tests prove the typed ops drain safely in place.
+	needsLiveDrop := migration.CompleteRequiresLiveSchemaDrop()
 	if !o.skipSchemaDrop {
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
 		}
 		if len(queued) > 0 {
+			for _, dm := range queued {
+				if dm.CompleteRequiresLiveSchemaDrop() {
+					needsLiveDrop = true
+					break
+				}
+			}
+
 			m.logger.Info("draining deferred completes", "count", len(queued))
 
 			// Seal at intent: stamp every done row sealed BEFORE the drain's
@@ -502,22 +518,11 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 				return err
 			}
 
-			// Drop the active migration's version schema (and its views)
-			// before drain runs. Drain DDL frequently drops/renames
-			// user-facing columns the active version schema's views
-			// project; pg_depend records those view→column edges as
-			// deptype=n (normal), which DROP COLUMN refuses to cascade
-			// without an explicit CASCADE. Dropping the version schema
-			// up front lets each drain action proceed against the bare
-			// table; we recreate the version schema at the end of
-			// Complete from the post-drain physical state.
-			//
-			// Apps connected to the active version schema would observe
-			// a brief outage, but at this point in the lifecycle the
-			// previous-production schema (V0) has already been reaped,
-			// so apps are in a transition window already. Recreating
-			// from post-drain state immediately restores the projection.
-			if !m.disableVersionSchemas {
+			if needsLiveDrop && !m.disableVersionSchemas {
+				// onComplete raw SQL only: drop the active version schema so
+				// the opaque DDL can't be blocked by a view's deptype=n
+				// dependency. Recreated from the post-drain physical state
+				// below.
 				versionSchema := VersionedSchemaName(m.schema, migration.VersionSchemaName())
 				_, err := m.pgConn.ExecContext(ctx,
 					fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
@@ -576,25 +581,21 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
 	}
 
-	// Recreate the active migration's version schema. Always when
-	// !skipSchemaDrop, because the drain may have dropped it (above) to
-	// unblock destructive DDL, OR the active migration's ops may have
-	// included raw SQL that requires a refresh. The ensureViews call
-	// rebuilds the version schema and its views over the post-drain
-	// physical state, restoring the projection apps deploy against.
-	if !o.skipSchemaDrop && !m.disableVersionSchemas {
+	// Recreate the active migration's version schema only when something
+	// actually changed its views: the drain dropped it (needsLiveDrop, the
+	// onComplete raw SQL case), or an op requires a schema refresh. A typed
+	// contraction leaves the views valid — Postgres auto-follows the underlying
+	// renames and never references the dropped originals — so recreating would
+	// needlessly churn and re-lock views apps are actively reading.
+	if !o.skipSchemaDrop && !m.disableVersionSchemas && (needsLiveDrop || refreshViews) {
 		currentSchema, err = m.state.ReadSchema(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)
 		}
 
-		err = m.ensureViews(ctx, currentSchema, migration)
-		if err != nil {
+		if err := m.ensureViews(ctx, currentSchema, migration); err != nil {
 			return err
 		}
-		// Suppress unused-var warning if refreshViews ends up unused in
-		// some build paths.
-		_ = refreshViews
 	}
 
 	// mark as completed
