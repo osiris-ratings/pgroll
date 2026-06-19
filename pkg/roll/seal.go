@@ -121,16 +121,21 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	// The live version schema only needs to be dropped (and rebuilt afterwards)
-	// when the drain will actually contract a user-facing identifier its views
-	// project — a DROP/RENAME of a column or table, or a duplicator's Complete.
-	// An additive drain (e.g. a deferred final migration kept queued only for
-	// the revert window) touches just pgroll-internal artifacts the live views
-	// never reference, so dropping the live schema is unnecessary and only
-	// risks an unwinnable lock fight with the apps actively reading it.
+	// The live version schema almost never needs to be dropped. pgroll's
+	// expand-phase views never reference the object a typed contraction touches:
+	// renames are auto-followed by Postgres in dependent views; dropped columns
+	// were marked deleted at Start (so the live view never projected them);
+	// duplicators project the temp column, not the original being dropped;
+	// dropped tables are filtered out of the live view. Leaving the live schema
+	// in place avoids an unwinnable lock fight with apps actively reading it
+	// (including readers of unrelated hot tables the migration never touches).
+	// The one Complete pgroll cannot reason about is onComplete raw SQL, whose
+	// arbitrary statements may drop or rename anything — that forces the
+	// conservative whole-schema drop. (Per-op seal tests prove the typed ops
+	// drain safely with the live schema left in place.)
 	needsLiveDrop := false
 	for _, dm := range queued {
-		if dm.CompleteAffectsLiveProjection() {
+		if dm.CompleteRequiresLiveSchemaDrop() {
 			needsLiveDrop = true
 			break
 		}
@@ -153,11 +158,12 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 
 		versionSchema := VersionedSchemaName(m.schema, live.VersionSchemaName())
 		if needsLiveDrop {
-			// Required for contraction and therefore strict: it cannot be
-			// deferred (the drain's DROP/RENAME would fail on the view's
-			// deptype=n dependency), so a blocked drop must fail the seal
-			// rather than corrupt it. Name the blocking sessions so the
-			// straggler (apps still reading the live schema) can be cleared.
+			// Reached only for an onComplete raw SQL drain, whose arbitrary DDL
+			// may drop/rename an object the live view projects. Strict: it
+			// cannot be deferred (the raw SQL could fail on a view's deptype=n
+			// dependency), so a blocked drop must fail the seal rather than
+			// corrupt it. Name the blocking sessions so the straggler can be
+			// cleared.
 			if _, err := m.pgConn.ExecContext(ctx,
 				fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema))); err != nil {
 				if isLockNotAvailable(err) {
@@ -168,8 +174,8 @@ func (m *Roll) SealDeferredCompletes(ctx context.Context) (int, error) {
 				return 0, fmt.Errorf("unable to drop live version schema before drain: %w", err)
 			}
 		} else {
-			m.logger.Info("seal drain is projection-preserving; keeping the live version schema in place",
-				"schema", versionSchema)
+			m.logger.Info("keeping the live version schema in place; the drain's typed contractions "+
+				"do not invalidate its views", "schema", versionSchema)
 		}
 	}
 

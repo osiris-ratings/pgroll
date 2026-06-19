@@ -260,31 +260,30 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
-// CompleteAffectsLiveProjection reports whether replaying this migration's
-// Complete actions would drop or rename a user-facing identifier that the live
-// (previous-production) version schema's views project. That is the only
-// reason the seal must drop the live version schema before draining: Postgres
-// rejects such a Complete while the view still references the object (the
-// view→column edge is recorded in pg_depend as deptype=n).
+// CompleteRequiresLiveSchemaDrop reports whether draining this migration's
+// Complete requires dropping the live version schema first.
 //
-// It is a superset of CompleteMustBeDeferred. The extra case is
-// OpCreateConstraint — a duplicator that runs inline (it must; see
-// CompleteMustBeDeferred) but whose Complete drops the original user-facing
-// columns and renames the duplicates back. A train's final migration is
-// deferred for the revert window regardless of its ops, so an OpCreateConstraint
-// final can reach the drain and would then need the live schema dropped.
+// For every *typed* contracting operation it does not: pgroll's expand-phase
+// views never reference the object the Complete touches.
+//   - rename column / table — Postgres auto-follows the rename in dependent
+//     views (references are by attribute number / OID, not name).
+//   - drop column — marked deleted at Start, and ensureView skips deleted
+//     columns, so the live view never projected it.
+//   - alter column / create-or-drop constraint (duplicators) — the live view
+//     projects the temporary column (`_pgroll_new_… AS col`); Complete drops the
+//     original (which the view does not reference) and renames the temp back,
+//     which Postgres auto-follows.
+//   - drop table — ensureViews filters out soft-deleted tables, so the live
+//     view never included it.
 //
-// When this is false for every queued migration the drain is
-// projection-preserving — it touches only pgroll-internal artifacts (temp
-// names, trigger machinery) that the live views never reference — so the seal
-// can leave the live schema untouched instead of fighting live traffic for the
-// AccessExclusive lock needed to drop it.
-func (m *Migration) CompleteAffectsLiveProjection() bool {
-	if m.CompleteMustBeDeferred() {
-		return true
-	}
+// The one Complete pgroll cannot reason about is onComplete raw SQL: its
+// arbitrary statements may drop or rename anything the live view projects, so a
+// queue containing one forces the conservative whole-schema drop. The expected
+// safety of leaving the live schema in place for typed ops is enforced
+// empirically by the per-op seal tests, not by this comment.
+func (m *Migration) CompleteRequiresLiveSchemaDrop() bool {
 	for _, op := range m.Operations {
-		if _, ok := op.(*OpCreateConstraint); ok {
+		if raw, ok := op.(*OpRawSQL); ok && raw.OnComplete {
 			return true
 		}
 	}

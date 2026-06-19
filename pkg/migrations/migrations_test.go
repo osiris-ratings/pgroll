@@ -132,39 +132,66 @@ func TestCompleteMustBeDeferred(t *testing.T) {
 	}
 }
 
-func TestCompleteAffectsLiveProjection(t *testing.T) {
+func TestCompleteRequiresLiveSchemaDrop(t *testing.T) {
 	t.Parallel()
 
+	// Only onComplete raw SQL (opaque) forces the live-schema drop. Every typed
+	// contraction leaves the live views valid (Postgres auto-follows the
+	// underlying renames; the view never references dropped originals), so the
+	// drop is unnecessary — proven per op by the seal tests.
 	cases := map[string]struct {
 		ops    migrations.Operations
 		expect bool
 	}{
-		"add column is projection-preserving": {
+		"add column": {
 			ops:    migrations.Operations{&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}}},
 			expect: false,
 		},
-		"create table is projection-preserving": {
+		"create table": {
 			ops:    migrations.Operations{&migrations.OpCreateTable{Name: "t"}},
 			expect: false,
 		},
-		"raw SQL without OnComplete is projection-preserving": {
+		"drop column": {
+			ops:    migrations.Operations{&migrations.OpDropColumn{Table: "t", Column: "c"}},
+			expect: false,
+		},
+		"rename column": {
+			ops:    migrations.Operations{&migrations.OpRenameColumn{Table: "t", From: "a", To: "b"}},
+			expect: false,
+		},
+		"rename table": {
+			ops:    migrations.Operations{&migrations.OpRenameTable{From: "a", To: "b"}},
+			expect: false,
+		},
+		"drop table": {
+			ops:    migrations.Operations{&migrations.OpDropTable{Name: "t"}},
+			expect: false,
+		},
+		"alter column": {
+			ops:    migrations.Operations{&migrations.OpAlterColumn{Table: "t", Column: "c", Up: "c", Down: "c"}},
+			expect: false,
+		},
+		"create constraint": {
+			ops:    migrations.Operations{&migrations.OpCreateConstraint{}},
+			expect: false,
+		},
+		"drop index": {
+			ops:    migrations.Operations{&migrations.OpDropIndex{Name: "idx"}},
+			expect: false,
+		},
+		"raw SQL without OnComplete": {
 			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
 			expect: false,
 		},
-		"drop column affects the projection": {
-			ops:    migrations.Operations{&migrations.OpDropColumn{Table: "t", Column: "c"}},
+		"onComplete raw SQL forces the drop": {
+			ops:    migrations.Operations{&migrations.OpRawSQL{Up: "ALTER TABLE t DROP COLUMN c", OnComplete: true}},
 			expect: true,
 		},
-		"rename column affects the projection": {
-			ops:    migrations.Operations{&migrations.OpRenameColumn{Table: "t", From: "a", To: "b"}},
-			expect: true,
-		},
-		// The case CompleteMustBeDeferred misses: a duplicator that runs inline
-		// but whose Complete drops/renames user-facing columns. A deferred
-		// final migration can carry it into the drain, so it must still force
-		// the live-schema drop.
-		"create constraint affects the projection though it runs inline": {
-			ops:    migrations.Operations{&migrations.OpCreateConstraint{}},
+		"onComplete raw SQL mixed with typed ops still forces the drop": {
+			ops: migrations.Operations{
+				&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "c", Type: "text", Nullable: true}},
+				&migrations.OpRawSQL{Up: "ALTER TABLE t DROP COLUMN old", OnComplete: true},
+			},
 			expect: true,
 		},
 	}
@@ -172,7 +199,7 @@ func TestCompleteAffectsLiveProjection(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			m := &migrations.Migration{Name: "x", Operations: tc.ops}
-			assert.Equal(t, tc.expect, m.CompleteAffectsLiveProjection())
+			assert.Equal(t, tc.expect, m.CompleteRequiresLiveSchemaDrop())
 		})
 	}
 }
