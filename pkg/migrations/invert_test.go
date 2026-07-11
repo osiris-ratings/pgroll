@@ -21,9 +21,10 @@ func invertFixtureSchema() *schema.Schema {
 			"users": {
 				Name: "users",
 				Columns: map[string]*schema.Column{
-					"id":    {Name: "id", Type: "integer"},
-					"email": {Name: "email", Type: "text", Nullable: true, Comment: "contact address"},
-					"score": {Name: "score", Type: "integer", Nullable: true, Default: ptrString("0")},
+					"id":     {Name: "id", Type: "integer"},
+					"email":  {Name: "email", Type: "text", Nullable: true, Comment: "contact address"},
+					"score":  {Name: "score", Type: "integer", Nullable: true, Default: ptrString("0")},
+					"org_id": {Name: "org_id", Type: "integer", Nullable: true},
 				},
 				PrimaryKey: []string{"id"},
 				Indexes: map[string]*schema.Index{
@@ -46,6 +47,17 @@ func invertFixtureSchema() *schema.Schema {
 				},
 				UniqueConstraints: map[string]*schema.UniqueConstraint{
 					"users_email_key": {Name: "users_email_key", Columns: []string{"email"}},
+				},
+				ForeignKeys: map[string]*schema.ForeignKey{
+					"users_org_id_fkey": {
+						Name:              "users_org_id_fkey",
+						Columns:           []string{"org_id"},
+						ReferencedTable:   "orgs",
+						ReferencedColumns: []string{"id"},
+						OnDelete:          "CASCADE",
+						OnUpdate:          "NO ACTION",
+						MatchType:         "SIMPLE",
+					},
 				},
 			},
 		},
@@ -204,15 +216,142 @@ func TestInvertOperations(t *testing.T) {
 		assert.Equal(t, "0", prior)
 	})
 
-	t.Run("alter column adding a constraint refuses", func(t *testing.T) {
-		_, err := (&OpAlterColumn{
+	t.Run("alter column adding a constraint inverts to a constraint drop", func(t *testing.T) {
+		inv := singleInverse(t, &OpAlterColumn{
 			Table:  "users",
 			Column: "score",
 			Unique: &UniqueConstraint{Name: "score_unique"},
 			Up:     "score",
 			Down:   "score",
+		}, pre)
+		drop, ok := inv.(*OpDropMultiColumnConstraint)
+		require.True(t, ok)
+		assert.Equal(t, "users", drop.Table)
+		assert.Equal(t, "score_unique", drop.Name)
+		assert.Equal(t, MultiColumnUpSQL{"score": "score"}, drop.Up)
+		assert.Equal(t, MultiColumnDownSQL{"score": "score"}, drop.Down)
+	})
+
+	t.Run("alter column combining a constraint with other changes refuses", func(t *testing.T) {
+		newType := "bigint"
+		_, err := (&OpAlterColumn{
+			Table:  "users",
+			Column: "score",
+			Type:   &newType,
+			Unique: &UniqueConstraint{Name: "score_unique"},
+			Up:     "score::bigint",
+			Down:   "score::integer",
 		}).Invert(pre)
-		require.ErrorContains(t, err, "constraint")
+		require.ErrorContains(t, err, "combines a constraint")
+	})
+
+	t.Run("create constraint inverts to a constraint drop with swapped expressions", func(t *testing.T) {
+		inv := singleInverse(t, &OpCreateConstraint{
+			Table:   "users",
+			Name:    "email_score_unique",
+			Type:    OpCreateConstraintTypeUnique,
+			Columns: []string{"email", "score"},
+			Up:      MultiColumnUpSQL{"email": "lower(email)", "score": "score"},
+			Down:    MultiColumnDownSQL{"email": "email", "score": "score"},
+		}, pre)
+		drop, ok := inv.(*OpDropMultiColumnConstraint)
+		require.True(t, ok)
+		assert.Equal(t, "email_score_unique", drop.Name)
+		assert.Equal(t, MultiColumnUpSQL{"email": "email", "score": "score"}, drop.Up,
+			"the drop's up is the create's down")
+		assert.Equal(t, MultiColumnDownSQL{"email": "lower(email)", "score": "score"}, drop.Down,
+			"the drop's down is the create's up")
+	})
+
+	t.Run("create primary key constraint refuses", func(t *testing.T) {
+		_, err := (&OpCreateConstraint{
+			Table:   "users",
+			Name:    "users_pk",
+			Type:    OpCreateConstraintTypePrimaryKey,
+			Columns: []string{"id"},
+			Up:      MultiColumnUpSQL{"id": "id"},
+			Down:    MultiColumnDownSQL{"id": "id"},
+		}).Invert(pre)
+		require.ErrorContains(t, err, "primary key")
+	})
+
+	t.Run("drop check constraint inverts to its recreation from the snapshot", func(t *testing.T) {
+		inv := singleInverse(t, &OpDropMultiColumnConstraint{
+			Table: "users",
+			Name:  "score_positive",
+			Up:    MultiColumnUpSQL{"score": "greatest(score, 0)"},
+			Down:  MultiColumnDownSQL{"score": "score"},
+		}, pre)
+		create, ok := inv.(*OpCreateConstraint)
+		require.True(t, ok)
+		assert.Equal(t, OpCreateConstraintTypeCheck, create.Type)
+		assert.Equal(t, "score_positive", create.Name)
+		assert.Equal(t, []string{"score"}, create.Columns)
+		require.NotNil(t, create.Check)
+		// pg_get_constraintdef double-wraps; one layer of parens may remain
+		// and is semantically harmless inside CHECK (...).
+		assert.Equal(t, "(score >= 0)", *create.Check)
+		assert.Equal(t, MultiColumnUpSQL{"score": "score"}, create.Up,
+			"the create's up is the drop's down")
+		assert.Equal(t, MultiColumnDownSQL{"score": "greatest(score, 0)"}, create.Down,
+			"the create's down is the drop's up")
+	})
+
+	t.Run("drop unique constraint without up falls back to identity", func(t *testing.T) {
+		inv := singleInverse(t, &OpDropMultiColumnConstraint{
+			Table: "users",
+			Name:  "users_email_key",
+			Down:  MultiColumnDownSQL{"email": "email"},
+		}, pre)
+		create, ok := inv.(*OpCreateConstraint)
+		require.True(t, ok)
+		assert.Equal(t, OpCreateConstraintTypeUnique, create.Type)
+		assert.Equal(t, []string{"email"}, create.Columns)
+		assert.Equal(t, MultiColumnUpSQL{"email": "email"}, create.Up)
+		assert.Equal(t, MultiColumnDownSQL{"email": `"email"`}, create.Down,
+			"missing drop up falls back to the identity projection")
+	})
+
+	t.Run("drop foreign key inverts to its recreation from the snapshot", func(t *testing.T) {
+		inv := singleInverse(t, &OpDropMultiColumnConstraint{
+			Table: "users",
+			Name:  "users_org_id_fkey",
+			Up:    MultiColumnUpSQL{"org_id": "org_id"},
+			Down:  MultiColumnDownSQL{"org_id": "org_id"},
+		}, pre)
+		create, ok := inv.(*OpCreateConstraint)
+		require.True(t, ok)
+		assert.Equal(t, OpCreateConstraintTypeForeignKey, create.Type)
+		assert.Equal(t, []string{"org_id"}, create.Columns)
+		require.NotNil(t, create.References)
+		assert.Equal(t, "orgs", create.References.Table)
+		assert.Equal(t, []string{"id"}, create.References.Columns)
+		assert.Equal(t, ForeignKeyActionCASCADE, create.References.OnDelete)
+		assert.Equal(t, ForeignKeyActionNOACTION, create.References.OnUpdate)
+		assert.Empty(t, create.References.MatchType, "SIMPLE match is the default and stays unset")
+	})
+
+	t.Run("drop of an unknown constraint refuses", func(t *testing.T) {
+		_, err := (&OpDropMultiColumnConstraint{
+			Table: "users",
+			Name:  "no_such_constraint",
+			Down:  MultiColumnDownSQL{"score": "score"},
+		}).Invert(pre)
+		require.ErrorContains(t, err, "not found")
+	})
+
+	t.Run("deprecated drop_constraint inverts via the snapshot for a single column", func(t *testing.T) {
+		inv := singleInverse(t, &OpDropConstraint{
+			Table: "users",
+			Name:  "score_positive",
+			Up:    "score",
+			Down:  "greatest(score, 0)",
+		}, pre)
+		create, ok := inv.(*OpCreateConstraint)
+		require.True(t, ok)
+		assert.Equal(t, OpCreateConstraintTypeCheck, create.Type)
+		assert.Equal(t, MultiColumnUpSQL{"score": "greatest(score, 0)"}, create.Up)
+		assert.Equal(t, MultiColumnDownSQL{"score": "score"}, create.Down)
 	})
 
 	t.Run("drop table recreates definition and indexes from snapshot", func(t *testing.T) {
@@ -223,7 +362,7 @@ func TestInvertOperations(t *testing.T) {
 		create, ok := ops[0].(*OpCreateTable)
 		require.True(t, ok)
 		assert.Equal(t, "users", create.Name)
-		require.Len(t, create.Columns, 3)
+		require.Len(t, create.Columns, 4)
 		byName := map[string]Column{}
 		for _, c := range create.Columns {
 			byName[c.Name] = c
@@ -233,13 +372,15 @@ func TestInvertOperations(t *testing.T) {
 		require.NotNil(t, byName["score"].Default)
 		assert.Equal(t, "0", *byName["score"].Default)
 
-		var checkC, uniqueC *Constraint
+		var checkC, uniqueC, fkC *Constraint
 		for i := range create.Constraints {
 			switch create.Constraints[i].Type {
 			case ConstraintTypeCheck:
 				checkC = &create.Constraints[i]
 			case ConstraintTypeUnique:
 				uniqueC = &create.Constraints[i]
+			case ConstraintTypeForeignKey:
+				fkC = &create.Constraints[i]
 			}
 		}
 		require.NotNil(t, checkC)
@@ -249,6 +390,10 @@ func TestInvertOperations(t *testing.T) {
 		assert.NotContains(t, checkC.Check, "CHECK")
 		require.NotNil(t, uniqueC)
 		assert.Equal(t, []string{"email"}, uniqueC.Columns)
+		require.NotNil(t, fkC)
+		assert.Equal(t, []string{"org_id"}, fkC.Columns)
+		require.NotNil(t, fkC.References)
+		assert.Equal(t, "orgs", fkC.References.Table)
 
 		idx, ok := ops[1].(*OpRawSQL)
 		require.True(t, ok)

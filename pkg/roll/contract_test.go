@@ -16,12 +16,12 @@ import (
 	"github.com/xataio/pgroll/pkg/roll"
 )
 
-// TestSealStampsBeforeContraction covers the seal-at-intent crash contract:
-// a seal interrupted after stamping but before (or during) the drain leaves
-// sealed-but-queued rows. Revert must refuse (the window is closed — no
-// crash state may present a drained row as revertible), and re-running the
-// seal must resume the drain to completion.
-func TestSealStampsBeforeContraction(t *testing.T) {
+// TestContractionStampsBeforeDDL covers the seal-at-intent crash contract: a
+// contraction interrupted after stamping but before (or during) the drain
+// leaves sealed-but-queued rows. Revert must refuse (the window is closed —
+// no crash state may present a drained row as revertible), and re-running
+// the contraction must resume the drain to completion.
+func TestContractionStampsBeforeDDL(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -57,25 +57,25 @@ func TestSealStampsBeforeContraction(t *testing.T) {
 			},
 		})
 
-		// Simulate the crash window immediately after the seal's stamp:
-		// every done row sealed, the deferred flags still set, no
-		// contraction DDL run yet.
+		// Simulate the crash window immediately after the stamp: every done
+		// row sealed, the deferred flags still set, no contraction DDL run
+		// yet.
 		_, err := db.ExecContext(ctx,
 			`UPDATE pgroll.migrations SET sealed = TRUE WHERE schema = $1 AND done`, cSchema)
 		require.NoError(t, err)
 
 		// The window is closed: revert refuses to touch the half-sealed
-		// train rather than running expand-phase rollbacks over rows whose
+		// batch rather than running expand-phase rollbacks over rows whose
 		// contraction may have partially run.
 		targets, err := mig.RevertTargets(ctx)
 		require.NoError(t, err)
 		require.Empty(t, targets, "sealed rows must not be revertible, even while still queued")
 
-		// Re-running the seal resumes forward: the sealed-but-queued rows
-		// are the durable signature of an interrupted seal.
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		// Re-running the contraction resumes forward: the sealed-but-queued
+		// rows are the durable signature of an interrupted run.
+		drained, _, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		require.Equal(t, 2, sealed, "both deferred rows drain on resume")
+		require.Equal(t, 2, drained, "both deferred rows drain on resume")
 
 		var emailExists bool
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -83,93 +83,28 @@ func TestSealStampsBeforeContraction(t *testing.T) {
 				SELECT 1 FROM information_schema.columns
 				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
 			)`, cSchema).Scan(&emailExists))
-		assert.False(t, emailExists, "the resumed seal must finish the contraction")
+		assert.False(t, emailExists, "the resumed contraction must finish the drain")
 
 		var queued int
 		require.NoError(t, db.QueryRowContext(ctx,
 			`SELECT count(*) FROM pgroll.migrations WHERE schema = $1 AND complete_deferred`,
 			cSchema).Scan(&queued))
-		assert.Zero(t, queued, "the resumed seal must clear the queue")
+		assert.Zero(t, queued, "the resumed contraction must clear the queue")
 
 		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "02_add_age")),
-			"the live projection must be recreated by the resumed seal")
+			"the live projection must survive the resumed contraction")
 	})
 }
 
-// TestOrphanedSchemaIsDistinctFromRevertTarget proves the system can tell a
-// deferred orphan apart from a schema in the open revert window. A best-effort
-// reap (ReapVersionSchemasExcept) leaves a sealed migration's version schema in
-// place when a backend still holds it; that orphan must never be mistaken for a
-// schema you can revert to. The discriminator is the sealed flag — the same
-// source of truth revert uses: an orphan is sealed (its contraction has run, so
-// it is not revertible), a window schema is unsealed.
-func TestOrphanedSchemaIsDistinctFromRevertTarget(t *testing.T) {
-	t.Parallel()
-
-	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-		ctx := context.Background()
-
-		// Two completed migrations whose version schemas both survive
-		// (WithSkipSchemaDrop), as a deferred reap would have left them.
-		require.NoError(t, mig.Start(ctx, &migrations.Migration{
-			Name:       "00_base",
-			Operations: migrations.Operations{createTableOp("t_base")},
-		}, backfill.NewConfig()))
-		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
-
-		require.NoError(t, mig.Start(ctx, &migrations.Migration{
-			Name:       "01_live",
-			Operations: migrations.Operations{createTableOp("t_live")},
-		}, backfill.NewConfig()))
-		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
-
-		// Drive the state the seal produces: the previous train (00_base) is
-		// sealed — its contraction has run — while the live train (01_live)
-		// stays in its open, revertible window. 00_base's schema survives only
-		// because its reap was deferred: it is now an orphan.
-		_, err := db.ExecContext(ctx,
-			`UPDATE pgroll.migrations SET sealed = TRUE WHERE schema = $1 AND name = '00_base'`, cSchema)
-		require.NoError(t, err)
-		_, err = db.ExecContext(ctx,
-			`UPDATE pgroll.migrations SET sealed = FALSE WHERE schema = $1 AND name = '01_live'`, cSchema)
-		require.NoError(t, err)
-
-		base := roll.VersionedSchemaName(cSchema, "00_base")
-		live := roll.VersionedSchemaName(cSchema, "01_live")
-		require.True(t, schemaExists(t, db, base))
-		require.True(t, schemaExists(t, db, live))
-
-		// The orphan is identified as such; the live/revertible schema is not.
-		orphans, err := mig.OrphanedVersionSchemas(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, []string{base}, orphans,
-			"the sealed, non-live leftover must be reported as an orphan")
-		assert.NotContains(t, orphans, live,
-			"the live, unsealed schema must never be reported as an orphan")
-
-		// Revert agrees: the window is the unsealed train only; the sealed
-		// orphan is not a revert target.
-		targets, err := mig.RevertTargets(ctx)
-		require.NoError(t, err)
-		names := make([]string, 0, len(targets))
-		for _, tg := range targets {
-			names = append(names, tg.Name)
-		}
-		assert.Contains(t, names, "01_live", "the unsealed migration is revertible")
-		assert.NotContains(t, names, "00_base", "the sealed orphan is not a revert target")
-	})
-}
-
-// TestSealKeepsLiveSchemaForAdditiveDrain proves the live-schema drop is
-// skipped when the drain has nothing to contract. A create-table deployment
-// left deferred only for the revert window (the incident shape:
-// add_onboarding_sessions) is projection-preserving — its Complete does not
-// drop or rename anything the live views project — so the live version schema
-// need not be dropped. The seal must succeed even while a backend holds the
-// live schema open with the AccessShare lock that would otherwise wedge the
-// (unnecessary) DROP SCHEMA, with retries disabled so a drop attempt would
-// fail outright.
-func TestSealKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
+// TestContractionKeepsLiveSchemaForAdditiveDrain proves the live-schema drop
+// is skipped when the drain has nothing to contract. A create-table batch
+// left deferred is projection-preserving — its Complete does not drop or
+// rename anything the live views project — so the live version schema need
+// not be dropped. The contraction must succeed even while a backend holds
+// the live schema open with the AccessShare lock that would otherwise wedge
+// the (unnecessary) DROP SCHEMA, with retries disabled so a drop attempt
+// would fail outright.
+func TestContractionKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
@@ -189,26 +124,25 @@ func TestSealKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
 			}, backfill.NewConfig()))
 			require.NoError(t, mig.Complete(ctx))
 
-			// An additive deployment left deferred (queued) for the revert
-			// window: a new table whose Complete touches neither users nor any
-			// identifier the live views project.
+			// An additive batch awaiting contraction: a new table whose
+			// Complete touches neither users nor any identifier the live
+			// views project.
 			applyDelayedContractionTrain(t, mig, []*migrations.Migration{
 				{Name: "01_create_sessions", Operations: migrations.Operations{createTableOp("sessions")}},
 			})
 
 			live := roll.VersionedSchemaName(cSchema, "01_create_sessions")
 
-			// A live backend holds the live schema's users view open. Dropping
-			// the live schema would need AccessExclusive on this view and fail
-			// immediately (retries disabled); the drain itself never touches
-			// users, so nothing legitimately blocks.
+			// A live backend holds the live schema's users view open.
+			// Dropping the live schema would need AccessExclusive on this
+			// view and fail immediately (retries disabled); the drain itself
+			// never touches users, so nothing legitimately blocks.
 			release := holdAccessShareOnView(t, db, live+".users")
 			defer release()
 
-			// The seal must still succeed: the additive drain needs no
-			// contraction, so the live schema is left in place rather than
-			// dropped.
-			drained, err := mig.SealDeferredCompletes(ctx)
+			// The contraction must still succeed: the additive drain needs
+			// no live-schema drop, so the schema is left in place.
+			drained, _, err := mig.FinishContraction(ctx)
 			require.NoError(t, err)
 			require.Equal(t, 1, drained)
 
@@ -223,21 +157,20 @@ func TestSealKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
 		})
 }
 
-// TestSealLiveSchemaHandlingPerOp is the empirical gate for skipping the
-// live-schema drop. Each case applies a deferred train that contracts table
-// `t`, while a backend holds the live view of an UNRELATED table `hot` (which
-// the migration never touches) with retries disabled. For every typed
-// contraction the seal must succeed WITHOUT dropping the live schema — so the
-// held `hot` view never blocks it, proving we did not drop the live schema (the
-// old behavior would have). Only opaque onComplete raw SQL forces the
-// whole-schema drop, which the held view then blocks.
-func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
+// TestContractionLiveSchemaHandlingPerOp is the empirical gate for skipping
+// the live-schema drop. Each case applies a deferred batch that contracts
+// table `t`, while a backend holds the live view of an UNRELATED table `hot`
+// (which the migration never touches) with retries disabled. For every typed
+// contraction the drain must succeed WITHOUT dropping the live schema — so
+// the held `hot` view never blocks it. Only opaque onComplete raw SQL forces
+// the whole-schema drop, which the held view then blocks.
+func TestContractionLiveSchemaHandlingPerOp(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name        string
 		op          migrations.Operation
-		wantSealErr bool // opaque raw SQL: full-schema drop blocked by the held view
+		wantErr     bool // opaque raw SQL: full-schema drop blocked by the held view
 		tViewGone   bool // drop_table removes t's own view
 	}{
 		{
@@ -269,9 +202,9 @@ func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
 			tViewGone: true,
 		},
 		{
-			name:        "opaque_oncomplete_raw_sql",
-			op:          &migrations.OpRawSQL{Up: "SELECT 1", OnComplete: true},
-			wantSealErr: true,
+			name:    "opaque_oncomplete_raw_sql",
+			op:      &migrations.OpRawSQL{Up: "SELECT 1", OnComplete: true},
+			wantErr: true,
 		},
 	}
 
@@ -283,8 +216,8 @@ func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
 				func(mig *roll.Roll, db *sql.DB) {
 					ctx := context.Background()
 
-					// Base deployment: `t` (to be contracted) and an unrelated
-					// hot table `hot`.
+					// Base deployment: `t` (to be contracted) and an
+					// unrelated hot table `hot`.
 					require.NoError(t, mig.Start(ctx, &migrations.Migration{
 						Name: "00_base",
 						Operations: migrations.Operations{
@@ -297,28 +230,29 @@ func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
 					}, backfill.NewConfig()))
 					require.NoError(t, mig.Complete(ctx))
 
-					// The deferred contraction train (the previous deployment).
+					// The deferred contraction batch.
 					version := "01_" + tc.name
 					applyDelayedContractionTrain(t, mig, []*migrations.Migration{
 						{Name: version, Operations: migrations.Operations{tc.op}},
 					})
 					live := roll.VersionedSchemaName(cSchema, version)
 
-					// A live backend holds the unrelated `hot` view open. Dropping
-					// the live SCHEMA needs AccessExclusive on it and would fail
-					// immediately (retries disabled); the contraction touches only
-					// `t`, so nothing legitimately blocks.
+					// A live backend holds the unrelated `hot` view open.
+					// Dropping the live SCHEMA needs AccessExclusive on it
+					// and would fail immediately (retries disabled); the
+					// contraction touches only `t`, so nothing legitimately
+					// blocks.
 					release := holdAccessShareOnView(t, db, live+".hot")
 					defer release()
 
-					_, err := mig.SealDeferredCompletes(ctx)
-					if tc.wantSealErr {
+					_, _, err := mig.FinishContraction(ctx)
+					if tc.wantErr {
 						require.Error(t, err,
 							"opaque drain must take the full-schema drop, which the held view blocks")
 						return
 					}
 					require.NoError(t, err,
-						"a typed contraction must seal without dropping the live schema")
+						"a typed contraction must drain without dropping the live schema")
 
 					assert.True(t, schemaExists(t, db, live), "live schema must remain")
 					assert.True(t, viewExists(t, db, live, "hot"),
@@ -337,13 +271,13 @@ func TestSealLiveSchemaHandlingPerOp(t *testing.T) {
 	}
 }
 
-// TestSealSkipsUnfinishedTrain covers the mid-train-crash recovery contract:
-// a `pgroll migrate` that died mid-batch leaves the applied prefix's
-// defer-class rows queued with a version-schema-less intermediate as the
-// history leaf. The seal must NOT fire — sealing would close the window
-// mid-train and drop the previous deployment's (production-pinned) schema —
-// so the retry resumes the train instead.
-func TestSealSkipsUnfinishedTrain(t *testing.T) {
+// TestContractionRefusesUnfinishedBatch covers the mid-batch-crash recovery
+// contract: a `pgroll migrate` that died mid-batch leaves the applied
+// prefix's defer-class rows queued with a version-schema-less intermediate
+// as the history leaf. The contraction must REFUSE — draining would fire the
+// point of no return mid-batch and drop the previous deployment's
+// (production-pinned) schema — so the operator resumes or aborts the batch.
+func TestContractionRefusesUnfinishedBatch(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -360,8 +294,8 @@ func TestSealSkipsUnfinishedTrain(t *testing.T) {
 		}, backfill.NewConfig()))
 		require.NoError(t, mig.Complete(ctx))
 
-		// A train that crashed after its first (destructive, deferred)
-		// intermediate: no version schema, queue non-empty, train-final
+		// A batch that crashed after its first (destructive, deferred)
+		// intermediate: no version schema, queue non-empty, batch-final
 		// never applied.
 		require.NoError(t, mig.Start(ctx, &migrations.Migration{
 			Name: "01_drop_email",
@@ -371,9 +305,8 @@ func TestSealSkipsUnfinishedTrain(t *testing.T) {
 		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
 		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
 
-		sealed, err := mig.SealDeferredCompletes(ctx)
-		require.NoError(t, err)
-		assert.Zero(t, sealed, "the seal must skip an unfinished train")
+		_, _, err := mig.FinishContraction(ctx)
+		require.ErrorContains(t, err, "unfinished", "the contraction must refuse an unfinished batch")
 
 		// Nothing was sealed or drained, and the previous deployment's
 		// schema survives — production apps stay pinned to it.
@@ -381,11 +314,11 @@ func TestSealSkipsUnfinishedTrain(t *testing.T) {
 		require.NoError(t, db.QueryRowContext(ctx,
 			`SELECT count(*) FROM pgroll.migrations WHERE schema = $1 AND complete_deferred AND NOT sealed`,
 			cSchema).Scan(&queued))
-		assert.Equal(t, 1, queued, "the crashed train's queue must stay intact and unsealed")
+		assert.Equal(t, 1, queued, "the crashed batch's queue must stay intact and unsealed")
 		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "00_create_users")),
-			"the previous deployment's version schema must survive the skipped seal")
+			"the previous deployment's version schema must survive the refused contraction")
 
-		// The partial train remains losslessly revertible: the documented
+		// The partial batch remains losslessly revertible: the documented
 		// alternative to resuming it.
 		targets, err := mig.RevertTargets(ctx)
 		require.NoError(t, err)
@@ -395,11 +328,11 @@ func TestSealSkipsUnfinishedTrain(t *testing.T) {
 	})
 }
 
-// TestSealHealsStrandedCompletes: a crash between an older binary's drain
-// and its (post-drain) seal stamp left done/drained/unsealed defer-class
-// rows with an empty queue — a state the window guard refuses and no drain
-// would ever stamp. The empty-queue seal path must heal it.
-func TestSealHealsStrandedCompletes(t *testing.T) {
+// TestContractionSealsStrandedCompletes: a crash between an older binary's
+// drain and its (post-drain) seal stamp left done/drained/unsealed
+// defer-class rows with an empty queue — a state the window guard refuses
+// and no drain would ever stamp. The empty-queue contraction must heal it.
+func TestContractionSealsStrandedCompletes(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -436,11 +369,12 @@ func TestSealHealsStrandedCompletes(t *testing.T) {
 		_, err = mig.RevertTargets(ctx)
 		require.ErrorContains(t, err, "not sealed")
 
-		// ...and the empty-queue seal heals it, exactly as the error's
-		// advice (re-run migrate or complete) promises.
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		// ...and the empty-queue contraction heals it, exactly as the
+		// error's advice (re-run migrate or complete) promises.
+		drained, stamped, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		assert.Zero(t, sealed, "nothing drains; the heal only stamps")
+		assert.Zero(t, drained, "nothing drains; the heal only stamps")
+		assert.Equal(t, int64(1), stamped, "the stranded row is stamped sealed")
 
 		var isSealed bool
 		require.NoError(t, db.QueryRowContext(ctx,
@@ -528,11 +462,11 @@ func TestRevertRefusesIrreversibleMigration(t *testing.T) {
 	})
 }
 
-// TestSealWindowClosesInlineOnlyWindow: a bounded revert can re-open a train
-// whose remaining rows are all inline-completed — nothing queued, so the
-// drain path has nothing to do. The explicit SealWindow (manual `pgroll
-// complete`) must still close that window on demand.
-func TestSealWindowClosesInlineOnlyWindow(t *testing.T) {
+// TestFinishContractionClosesInlineOnlyWindow: a bounded revert can re-open
+// a batch whose remaining rows are all inline-completed — nothing queued, so
+// the drain path has nothing to do. `pgroll complete` (FinishContraction)
+// must still close that window and converge the version schemas.
+func TestFinishContractionClosesInlineOnlyWindow(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -572,34 +506,32 @@ func TestSealWindowClosesInlineOnlyWindow(t *testing.T) {
 			},
 		})
 
-		// Bounded revert removes the (deferred) train-final, leaving an
+		// Bounded revert removes the (deferred) batch-final, leaving an
 		// inline-only window with an empty queue.
 		reverted, err := mig.Revert(ctx, roll.WithRevertSteps(1))
 		require.NoError(t, err)
 		require.Len(t, reverted, 1)
 
-		// The drain path has nothing to do and must NOT close the window:
-		// the re-applied train-final should join it.
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		// The explicit contraction stamps the inline row and converges the
+		// version schemas onto the new leaf's.
+		drained, stamped, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		assert.Zero(t, sealed)
-		targets, err := mig.RevertTargets(ctx)
-		require.NoError(t, err)
-		require.Len(t, targets, 1, "the inline row stays revertible after a drain-only seal")
-
-		// The explicit window close stamps it.
-		stamped, err := mig.SealWindow(ctx)
-		require.NoError(t, err)
+		assert.Zero(t, drained)
 		assert.Equal(t, int64(1), stamped)
 
-		targets, err = mig.RevertTargets(ctx)
+		targets, err := mig.RevertTargets(ctx)
 		require.NoError(t, err)
 		assert.Empty(t, targets)
+
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "01_add_age")),
+			"the leaf's projection must survive")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "00_create_users")),
+			"older version schemas must be dropped by the contraction")
 	})
 }
 
 // TestRevertInlineCompletedRenameConstraint: rename_constraint completes
-// inline as a train intermediate (its Complete physically renames the
+// inline as a batch intermediate (its Complete physically renames the
 // constraint). Reverting it must rename the constraint back — previously
 // its no-op Rollback deleted the history row while the rename persisted.
 func TestRevertInlineCompletedRenameConstraint(t *testing.T) {
@@ -659,10 +591,10 @@ func TestRevertInlineCompletedRenameConstraint(t *testing.T) {
 	})
 }
 
-// TestSealedRevertRecordsTombstones: a sealed revert must leave tombstones
-// for its targets so an unchanged re-apply is refused (the convergent-deploy
-// re-application hazard), and clearing them must work.
-func TestSealedRevertRecordsTombstones(t *testing.T) {
+// TestInversionRevertRecordsTombstones: an inversion revert must leave
+// tombstones for its targets so an unchanged re-apply is refused (the
+// convergent-deploy re-application hazard), and clearing them must work.
+func TestInversionRevertRecordsTombstones(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -688,9 +620,9 @@ func TestSealedRevertRecordsTombstones(t *testing.T) {
 			},
 		})
 
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		drained, _, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		require.Equal(t, 1, sealed)
+		require.Equal(t, 1, drained)
 
 		result, err := mig.RevertSealed(ctx, "00_create_users", nil)
 		require.NoError(t, err)
@@ -700,7 +632,7 @@ func TestSealedRevertRecordsTombstones(t *testing.T) {
 		tombstones, err := mig.State().RevertedMigrations(ctx, cSchema)
 		require.NoError(t, err)
 		hash, ok := tombstones["01_drop_email"]
-		require.True(t, ok, "the sealed revert must record a tombstone for its target")
+		require.True(t, ok, "the inversion revert must record a tombstone for its target")
 		assert.NotEmpty(t, hash)
 
 		// The hash matches the reverted content, so an unchanged re-apply
@@ -727,5 +659,88 @@ func TestSealedRevertRecordsTombstones(t *testing.T) {
 		tombstones, err = mig.State().RevertedMigrations(ctx, cSchema)
 		require.NoError(t, err)
 		assert.Empty(t, tombstones)
+	})
+}
+
+// TestBatchedMigrateCompleteConverges is the end-state invariant for the
+// two-phase deploy: after a batch is applied expand-only (final ACTIVE) and
+// `pgroll complete` contracts it, exactly one version schema exists, every
+// row is sealed with an empty queue, and the leaf's snapshot is a clean
+// anchor for inversion reverts.
+func TestBatchedMigrateCompleteConverges(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		// The batch, as `pgroll migrate` (no --complete) applies it:
+		// defer-class intermediate, inline intermediate, final left ACTIVE.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "01_drop_email",
+			Operations: migrations.Operations{
+				&migrations.OpDropColumn{Table: "users", Column: "email", Down: "''"},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "02_add_age",
+			Operations: migrations.Operations{
+				&migrations.OpAddColumn{
+					Table:  "users",
+					Up:     "18",
+					Column: migrations.Column{Name: "age", Type: "integer", Nullable: true},
+				},
+			},
+		}, backfill.NewConfig(), roll.WithoutVersionSchema()))
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "03_create_sessions",
+			Operations: migrations.Operations{createTableOp("sessions")},
+		}, backfill.NewConfig()))
+
+		// The fleet repins here; then the deploy's contraction step runs.
+		require.NoError(t, mig.Complete(ctx))
+
+		// Exactly one version schema: the leaf's.
+		schemas, err := mig.ExistingVersionSchemas(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []string{roll.VersionedSchemaName(cSchema, "03_create_sessions")}, schemas)
+
+		// Every row sealed; queue empty.
+		var unsealed, queued int
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT count(*) FILTER (WHERE NOT sealed), count(*) FILTER (WHERE complete_deferred)
+			 FROM pgroll.migrations WHERE schema = $1`, cSchema).Scan(&unsealed, &queued))
+		assert.Zero(t, unsealed, "every row must be sealed after the deploy's complete")
+		assert.Zero(t, queued, "the intra-deploy queue must drain at complete")
+
+		// The drain physically ran.
+		var emailExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
+			)`, cSchema).Scan(&emailExists))
+		assert.False(t, emailExists, "the deferred contraction must run at complete")
+
+		// The leaf snapshot is a clean inversion anchor.
+		var snapshot string
+		require.NoError(t, db.QueryRowContext(ctx,
+			`SELECT resulting_schema::text FROM pgroll.migrations WHERE schema = $1 AND name = '03_create_sessions'`,
+			cSchema).Scan(&snapshot))
+		assert.NotContains(t, snapshot, "_pgroll_", "the deploy-boundary snapshot must be clean")
 	})
 }

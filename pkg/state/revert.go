@@ -93,24 +93,6 @@ func (s *State) MarkSealed(ctx context.Context, schema string) (int64, error) {
 	return n, nil
 }
 
-// MarkSealedByName stamps the named migrations as sealed. Used to heal
-// stranded rows (drained defer-class migrations left unsealed by a crash
-// between a Complete's drain and its seal stamp on an older binary) without
-// touching other unsealed rows, whose window may legitimately still be open.
-func (s *State) MarkSealedByName(ctx context.Context, schema string, names []string) error {
-	if len(names) == 0 {
-		return nil
-	}
-	_, err := s.pgConn.ExecContext(ctx, fmt.Sprintf(
-		"UPDATE %s.migrations SET sealed=TRUE WHERE schema=$1 AND name = ANY($2)",
-		pq.QuoteIdentifier(s.schema),
-	), schema, pq.Array(names))
-	if err != nil {
-		return fmt.Errorf("unable to mark migrations sealed by name: %w", err)
-	}
-	return nil
-}
-
 // DeleteMigration removes the named migration row regardless of its done
 // state. Used by the revert walk, which always removes the current leaf —
 // the parent foreign key guarantees a row with a child cannot be deleted,

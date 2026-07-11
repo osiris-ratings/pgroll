@@ -212,9 +212,9 @@ func TestSealClosesRevertWindow(t *testing.T) {
 			)`, cSchema).Scan(&emailExists))
 		assert.True(t, emailExists, "deferred drop must not run before the seal")
 
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		drained, _, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, 2, sealed)
+		assert.Equal(t, 2, drained)
 
 		// Contraction drained: email physically gone.
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -244,10 +244,10 @@ func TestSealClosesRevertWindow(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, reverted, "revert after seal must be a no-op")
 
-		// Sealing again is a no-op.
-		sealed, err = mig.SealDeferredCompletes(ctx)
+		// Contracting again is a no-op.
+		drained, _, err = mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		assert.Zero(t, sealed)
+		assert.Zero(t, drained)
 	})
 }
 

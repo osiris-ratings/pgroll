@@ -12,6 +12,12 @@ import (
 	"github.com/xataio/pgroll/pkg/state"
 )
 
+// ErrRevertTargetSealed marks a revert bound that names a migration whose
+// contraction has already run: a lossless window revert cannot reach it, but
+// an inversion revert (RevertSealed) can — the CLI uses this sentinel to
+// switch modes.
+var ErrRevertTargetSealed = fmt.Errorf("revert target is sealed")
+
 // RevertTargetState classifies how a migration in the revertible window will
 // be rolled back.
 type RevertTargetState string
@@ -69,8 +75,8 @@ func WithRevertTo(name string) RevertOption {
 
 // RevertTargets computes the revertible window: the contiguous unsealed
 // suffix of history, walked parent-ward from the leaf, newest first. The
-// window is the most recent deployment — sealing (the next train departing,
-// or a manual `pgroll complete`) is the point of no return that closes it.
+// window is the deployment in flight — contraction (`pgroll complete`, or
+// `migrate --complete`) is the point of no return that closes it.
 //
 // The walk is anchored at the actual history leaf rather than trusting row
 // order: a sealed row sitting ABOVE unsealed rows (an inferred DDL capture
@@ -260,8 +266,9 @@ func (m *Roll) RevertPlan(ctx context.Context, opts ...RevertOption) ([]RevertTa
 				boundary = *latest
 			}
 			return nil, fmt.Errorf(
-				"migration %q is sealed: its contraction has run and revert cannot restore the prior state; "+
-					"the deepest reachable target is %q", o.to, boundary,
+				"migration %q is sealed: its contraction has run and a lossless revert cannot restore "+
+					"the prior state (the deepest lossless target is %q): %w", o.to, boundary,
+				ErrRevertTargetSealed,
 			)
 		}
 		return nil, fmt.Errorf("migration %q not found in history", o.to)
@@ -278,8 +285,9 @@ func (m *Roll) RevertPlan(ctx context.Context, opts ...RevertOption) ([]RevertTa
 // renamed pgroll-internal artifacts.
 //
 // Apps pinned to the deployment's version schema must be repinned to the
-// previous deployment's schema (still alive under delayed contraction)
-// before reverting — the walk drops the newer version schema first.
+// previous deployment's schema (still alive until this deployment's
+// `pgroll complete` contracts it) before reverting — the walk drops the
+// newer version schema first.
 //
 // After a bounded revert the new leaf may be a train intermediate that
 // never projected a version schema; one is materialized for it so apps and

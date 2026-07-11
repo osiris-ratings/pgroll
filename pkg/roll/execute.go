@@ -492,7 +492,7 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	// the live views (renames auto-follow; drops/duplicators don't touch the
 	// projected names; dropped tables are filtered out of the view), so the
 	// drop — and the matching recreate below — are skipped, leaving the views
-	// (and any apps reading them) untouched. See SealDeferredCompletes for the
+	// (and any apps reading them) untouched. See FinishContraction for the
 	// same reasoning; per-op tests prove the typed ops drain safely in place.
 	needsLiveDrop := migration.CompleteRequiresLiveSchemaDrop()
 	if !o.skipSchemaDrop {
@@ -873,7 +873,7 @@ func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migrat
 // applyDeferredComplete constructs and executes a deferred migration's
 // Complete actions against the current physical schema, without clearing
 // its complete_deferred flag. Callers that need to order other durable
-// steps before the flag clears (see SealDeferredCompletes) use this
+// steps before the flag clears (see FinishContraction) use this
 // directly; everyone else uses drainDeferredMigration.
 func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migration) error {
 	drainSchema, err := m.state.ReadSchema(ctx, m.schema)
@@ -928,98 +928,14 @@ func (m *Roll) ExistingVersionSchemas(ctx context.Context) ([]string, error) {
 	return schemas, nil
 }
 
-// OrphanedVersionSchemas returns version schemas that physically exist but are
-// neither the live projection nor backed by any unsealed migration — the
-// leftovers of sealed migrations whose drop a best-effort reap
-// (ReapVersionSchemasExcept) could not perform because a backend still held a
-// lock, and which a later deployment will collect.
-//
-// These must never be mistaken for a schema you can revert to. The
-// discriminator is the sealed flag — the same source of truth `pgroll revert`
-// uses (RevertTargets walks only unsealed rows, and refuses sealed ones). A
-// deferred orphan is sealed: its contraction has run, so reverting to it
-// cannot restore the prior state. A schema in the open revert window is
-// unsealed. The relationship is structural, not incidental:
-// SealDeferredCompletes stamps every row sealed *before* the reap runs, so
-// every schema the reap can defer is already sealed — an orphan can never be a
-// revert-window schema. The live projection is excluded unconditionally: apps
-// are pinned to it whether or not its own migration has been sealed (a
-// non-deferred complete seals inline).
-func (m *Roll) OrphanedVersionSchemas(ctx context.Context) ([]string, error) {
-	existing, err := m.ExistingVersionSchemas(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(existing) == 0 {
-		return nil, nil
-	}
-
-	// active = the live projection ∪ every unsealed migration's schema. These
-	// are the schemas apps are pinned to or can roll back to; everything else
-	// that physically exists is orphaned garbage.
-	active := make(map[string]bool)
-
-	latest, err := m.state.LatestMigration(ctx, m.schema)
-	if err != nil {
-		return nil, fmt.Errorf("unable to determine latest migration: %w", err)
-	}
-	if latest != nil {
-		live, err := m.state.GetMigration(ctx, m.schema, *latest)
-		if err != nil {
-			return nil, fmt.Errorf("unable to load latest migration: %w", err)
-		}
-		active[VersionedSchemaName(m.schema, live.VersionSchemaName())] = true
-	}
-
-	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read unsealed migrations: %w", err)
-	}
-	for _, r := range unsealed {
-		active[VersionedSchemaName(m.schema, r.Migration.VersionSchemaName())] = true
-	}
-
-	var orphans []string
-	for _, s := range existing {
-		if !active[s] {
-			orphans = append(orphans, s)
-		}
-	}
-	return orphans, nil
-}
-
 // DropVersionSchemasExcept drops all version schemas for the given schema
 // except those whose version name is in the keep list. Version schemas are
-// identified by their prefix (schema + "_"). A drop blocked by another
-// backend's lock aborts the call after the lock-retry budget is exhausted —
-// use ReapVersionSchemasExcept when a blocked drop should be deferred instead.
+// identified by their prefix (schema + "_"). Strict: a drop blocked by
+// another backend's lock (after the lock-retry budget is exhausted) aborts
+// the call, naming the blocking sessions — a held lock on a retiring schema
+// means something is still reading a projection this deployment is dropping,
+// and the operator must repin the straggler and re-run.
 func (m *Roll) DropVersionSchemasExcept(ctx context.Context, keep ...string) error {
-	_, err := m.dropVersionSchemasExcept(ctx, false, keep)
-	return err
-}
-
-// ReapVersionSchemasExcept is the best-effort counterpart of
-// DropVersionSchemasExcept: a version schema whose drop is blocked by a lock
-// held by another backend (lock_timeout / SQLSTATE 55P03, raised after the
-// retry budget is exhausted) is logged with its blocking sessions and left in
-// place rather than aborting the caller. The skipped schemas are returned and
-// reaped automatically by a later deployment once they fall idle.
-//
-// A held AccessShareLock on a version schema means a live backend is still
-// reading through that schema's views; dropping it would break those sessions
-// mid-query. Deferring the reap is therefore the correct, safe behavior, not
-// merely a convenience — old version-schema garbage must not be collected
-// while production traffic is still pinned to it. Reaping must never sit on
-// the critical path of a deployment: failing to collect dead garbage cannot
-// be allowed to fail the migrate that applies new work.
-//
-// Non-lock failures (e.g. permission errors) still abort — they are not
-// transient and would silently recur on every deployment.
-func (m *Roll) ReapVersionSchemasExcept(ctx context.Context, keep ...string) (deferred []string, err error) {
-	return m.dropVersionSchemasExcept(ctx, true, keep)
-}
-
-func (m *Roll) dropVersionSchemasExcept(ctx context.Context, bestEffort bool, keep []string) ([]string, error) {
 	keepSet := make(map[string]bool, len(keep))
 	for _, k := range keep {
 		keepSet[VersionedSchemaName(m.schema, k)] = true
@@ -1030,7 +946,7 @@ func (m *Roll) dropVersionSchemasExcept(ctx context.Context, bestEffort bool, ke
 		"SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1 ORDER BY schema_name",
 		prefix+"%")
 	if err != nil {
-		return nil, fmt.Errorf("unable to list version schemas: %w", err)
+		return fmt.Errorf("unable to list version schemas: %w", err)
 	}
 	defer rows.Close()
 
@@ -1038,43 +954,36 @@ func (m *Roll) dropVersionSchemasExcept(ctx context.Context, bestEffort bool, ke
 	for rows.Next() {
 		var schemaName string
 		if err := rows.Scan(&schemaName); err != nil {
-			return nil, fmt.Errorf("unable to scan schema name: %w", err)
+			return fmt.Errorf("unable to scan schema name: %w", err)
 		}
 		if !keepSet[schemaName] {
 			toDrop = append(toDrop, schemaName)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating version schemas: %w", err)
+		return fmt.Errorf("error iterating version schemas: %w", err)
 	}
 
 	if len(toDrop) == 0 {
-		m.logger.Info("deferred schema cleanup: no intermediate schemas to drop")
+		m.logger.Info("schema cleanup: no old version schemas to drop")
 	} else {
-		m.logger.Info("deferred schema cleanup: dropping intermediate schemas", "count", len(toDrop))
+		m.logger.Info("schema cleanup: dropping old version schemas", "count", len(toDrop))
 	}
 
-	var deferred []string
 	for _, s := range toDrop {
-		m.logger.Info("deferred schema cleanup: dropping schema", "schema", s)
+		m.logger.Info("schema cleanup: dropping schema", "schema", s)
 		_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(s)))
 		if err != nil {
-			if bestEffort && isLockNotAvailable(err) {
-				// A live backend still holds a lock inside this schema, so it
-				// is still in use; carry it forward to a later deployment
-				// rather than failing the migrate. Name the blockers so the
-				// straggler can be cleared out of band.
-				m.logger.Warn("deferred schema cleanup: schema still locked by another backend; "+
-					"deferring its drop to a later deployment",
-					"schema", s, "holders", m.schemaLockHolders(ctx, s))
-				deferred = append(deferred, s)
-				continue
+			if isLockNotAvailable(err) {
+				return fmt.Errorf("unable to drop version schema %q "+
+					"(apps still reading it must move off it first); blocked by:%s: %w",
+					s, m.schemaLockHolders(ctx, s), err)
 			}
-			return deferred, fmt.Errorf("unable to drop version schema %q: %w", s, err)
+			return fmt.Errorf("unable to drop version schema %q: %w", s, err)
 		}
 	}
 
-	return deferred, nil
+	return nil
 }
 
 // schemaLockHolders reports, best effort, the backends holding locks on objects

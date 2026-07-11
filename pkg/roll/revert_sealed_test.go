@@ -85,12 +85,12 @@ func TestRevertSealed(t *testing.T) {
 			},
 		})
 
-		// SEAL it: contraction drains, email's data is physically
+		// CONTRACT it: the drain runs, email's data is physically
 		// destroyed. The drained count covers the deferred rows (01, 03,
 		// 04); the inline 02 had no queued work but is stamped sealed too.
-		sealed, err := mig.SealDeferredCompletes(ctx)
+		drained, _, err := mig.FinishContraction(ctx)
 		require.NoError(t, err)
-		require.Equal(t, 3, sealed)
+		require.Equal(t, 3, drained)
 
 		var emailExists bool
 		require.NoError(t, db.QueryRowContext(ctx, `
@@ -218,8 +218,8 @@ func TestRevertSealedGuards(t *testing.T) {
 		_, err := mig.PlanRevertSealed(ctx, "00_create_users")
 		require.ErrorContains(t, err, "revert window is open")
 
-		// Seal, then: unknown boundary refused.
-		_, err = mig.SealDeferredCompletes(ctx)
+		// Contract, then: unknown boundary refused.
+		_, _, err = mig.FinishContraction(ctx)
 		require.NoError(t, err)
 		_, err = mig.PlanRevertSealed(ctx, "no_such_migration")
 		require.ErrorContains(t, err, "not found")
@@ -236,5 +236,87 @@ func TestRevertSealedGuards(t *testing.T) {
 
 		_, err = mig.PlanRevertSealed(ctx, "00_create_users")
 		require.ErrorContains(t, err, "irreversible")
+	})
+}
+
+// TestExpandOnlyRevertSplitFlow covers the zero-downtime revert choreography:
+// `revert --to X --expand-only` applies the inverse train but leaves the
+// final inverse ACTIVE, with the restored boundary projection existing
+// alongside the current one so apps can repin; `pgroll complete` then
+// contracts the inverses and FinishPendingSealedRevert prunes history back
+// to the boundary.
+func TestExpandOnlyRevertSplitFlow(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: "00_create_users",
+			Operations: migrations.Operations{
+				&migrations.OpRawSQL{
+					Up:   `CREATE TABLE users (id integer PRIMARY KEY, email text)`,
+					Down: `DROP TABLE users`,
+				},
+			},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		applyDelayedContractionTrain(t, mig, []*migrations.Migration{
+			{
+				Name: "01_drop_email",
+				Operations: migrations.Operations{
+					&migrations.OpDropColumn{Table: "users", Column: "email", Down: "'x@example.com'"},
+				},
+			},
+		})
+		drained, _, err := mig.FinishContraction(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 1, drained)
+
+		// Expand-only: the inverse train applies but stops before its final
+		// Complete — both projections exist side by side for the repin.
+		plan, err := mig.RevertSealed(ctx, "00_create_users", nil, roll.WithExpandOnly())
+		require.NoError(t, err)
+		require.NotNil(t, plan)
+
+		active, err := mig.State().GetActiveMigration(ctx, cSchema)
+		require.NoError(t, err)
+		assert.Equal(t, "revert_01_drop_email", active.Name)
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "00_create_users")),
+			"the restored boundary projection must exist for the repin")
+		assert.True(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "01_drop_email")),
+			"the current projection must survive until the completing step")
+
+		// `pgroll complete` contracts the inverse; FinishPendingSealedRevert
+		// prunes history back to the boundary (the CLI runs both).
+		require.NoError(t, mig.Complete(ctx))
+		finished, err := mig.FinishPendingSealedRevert(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, finished)
+		assert.Equal(t, "00_create_users", finished.Boundary)
+
+		latest, err := mig.State().LatestMigration(ctx, cSchema)
+		require.NoError(t, err)
+		require.NotNil(t, latest)
+		assert.Equal(t, "00_create_users", *latest)
+
+		// Schema restored: email is back (re-derived through the original
+		// down), and only the boundary projection remains.
+		var emailExists bool
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'email'
+			)`, cSchema).Scan(&emailExists))
+		assert.True(t, emailExists, "the reverted drop_column must be physically undone")
+		assert.False(t, schemaExists(t, db, roll.VersionedSchemaName(cSchema, "01_drop_email")),
+			"the reverted deployment's projection must be gone")
+
+		// The forward migration is tombstoned against silent re-apply.
+		tombstones, err := mig.State().RevertedMigrations(ctx, cSchema)
+		require.NoError(t, err)
+		_, ok := tombstones["01_drop_email"]
+		assert.True(t, ok, "the pruned forward migration must be tombstoned")
 	})
 }
