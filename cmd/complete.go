@@ -3,12 +3,14 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 
+	"github.com/xataio/pgroll/pkg/roll"
 	"github.com/xataio/pgroll/pkg/state"
 )
 
@@ -26,35 +28,48 @@ var completeCmd = &cobra.Command{
 		sp, _ := pterm.DefaultSpinner.WithText("Completing migration...").Start()
 		err = m.Complete(cmd.Context())
 		if err != nil {
-			// No active migration: under delayed contraction, completed
-			// deployments leave their destructive DDL queued so they stay
-			// revertible. Treat a bare `pgroll complete` as the manual
-			// contraction trigger — drain the queue and close the revert
-			// window on demand.
+			// No active migration: contract whatever the deployment left
+			// pending — drain the deferred queue (a resumed batch, or a
+			// database upgraded with its delayed-contraction window still
+			// open) and stamp the deployment sealed.
 			if errors.Is(err, state.ErrNoActiveMigration) {
-				drained, sealErr := m.SealDeferredCompletes(cmd.Context())
-				if sealErr != nil {
-					sp.Fail(fmt.Sprintf("Failed to drain deferred completions: %s", sealErr))
-					return sealErr
-				}
-				// A manual seal closes the window completely: also stamp
-				// unsealed rows with nothing queued (inline-only windows,
-				// e.g. a train re-opened by a bounded revert).
-				stamped, sealErr := m.SealWindow(cmd.Context())
-				if sealErr != nil {
-					sp.Fail(fmt.Sprintf("Failed to seal the revert window: %s", sealErr))
-					return sealErr
+				drained, stamped, finishErr := m.FinishContraction(cmd.Context())
+				if finishErr != nil {
+					sp.Fail(fmt.Sprintf("Failed to contract the deployment: %s", finishErr))
+					return finishErr
 				}
 				if drained > 0 || stamped > 0 {
-					sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) and sealed %d migration(s). The revert window is now closed.", drained, stamped))
-					return nil
+					sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) and sealed %d migration(s).", drained, stamped))
+				} else {
+					sp.Success("Nothing to complete: no active migration and no pending contraction.")
 				}
+				return finishPendingRevert(cmd.Context(), m)
 			}
 			sp.Fail(fmt.Sprintf("Failed to complete migration: %s", err))
 			return err
 		}
 
 		sp.Success("Migration successful!")
-		return nil
+		return finishPendingRevert(cmd.Context(), m)
 	},
+}
+
+// finishPendingRevert finishes an applied-but-unpruned inverse train, if the
+// history leaf is one: it prunes the reverted forward migrations and their
+// inverses from history and records re-application tombstones. This is the
+// second half of a split (`revert --expand-only`) revert — the operator
+// repins the fleet to the restored schema between the expand and this
+// complete — and also the resume path for a revert interrupted between its
+// final Complete and its prune. A no-op for ordinary migrations.
+func finishPendingRevert(ctx context.Context, m *roll.Roll) error {
+	plan, err := m.FinishPendingSealedRevert(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to finish the pending revert: %w", err)
+	}
+	if plan == nil {
+		return nil
+	}
+	pterm.Success.Printfln("Finished the pending revert: %d migration(s) unwound; history restored to %q.",
+		len(plan.Targets), plan.Boundary)
+	return nil
 }

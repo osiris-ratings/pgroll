@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/lib/pq"
 	"github.com/oapi-codegen/nullable"
 
 	"github.com/xataio/pgroll/pkg/db"
@@ -171,7 +172,8 @@ func replayStart(ctx context.Context, op Operation, migName string, fakeDB db.DB
 // from their own fields.
 func invertReadsPreState(op Operation) bool {
 	switch op.(type) {
-	case *OpDropColumn, *OpDropTable, *OpDropIndex, *OpAlterColumn:
+	case *OpDropColumn, *OpDropTable, *OpDropIndex, *OpAlterColumn,
+		*OpDropMultiColumnConstraint, *OpDropConstraint:
 		return true
 	default:
 		return false
@@ -353,12 +355,47 @@ func (o *OpDropColumn) Invert(pre *schema.Schema) ([]Operation, error) {
 // Invert restores the column's prior type/nullability/default/comment from
 // the pre-state snapshot, with the data expressions swapped (the original
 // down re-derives the prior values; the original up re-derives the new ones
-// while the inverse is itself in its expand phase). Constraint-adding
-// sub-operations (check/unique/references) invert to constraint drops,
-// which are not yet expressible — refused by name.
+// while the inverse is itself in its expand phase). A constraint-adding
+// sub-operation (check/unique/references) inverts to a drop of the added
+// constraint — but only when it is the alter's sole change: composing a
+// constraint drop with other sub-inverses on the same column in one
+// migration is refused rather than synthesized unsoundly.
 func (o *OpAlterColumn) Invert(pre *schema.Schema) ([]Operation, error) {
-	if o.Check != nil || o.Unique != nil || o.References != nil {
-		return nil, fmt.Errorf("alter_column on %q.%q adds a constraint; constraint inverses are not supported yet", o.Table, o.Column)
+	var constraintNames []string
+	if o.Check != nil {
+		constraintNames = append(constraintNames, o.Check.Name)
+	}
+	if o.Unique != nil {
+		constraintNames = append(constraintNames, o.Unique.Name)
+	}
+	if o.References != nil {
+		constraintNames = append(constraintNames, o.References.Name)
+	}
+	if len(constraintNames) > 0 {
+		otherChanges := o.Type != nil || o.Nullable != nil || o.Default.IsSpecified() || o.Comment.IsSpecified()
+		if len(constraintNames) > 1 || otherChanges {
+			return nil, fmt.Errorf(
+				"alter_column on %q.%q combines a constraint with other changes; its inverse cannot be "+
+					"synthesized soundly", o.Table, o.Column)
+		}
+		// The inverse drops the constraint the alter added. Data expressions
+		// swap direction: the alter's down re-derives the unconstrained
+		// values (the drop's up), and its up re-derives the constrained ones
+		// (the drop's down, used if the inverse train is itself reverted).
+		up := o.Down
+		if up == "" {
+			up = pq.QuoteIdentifier(o.Column)
+		}
+		down := o.Up
+		if down == "" {
+			down = pq.QuoteIdentifier(o.Column)
+		}
+		return []Operation{&OpDropMultiColumnConstraint{
+			Table: o.Table,
+			Name:  constraintNames[0],
+			Up:    MultiColumnUpSQL{o.Column: up},
+			Down:  MultiColumnDownSQL{o.Column: down},
+		}}, nil
 	}
 
 	table := pre.GetTable(o.Table)
@@ -537,6 +574,121 @@ func (o *OpDropTable) Invert(pre *schema.Schema) ([]Operation, error) {
 	}
 
 	return ops, nil
+}
+
+// Invert drops the constraint this operation created. The drop's data
+// expressions are the create's own, with direction swapped: the create's
+// down re-derives the unconstrained values (the drop's up), and its up
+// re-derives the constrained ones (the drop's down). Primary keys are
+// refused: OpDropMultiColumnConstraint cannot drop them.
+func (o *OpCreateConstraint) Invert(_ *schema.Schema) ([]Operation, error) {
+	if o.Type == OpCreateConstraintTypePrimaryKey {
+		return nil, fmt.Errorf(
+			"create_constraint %q on %q adds a primary key; primary key inverses are not supported",
+			o.Name, o.Table)
+	}
+	up := make(MultiColumnUpSQL, len(o.Columns))
+	down := make(MultiColumnDownSQL, len(o.Columns))
+	for _, col := range o.Columns {
+		up[col] = o.Down[col]
+		down[col] = o.Up[col]
+	}
+	return []Operation{&OpDropMultiColumnConstraint{
+		Table: o.Table,
+		Name:  o.Name,
+		Up:    up,
+		Down:  down,
+	}}, nil
+}
+
+// Invert recreates the dropped constraint from the pre-state snapshot.
+func (o *OpDropMultiColumnConstraint) Invert(pre *schema.Schema) ([]Operation, error) {
+	return invertConstraintDrop(pre, o.Table, o.Name, o.Up, o.Down)
+}
+
+// Invert recreates the dropped constraint from the pre-state snapshot. The
+// deprecated single-column form carries one up/down expression pair, so only
+// single-column constraints are invertible through it.
+func (o *OpDropConstraint) Invert(pre *schema.Schema) ([]Operation, error) {
+	table := pre.GetTable(o.Table)
+	if table == nil {
+		return nil, fmt.Errorf("table %q not found in the parent snapshot", o.Table)
+	}
+	cols := table.GetConstraintColumns(o.Name)
+	if len(cols) != 1 {
+		return nil, fmt.Errorf(
+			"constraint %q on %q covers %d columns; the deprecated drop_constraint form is only "+
+				"invertible for single-column constraints", o.Name, o.Table, len(cols))
+	}
+	return invertConstraintDrop(pre, o.Table, o.Name,
+		map[string]string{cols[0]: o.Up},
+		map[string]string{cols[0]: o.Down})
+}
+
+// invertConstraintDrop reconstructs a dropped check/unique/foreign-key
+// constraint from its definition in the pre-state snapshot, as an
+// OpCreateConstraint. The data expressions swap direction: the drop's down
+// re-derives the constrained values (the create's up), and its up re-derives
+// the unconstrained ones (the create's down); missing entries fall back to
+// the identity projection. Exclusion and primary-key constraints are not
+// expressible as create_constraint and are refused.
+func invertConstraintDrop(pre *schema.Schema, tableName, name string, dropUp, dropDown map[string]string) ([]Operation, error) {
+	table := pre.GetTable(tableName)
+	if table == nil {
+		return nil, fmt.Errorf("table %q not found in the parent snapshot", tableName)
+	}
+
+	create := &OpCreateConstraint{Table: tableName, Name: name}
+	switch {
+	case table.CheckConstraints[name] != nil:
+		cc := table.CheckConstraints[name]
+		check := stripCheckDefinition(cc.Definition)
+		create.Type = OpCreateConstraintTypeCheck
+		create.Check = &check
+		create.Columns = cc.Columns
+		create.NoInherit = cc.NoInherit
+	case table.UniqueConstraints[name] != nil:
+		uc := table.UniqueConstraints[name]
+		create.Type = OpCreateConstraintTypeUnique
+		create.Columns = uc.Columns
+	case table.ForeignKeys[name] != nil:
+		fk := table.ForeignKeys[name]
+		create.Type = OpCreateConstraintTypeForeignKey
+		create.Columns = fk.Columns
+		ref := &TableForeignKeyReference{
+			Table:    fk.ReferencedTable,
+			Columns:  fk.ReferencedColumns,
+			OnDelete: ForeignKeyAction(fk.OnDelete),
+			OnUpdate: ForeignKeyAction(fk.OnUpdate),
+		}
+		if fk.MatchType != "" && fk.MatchType != string(ForeignKeyMatchTypeSIMPLE) {
+			ref.MatchType = ForeignKeyMatchType(fk.MatchType)
+		}
+		create.References = ref
+	default:
+		return nil, fmt.Errorf(
+			"constraint %q on %q not found in the parent snapshot as a check, unique, or foreign key "+
+				"constraint (exclusion and primary key constraints cannot be recreated)", name, tableName)
+	}
+
+	up := make(MultiColumnUpSQL, len(create.Columns))
+	down := make(MultiColumnDownSQL, len(create.Columns))
+	for _, col := range create.Columns {
+		u := dropDown[col]
+		if u == "" {
+			u = pq.QuoteIdentifier(col)
+		}
+		d := dropUp[col]
+		if d == "" {
+			d = pq.QuoteIdentifier(col)
+		}
+		up[col] = u
+		down[col] = d
+	}
+	create.Up = up
+	create.Down = down
+
+	return []Operation{create}, nil
 }
 
 // serialTypeFor maps an integer column whose default draws from the

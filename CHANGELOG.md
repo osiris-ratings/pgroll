@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — BREAKING lifecycle semantics
+
+- **Contraction moved from "next deployment" to "end of this deployment."**
+  The cross-deploy seal window is retired. `pgroll migrate` is now purely
+  additive: it never seals, drains, or drops anything — the previous
+  deployment can no longer be contracted as a side effect of applying new
+  work, so a stale schema pin can no longer wedge future deployments.
+  Deploy flow: `migrate` (expand, final migration left active) → repin
+  apps → `pgroll complete` (drain the batch's deferred DDL, drop old
+  version schemas, seal). `migrate --complete` performs the full converge
+  in one shot for environments with nothing pinned to the previous schema
+  (dev/CI/disposable instances). At most two version schemas exist during
+  a deploy; exactly one after.
+- **`pgroll complete` is the single contraction step.** With no active
+  migration it finishes whatever the deployment left pending
+  (`FinishContraction`): drains a leftover deferred queue (including one
+  left by a database upgraded from the delayed-contraction lifecycle),
+  seals the window, and converges version schemas. It refuses an
+  unfinished `migrate` batch (resume with `migrate` or abort with
+  `revert`) instead of contracting mid-batch.
+- **`pgroll revert` is the unified reverse gear.** While a deployment is
+  in flight (not yet contracted) it walks back losslessly, exactly as
+  before. Once contracted, `revert --to <name>` switches to inversion:
+  synthesized inverse migrations run forward through the normal
+  zero-downtime engine, then forward and inverse rows are pruned from
+  history (schema-exact, data re-derived through the original up/down
+  expressions — best effort). When the in-flight window sits above a
+  contracted target, both legs compose under one confirmation.
+  `--past-seal` is deprecated (hidden alias for one release).
+- **New `revert --expand-only`** stops an inversion revert after its
+  expand phase: the restored schema exists alongside the current one for
+  apps to repin to, and the next `pgroll complete` contracts the inverses
+  and finishes the history prune (`FinishPendingSealedRevert`).
+- Schema drops are now strict everywhere: a version-schema drop blocked by
+  another backend fails loudly, naming the blocking sessions, instead of
+  deferring the drop to a later deployment. Orphaned version schemas can
+  no longer arise; the orphan bookkeeping (`OrphanedVersionSchemas`,
+  `ReapVersionSchemasExcept`) is removed.
+
+### Added
+
+- Constraint-family inversion coverage: `create_constraint` (unique,
+  check, foreign key) inverts to a constraint drop; `drop_constraint` /
+  `drop_multicolumn_constraint` invert to the constraint's re-creation
+  from the pre-state snapshot; `alter_column` adding a check/unique/
+  foreign-key constraint inverts to its drop. Primary-key and exclusion
+  constraints remain refused.
+
 ## [0.16.2-baselayer.13] - 2026-06-19
 
 ## [0.16.2-baselayer.12] - 2026-06-19

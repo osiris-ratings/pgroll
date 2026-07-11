@@ -38,6 +38,24 @@ type SealedRevertPlan struct {
 // mid-flight and cannot anchor inverse synthesis.
 var pollutionMarkers = []string{"_pgroll_new_", "_pgroll_needs_backfill", "_pgroll_del_", "_pgroll_dup_"}
 
+// sealedRevertOptions holds options for RevertSealed.
+type sealedRevertOptions struct {
+	expandOnly bool
+}
+
+// SealedRevertOption is a functional option for RevertSealed.
+type SealedRevertOption func(*sealedRevertOptions)
+
+// WithExpandOnly makes RevertSealed stop after the inverse train's expand
+// phase: the final inverse migration is left active (its version schema — the
+// restored boundary projection — exists alongside the current one), and
+// nothing is contracted or pruned. This is the zero-downtime revert split:
+// apps repin to the restored schema between this call and the `pgroll
+// complete` that contracts the inverses and prunes history.
+func WithExpandOnly() SealedRevertOption {
+	return func(o *sealedRevertOptions) { o.expandOnly = true }
+}
+
 // PlanRevertSealed computes the plan for reverting sealed history down to
 // (but not including) the named boundary migration.
 func (m *Roll) PlanRevertSealed(ctx context.Context, to string) (*SealedRevertPlan, error) {
@@ -53,6 +71,26 @@ func (m *Roll) PlanRevertSealed(ctx context.Context, to string) (*SealedRevertPl
 		return nil, fmt.Errorf("the revert window is open (%d unsealed migration(s)); revert it first with a plain revert", len(unsealed))
 	}
 
+	return m.planSealedSegment(ctx, to, "")
+}
+
+// PlanRevertSealedBelowWindow plans the sealed leg of a composed revert while
+// the revert window is still open: the segment spans (to, through], where
+// `through` is the window's lower boundary — the newest SEALED row the leg
+// will revert. Used to preview and validate the sealed leg before the window
+// leg executes; the actual execution re-plans via RevertSealed once the
+// window has been walked back.
+func (m *Roll) PlanRevertSealedBelowWindow(ctx context.Context, to, through string) (*SealedRevertPlan, error) {
+	if through == "" {
+		return nil, fmt.Errorf("the sealed leg of a composed revert needs the window's lower boundary")
+	}
+	return m.planSealedSegment(ctx, to, through)
+}
+
+// planSealedSegment computes the inverse plan for the sealed history segment
+// (to, through]; an empty `through` means the segment extends to the history
+// leaf.
+func (m *Roll) planSealedSegment(ctx context.Context, to, through string) (*SealedRevertPlan, error) {
 	history, err := m.state.SchemaHistory(ctx, m.schema)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read schema history: %w", err)
@@ -78,6 +116,22 @@ func (m *Roll) PlanRevertSealed(ctx context.Context, to string) (*SealedRevertPl
 	}
 
 	segment := history[boundaryIdx+1:]
+	if through != "" {
+		throughIdx := -1
+		for i, h := range history {
+			if h.Migration.Name == through {
+				throughIdx = i
+				break
+			}
+		}
+		if throughIdx == -1 {
+			return nil, fmt.Errorf("migration %q not found in history", through)
+		}
+		if throughIdx <= boundaryIdx {
+			return nil, fmt.Errorf("migration %q is not above the boundary %q", through, to)
+		}
+		segment = history[boundaryIdx+1 : throughIdx+1]
+	}
 	if len(segment) == 0 {
 		return nil, nil // already at the boundary
 	}
@@ -197,13 +251,22 @@ func (m *Roll) PendingSealedRevertResume(ctx context.Context) (string, error) {
 // leaving the boundary as the leaf — exactly as if the segment had never
 // been applied. Schema-exact; data best-effort.
 //
+// Under WithExpandOnly the run stops after the final inverse's Start: the
+// restored boundary projection exists alongside the current schema, apps
+// repin to it, and a subsequent `pgroll complete` contracts the inverses and
+// finishes the prune (see FinishPendingSealedRevert).
+//
 // Crash recovery:
 //   - interrupted while the inverse train was applying: the partial inverse
-//     rows are unsealed (delayed contraction), so they are walked back out
-//     with the standard window revert and the run restarts cleanly;
+//     rows are unsealed (still in their expand phase), so they are walked
+//     back out with the standard window revert and the run restarts cleanly;
 //   - interrupted after the final inverse completed but before the prune:
 //     the leaf is a sealed inverse row, and the prune is finished.
-func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config) (*SealedRevertPlan, error) {
+func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config, opts ...SealedRevertOption) (*SealedRevertPlan, error) {
+	var o sealedRevertOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	// Resume: a partial inverse train from an interrupted run is unsealed
 	// (and only ever contains engine-synthesized RevertOf rows) — undo it
 	// and start over.
@@ -257,6 +320,13 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 			if err := m.Start(ctx, inv, cfg); err != nil {
 				return nil, fmt.Errorf("unable to start inverse migration %q: %w", inv.Name, err)
 			}
+			if o.expandOnly {
+				m.logger.Info("expand-only revert: final inverse left active; repin apps to the "+
+					"restored schema, then run `pgroll complete` to contract and finish the revert",
+					"inverse", inv.Name,
+					"schema", VersionedSchemaName(m.schema, plan.BoundaryVersionSchema))
+				return plan, nil
+			}
 			if err := m.Complete(ctx); err != nil {
 				return nil, fmt.Errorf("unable to complete inverse migration %q: %w", inv.Name, err)
 			}
@@ -278,6 +348,62 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 		return nil, err
 	}
 	return plan, nil
+}
+
+// FinishPendingSealedRevert finishes a sealed revert whose inverse train has
+// fully applied but was never pruned — the history leaf is a sealed inverse
+// (RevertOf) row. This is the second half of a split (`revert --expand-only`)
+// revert, and the resume path for a revert interrupted between its final
+// Complete and its prune. The boundary is derived from history: the newest
+// row that is neither an inverse nor a target of the inverses above it (or
+// the baseline when the whole post-baseline history is being unwound).
+// Returns the finished plan, or nil when the leaf is not an inverse row.
+func (m *Roll) FinishPendingSealedRevert(ctx context.Context) (*SealedRevertPlan, error) {
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil || latest == nil {
+		return nil, err
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return nil, err
+	}
+	if leaf.RevertOf == "" {
+		return nil, nil
+	}
+
+	history, err := m.state.SchemaHistory(ctx, m.schema)
+	if err != nil {
+		return nil, err
+	}
+	reverted := make(map[string]bool)
+	boundary := ""
+	for i := len(history) - 1; i >= 0; i-- {
+		raw := history[i].Migration
+		mig, err := migrations.ParseMigration(&raw)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse migration %q: %w", raw.Name, err)
+		}
+		if mig.RevertOf != "" {
+			reverted[mig.RevertOf] = true
+			continue
+		}
+		if reverted[mig.Name] {
+			continue
+		}
+		boundary = mig.Name
+		break
+	}
+	if boundary == "" {
+		baseline, err := m.state.LatestBaseline(ctx, m.schema)
+		if err != nil {
+			return nil, err
+		}
+		if baseline == nil {
+			return nil, fmt.Errorf("cannot finish the pending revert: no boundary found beneath the inverse train")
+		}
+		boundary = baseline.Name
+	}
+	return m.finishSealedRevert(ctx, boundary)
 }
 
 // finishSealedRevert completes an interrupted run whose inverse train fully

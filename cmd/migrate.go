@@ -176,22 +176,6 @@ func migrateCmd() *cobra.Command {
 				backfill.WithBatchDelay(batchDelay),
 			)
 
-			// Seal the previous deployment before applying this one. Under
-			// delayed contraction every migration in a train — including the
-			// final one — defers its destructive DDL, keeping the whole train
-			// in its expand phase (and therefore losslessly revertible) for a
-			// full release cycle. The next train departing is the previous
-			// train's point of no return: drain its queued contraction now,
-			// while production apps stay pinned to its (briefly recreated)
-			// version schema.
-			sealed, err := m.SealDeferredCompletes(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to seal previous deployment: %w", err)
-			}
-			if sealed > 0 {
-				fmt.Printf("Sealed previous deployment: %d deferred completion(s) drained. The revert window now covers only this deployment.\n\n", sealed)
-			}
-
 			// Apply each intermediate migration without projecting a version
 			// schema. No apps will ever connect to an intermediate version, so
 			// projecting it would just waste a schema and create view
@@ -229,18 +213,17 @@ func migrateCmd() *cobra.Command {
 			}
 
 			// Run the final migration. Its Start projects the new target
-			// version schema. If --complete is set, the final migration is
-			// marked done with its contraction deferred (delayed
-			// contraction): the previous-production version schema survives
-			// and the whole train remains losslessly revertible via `pgroll
-			// revert` until the next train departs (or `pgroll complete`
-			// seals it manually). If --complete is not set, the final
-			// migration is left in-progress for a later `pgroll complete`.
-			finalOpts := []migrationOption{}
-			if complete {
-				finalOpts = append(finalOpts, AsCompleteOption(roll.WithDeferComplete()))
-			}
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, finalOpts...); err != nil {
+			// version schema. If --complete is set, the final migration runs
+			// a full (non-deferred) Complete: the batch's queued contraction
+			// drains, old version schemas are dropped, and the deployment is
+			// sealed — a one-shot converge for environments with nothing
+			// pinned to the previous schema (dev, CI, disposable instances).
+			// If --complete is not set — the production path — the final
+			// migration is left in-progress: the fleet repins to its version
+			// schema and a later `pgroll complete` contracts the deployment.
+			// Until that contraction, the whole batch is losslessly
+			// revertible via `pgroll revert`.
+			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
 				return err
 			}
 
@@ -298,28 +281,9 @@ const (
 // live schema (RECOVERY), since in all other cases the live schema name
 // already encodes it.
 func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir string, unapplied []*migrations.RawMigration, out io.Writer) (cycleState, error) {
-	existingSchemas, err := m.ExistingVersionSchemas(ctx)
+	liveSchemas, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
 		return "", fmt.Errorf("listing existing version schemas: %w", err)
-	}
-
-	// Orphaned schemas (sealed leftovers a best-effort reap could not drop)
-	// physically exist but are not the live projection or a revert target.
-	// Split them out so they are never displayed as a live schema or as the
-	// plan's source — apps are not pinned to them and cannot roll back to them.
-	orphanSchemas, err := m.OrphanedVersionSchemas(ctx)
-	if err != nil {
-		return "", fmt.Errorf("listing orphaned version schemas: %w", err)
-	}
-	orphanSet := make(map[string]bool, len(orphanSchemas))
-	for _, s := range orphanSchemas {
-		orphanSet[s] = true
-	}
-	liveSchemas := make([]string, 0, len(existingSchemas))
-	for _, s := range existingSchemas {
-		if !orphanSet[s] {
-			liveSchemas = append(liveSchemas, s)
-		}
 	}
 
 	stateLatestVersion, err := m.State().LatestVersion(ctx, m.Schema())
@@ -377,7 +341,7 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 	stateInSync := stateLatestVersion == nil
 	if stateLatestVersion != nil {
 		want := prefix + *stateLatestVersion
-		for _, s := range existingSchemas {
+		for _, s := range liveSchemas {
 			if s == want {
 				stateInSync = true
 				break
@@ -486,14 +450,16 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		plan := fmt.Sprintf("%s %s %s %s", source, pterm.FgGray.Sprint("→"), target, count)
 		field("Plan", plan)
 
-		// Surface the point of no return: applying this batch seals the
-		// previous deployment by draining its deferred contraction DDL.
+		// Surface a pre-existing deferred queue: contraction left pending by
+		// an earlier run (a resumed batch, or a database upgraded from the
+		// delayed-contraction lifecycle). It drains at this deployment's
+		// `pgroll complete`.
 		deferred, err := m.State().DeferredCompletes(ctx, m.Schema())
 		if err != nil {
 			return "", fmt.Errorf("reading deferred completes: %w", err)
 		}
 		if len(deferred) > 0 {
-			field("Seals", fmt.Sprintf("%d deferred completion(s) — closes the previous deployment's revert window", len(deferred)))
+			field("Drains", fmt.Sprintf("%d pending deferred completion(s) from an earlier run — they contract at this deployment's `pgroll complete`", len(deferred)))
 		}
 
 		names := make([]string, len(unapplied))
@@ -508,15 +474,6 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 				pterm.FgYellow.Sprint("⚠"), *stateLatestVersion)
 			fmt.Fprintln(out, pterm.FgYellow.Sprint("    A previous migrate completed migrations whose schema was never deployed."))
 		}
-	}
-
-	// Orphaned version schemas: physically present but sealed leftovers a
-	// best-effort reap could not drop. Surfaced distinctly so operators do not
-	// mistake them for the live schema or a revert target — a later deployment
-	// reaps them once the holding session releases.
-	if len(orphanSchemas) > 0 {
-		field("Orphaned", fmt.Sprintf("%s (sealed; pending GC, not a revert target)",
-			strings.Join(orphanSchemas, ", ")))
 	}
 
 	fmt.Fprintln(out)
