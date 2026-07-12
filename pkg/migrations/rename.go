@@ -87,7 +87,7 @@ func (a *renameDuplicatedColumnAction) Execute(ctx context.Context) error {
 			// column.
 			if IsNotNullConstraintName(StripDuplicationPrefix(cc.Name)) {
 				// Apply `NOT NULL` attribute to the column. This uses the validated constraint
-				if err := NewSetNotNullAction(a.conn, a.table.Name, a.to).Execute(ctx); err != nil {
+				if err := NewSetNotNullAction(a.conn, a.table.Name, a.to, CanonicalNotNullName(a.table.Name, a.to)).Execute(ctx); err != nil {
 					return fmt.Errorf("failed to set column not null: %w", err)
 				}
 

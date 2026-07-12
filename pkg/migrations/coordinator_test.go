@@ -60,8 +60,8 @@ func TestCoordinator(t *testing.T) {
 		"add same column multiple times to same table": {
 			actions: []DBAction{
 				NewCreateTableAction(nil, "test_table", "", ""),
-				NewAddColumnAction(nil, "t1", Column{Name: "column1"}, false),
-				NewAddColumnAction(nil, "t1", Column{Name: "column1"}, false), // Duplicate
+				NewAddColumnAction(nil, "t1", Column{Name: "column1"}, false, ""),
+				NewAddColumnAction(nil, "t1", Column{Name: "column1"}, false, ""), // Duplicate
 			},
 			expectedOrder: []string{"create_table_test_table", "add_column_t1_column1"},
 		},
@@ -77,7 +77,7 @@ func TestCoordinator(t *testing.T) {
 		"drop default value on column": {
 			actions: []DBAction{
 				NewCreateTableAction(nil, "test_table", "", ""),
-				NewAddColumnAction(nil, "test_table1", Column{Name: "column1", Default: ptr("default_value")}, false),
+				NewAddColumnAction(nil, "test_table1", Column{Name: "column1", Default: ptr("default_value")}, false, ""),
 				NewDropDefaultValueAction(nil, "test_table", "column1"),
 			},
 			expectedOrder: []string{"create_table_test_table", "add_column_test_table1_column1", "drop_default_test_table_column1"},
@@ -137,8 +137,8 @@ func TestCoordinator(t *testing.T) {
 		"create table and add multiple constraints": {
 			actions: []DBAction{
 				NewCreateTableAction(nil, "test_table", "", ""),
-				NewAddColumnAction(nil, "column1", Column{}, false),
-				NewAddColumnAction(nil, "column2", Column{}, false),
+				NewAddColumnAction(nil, "column1", Column{}, false, ""),
+				NewAddColumnAction(nil, "column2", Column{}, false, ""),
 				NewCreateUniqueIndexConcurrentlyAction(nil, "public", "test_table", "my_idx", "column1"),
 				NewCreateFKConstraintAction(nil, "test_table", "column2", []string{"other_column"}, nil, false, false, false),
 				NewCreateCheckConstraintAction(nil, "test_table", "my_check", "column1 > 0", []string{"column1"}, false, false),

@@ -74,7 +74,7 @@ func (o *OpSetNotNull) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 		// * New NULL values written to the old column during the migration period were also rewritten using `up` SQL.
 		NewValidateConstraintAction(conn, o.Table, NotNullConstraintName(o.Column)),
 		// Use the validated constraint to add `NOT NULL` to the new column
-		NewSetNotNullAction(conn, o.Table, TemporaryName(o.Column)),
+		NewSetNotNullAction(conn, o.Table, TemporaryName(o.Column), CanonicalNotNullName(o.Table, o.Column)),
 		// Drop the NOT NULL constraint
 		NewDropConstraintAction(conn, o.Table, NotNullConstraintName(o.Column)),
 	}, nil
