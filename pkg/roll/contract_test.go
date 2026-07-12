@@ -168,10 +168,10 @@ func TestContractionLiveSchemaHandlingPerOp(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name        string
-		op          migrations.Operation
-		wantErr     bool // opaque raw SQL: full-schema drop blocked by the held view
-		tViewGone   bool // drop_table removes t's own view
+		name      string
+		op        migrations.Operation
+		wantErr   bool // opaque raw SQL: full-schema drop blocked by the held view
+		tViewGone bool // drop_table removes t's own view
 	}{
 		{
 			name: "rename_column",

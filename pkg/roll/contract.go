@@ -128,7 +128,8 @@ func (m *Roll) FinishContraction(ctx context.Context) (int, int64, error) {
 			return 0, 0, fmt.Errorf(
 				"cannot contract: the latest migration %q has no version schema, so the deferred queue "+
 					"belongs to an unfinished `pgroll migrate` batch; resume it by re-running `pgroll migrate`, "+
-					"or abort it with `pgroll revert`", live.Name)
+					"or abort it with `pgroll revert`", live.Name,
+			)
 		}
 	}
 
