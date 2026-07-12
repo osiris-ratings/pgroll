@@ -282,18 +282,23 @@
     },
     {
       "name": "revert",
-      "short": "Revert the most recent deployment, restoring the previous schema and data",
+      "short": "Revert migrations, restoring an earlier point in the migration chain",
       "use": "revert",
       "example": "",
       "flags": [
         {
+          "name": "expand-only",
+          "description": "stop an inversion revert after its expand phase: the restored schema exists for apps to repin to; `pgroll complete` finishes the revert",
+          "default": "false"
+        },
+        {
           "name": "past-seal",
-          "description": "revert SEALED history down to --to by running synthesized inverse migrations (schema exact, data re-derived — best effort)",
+          "description": "deprecated: --to now reverts contracted history automatically",
           "default": "false"
         },
         {
           "name": "steps",
-          "description": "revert at most N migrations (newest first)",
+          "description": "revert at most N in-flight migrations (newest first)",
           "default": "0"
         },
         {

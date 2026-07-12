@@ -376,7 +376,8 @@ func (o *OpAlterColumn) Invert(pre *schema.Schema) ([]Operation, error) {
 		if len(constraintNames) > 1 || otherChanges {
 			return nil, fmt.Errorf(
 				"alter_column on %q.%q combines a constraint with other changes; its inverse cannot be "+
-					"synthesized soundly", o.Table, o.Column)
+					"synthesized soundly", o.Table, o.Column,
+			)
 		}
 		// The inverse drops the constraint the alter added. Data expressions
 		// swap direction: the alter's down re-derives the unconstrained
@@ -585,7 +586,8 @@ func (o *OpCreateConstraint) Invert(_ *schema.Schema) ([]Operation, error) {
 	if o.Type == OpCreateConstraintTypePrimaryKey {
 		return nil, fmt.Errorf(
 			"create_constraint %q on %q adds a primary key; primary key inverses are not supported",
-			o.Name, o.Table)
+			o.Name, o.Table,
+		)
 	}
 	up := make(MultiColumnUpSQL, len(o.Columns))
 	down := make(MultiColumnDownSQL, len(o.Columns))
@@ -618,7 +620,8 @@ func (o *OpDropConstraint) Invert(pre *schema.Schema) ([]Operation, error) {
 	if len(cols) != 1 {
 		return nil, fmt.Errorf(
 			"constraint %q on %q covers %d columns; the deprecated drop_constraint form is only "+
-				"invertible for single-column constraints", o.Name, o.Table, len(cols))
+				"invertible for single-column constraints", o.Name, o.Table, len(cols),
+		)
 	}
 	return invertConstraintDrop(pre, o.Table, o.Name,
 		map[string]string{cols[0]: o.Up},
@@ -668,7 +671,8 @@ func invertConstraintDrop(pre *schema.Schema, tableName, name string, dropUp, dr
 	default:
 		return nil, fmt.Errorf(
 			"constraint %q on %q not found in the parent snapshot as a check, unique, or foreign key "+
-				"constraint (exclusion and primary key constraints cannot be recreated)", name, tableName)
+				"constraint (exclusion and primary key constraints cannot be recreated)", name, tableName,
+		)
 	}
 
 	up := make(MultiColumnUpSQL, len(create.Columns))
