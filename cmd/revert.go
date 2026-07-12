@@ -4,9 +4,12 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
@@ -20,6 +23,8 @@ func revertCmd() *cobra.Command {
 	var toMigration string
 	var pastSeal bool
 	var expandOnly bool
+	var dryRun bool
+	var jsonOut bool
 
 	cmd := &cobra.Command{
 		Use:   "revert",
@@ -57,6 +62,33 @@ func revertCmd() *cobra.Command {
 			}
 			if expandOnly && toMigration == "" {
 				return fmt.Errorf("--expand-only requires --to: it applies to inversion reverts of contracted history")
+			}
+
+			// --dry-run: preview the revert{} plan and return WITHOUT executing
+			// or resuming anything. Honors the same bare / --steps / --to
+			// bounds the real revert does.
+			if dryRun {
+				var opts []roll.RevertOption
+				switch {
+				case steps > 0:
+					opts = append(opts, roll.WithRevertSteps(steps))
+				case toMigration != "":
+					opts = append(opts, roll.WithRevertTo(toMigration))
+				}
+				view, err := m.PreviewRevert(ctx, opts...)
+				if err != nil {
+					return err
+				}
+				if jsonOut {
+					out, err := json.MarshalIndent(view, "", "  ")
+					if err != nil {
+						return err
+					}
+					fmt.Println(string(out))
+					return nil
+				}
+				printRevertPreview(view, os.Stdout)
+				return nil
 			}
 
 			// Resume an interrupted inversion revert before planning anything
@@ -120,9 +152,61 @@ func revertCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&expandOnly, "expand-only", false, "stop an inversion revert after its expand phase: the restored schema exists for apps to repin to; `pgroll complete` finishes the revert")
 	cmd.Flags().BoolVar(&pastSeal, "past-seal", false, "deprecated: --to now reverts contracted history automatically")
 	_ = cmd.Flags().MarkHidden("past-seal")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview the revert (targets, restore schema, dropped version schemas) without executing anything")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "with --dry-run, emit the preview as JSON")
 	cmd.MarkFlagsMutuallyExclusive("steps", "to")
 
 	return cmd
+}
+
+// printRevertPreview renders the machine-readable revert plan (the same block
+// `pgroll plan` carries) as an aligned human summary for `revert --dry-run`.
+func printRevertPreview(view *roll.RevertView, out io.Writer) {
+	const fieldColWidth = 18
+
+	field := func(name, value string) {
+		gray := pterm.FgGray.Sprint(name)
+		pad := strings.Repeat(" ", fieldColWidth-len(name))
+		fmt.Fprintf(out, "    %s%s%s\n", gray, pad, value)
+	}
+
+	dashOr := func(s *string) string {
+		if s == nil || *s == "" {
+			return pterm.FgGray.Sprint("(empty database — no version schema will remain)")
+		}
+		return *s
+	}
+
+	title := pterm.NewStyle(pterm.FgWhite, pterm.Bold).Sprint("▶ pgroll revert --dry-run")
+	fmt.Fprintf(out, "\n%s\n\n", title)
+
+	if view.Count == 0 {
+		fmt.Fprintln(out, pterm.FgGray.Sprint("    Nothing to revert."))
+		fmt.Fprintln(out)
+		return
+	}
+
+	kind := "in-flight (lossless)"
+	if view.ContainsContracted {
+		kind = "includes contracted (inversion; schema-exact, data best-effort)"
+	}
+	field("Revert", fmt.Sprintf("%d migration(s) — %s", view.Count, kind))
+	field("Restore target", dashOr(view.ToSchema))
+	fmt.Fprintln(out)
+
+	tableData := pterm.TableData{{"Name", "Version schema (dropped)"}}
+	for i, name := range view.Migrations {
+		dropped := ""
+		if i < len(view.WouldDropSchemas) {
+			dropped = view.WouldDropSchemas[i]
+		}
+		tableData = append(tableData, []string{name, dropped})
+	}
+	_ = pterm.DefaultTable.WithWriter(out).WithHasHeader().WithData(tableData).Render()
+
+	fmt.Fprintln(out)
+	pterm.Warning.WithWriter(out).Printfln("Applications must be pinned to %s before reverting.", dashOr(view.ToSchema))
+	fmt.Fprintln(out)
 }
 
 // runWindowRevert previews, confirms, and executes a lossless revert of

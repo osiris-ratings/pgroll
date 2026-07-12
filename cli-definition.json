@@ -242,6 +242,28 @@
       ]
     },
     {
+      "name": "plan",
+      "short": "Print the plan to converge the database to a local migrations directory",
+      "use": "plan <directory>",
+      "example": "plan ./migrations --json",
+      "flags": [
+        {
+          "name": "json",
+          "description": "emit the plan as JSON",
+          "default": "false"
+        },
+        {
+          "name": "to",
+          "description": "override the convergence target: revert history down to this migration, which must already exist in the database",
+          "default": ""
+        }
+      ],
+      "subcommands": [],
+      "args": [
+        "directory"
+      ]
+    },
+    {
       "name": "prune",
       "short": "Remove migrations from pgroll's history without executing DDL",
       "use": "prune --name <name> [--name <name> ...]",
@@ -287,8 +309,18 @@
       "example": "",
       "flags": [
         {
+          "name": "dry-run",
+          "description": "preview the revert (targets, restore schema, dropped version schemas) without executing anything",
+          "default": "false"
+        },
+        {
           "name": "expand-only",
           "description": "stop an inversion revert after its expand phase: the restored schema exists for apps to repin to; `pgroll complete` finishes the revert",
+          "default": "false"
+        },
+        {
+          "name": "json",
+          "description": "with --dry-run, emit the preview as JSON",
           "default": "false"
         },
         {

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pgroll plan <directory> [--json]`** — a read-only command that computes
+  what it would take to converge the target database's migration history to a
+  local migrations directory, without executing anything. It surfaces the
+  forward migrations to apply, the migrations to revert (with the restore
+  target and the version schemas a revert would drop), whether the histories
+  are in sync or have diverged, and any database migrations that are absent
+  from the checkout and cannot be cleanly reverted. `--json` emits the machine
+  form; without it, a human-readable summary. Exit status is zero whenever a
+  plan can be produced — including "nothing to do" and "blocked" — so callers
+  branch on the JSON fields, not the exit code; a non-zero exit means no plan
+  could be produced at all (database unreachable, pgroll uninitialized, or a
+  `--to` target absent from history). `--to <name>` overrides the convergence
+  target with an explicit revert boundary that must already exist in history.
+  This lets deploy tooling decide apply-vs-revert (and pin-guard a revert)
+  through the CLI instead of reading pgroll's internal tables.
+- **`pgroll revert --dry-run [--json]`** — previews a revert (its targets, the
+  restore schema, the version schemas it would drop, and whether it reaches
+  contracted history) for the same bare / `--steps` / `--to` bounds the real
+  command honors, and returns without changing anything. `--json` emits the
+  machine form.
+
 ## [0.16.2-baselayer.14] - 2026-07-12
 
 ### Changed — BREAKING lifecycle semantics

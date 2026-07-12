@@ -121,6 +121,7 @@ func Prepare() *cobra.Command {
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(createCmd())
 	rootCmd.AddCommand(migrateCmd())
+	rootCmd.AddCommand(planCmd())
 	rootCmd.AddCommand(pullCmd())
 	rootCmd.AddCommand(latestCmd())
 	rootCmd.AddCommand(convertCmd())
