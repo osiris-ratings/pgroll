@@ -27,6 +27,27 @@ func (m *Roll) Validate(ctx context.Context, migration *migrations.Migration) er
 	if err != nil {
 		return fmt.Errorf("migration '%s' is invalid: %w", migration.Name, err)
 	}
+	if err := validateVersionSchemaName(m.schema, migration.VersionSchemaName()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateVersionSchemaName rejects migrations whose computed version schema
+// name (schema + "_" + versionName) would exceed Postgres' identifier length
+// limit. Without this check, Postgres silently truncates the name on
+// CREATE SCHEMA, leaving pgroll's metadata pointing at a name that no longer
+// matches what's in information_schema.schemata.
+func validateVersionSchemaName(schema, versionName string) error {
+	computed := VersionedSchemaName(schema, versionName)
+	if len(computed) > migrations.MaxIdentifierLength {
+		return migrations.VersionSchemaNameTooLongError{
+			Schema:       schema,
+			VersionName:  versionName,
+			ComputedName: computed,
+			Max:          migrations.MaxIdentifierLength,
+		}
+	}
 	return nil
 }
 
@@ -147,6 +168,9 @@ func (m *Roll) StartDDLOperations(ctx context.Context, migration *migrations.Mig
 }
 
 func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migrations.Migration) error {
+	if err := validateVersionSchemaName(m.schema, mig.VersionSchemaName()); err != nil {
+		return err
+	}
 	versionSchema := VersionedSchemaName(m.schema, mig.VersionSchemaName())
 	_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pq.QuoteIdentifier(versionSchema)))
 	if err != nil {

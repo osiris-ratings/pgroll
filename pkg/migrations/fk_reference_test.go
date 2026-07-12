@@ -22,7 +22,7 @@ func TestForeignKeyReferenceValidate(t *testing.T) {
 	})
 	t.Run("Name length", func(t *testing.T) {
 		fk := &ForeignKeyReference{
-			Name: strings.Repeat("x", maxIdentifierLength+1),
+			Name: strings.Repeat("x", MaxIdentifierLength+1),
 		}
 		// For now none of the tests use the schema
 		err := fk.Validate(nil)

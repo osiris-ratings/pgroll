@@ -246,25 +246,47 @@ func (e AlterColumnNoChangesError) Error() string {
 	return fmt.Sprintf("alter column %q on table %q requires at least one change", e.Column, e.Table)
 }
 
-// maxIdentifierLength is the maximum length of a valid identifier:
+// MaxIdentifierLength is the maximum length of a valid identifier:
 // https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
-const maxIdentifierLength = 63
+const MaxIdentifierLength = 63
 
 type InvalidIdentifierLengthError struct {
 	Name string
 }
 
 func (e InvalidIdentifierLengthError) Error() string {
-	return fmt.Sprintf("length of %q (%d) exceeds maximum length of %d", e.Name, len(e.Name), maxIdentifierLength)
+	return fmt.Sprintf("length of %q (%d) exceeds maximum length of %d", e.Name, len(e.Name), MaxIdentifierLength)
 }
 
 // ValidateIdentifierLength returns an error if the given name exceeds the maximum allowed length for
 // a Postgres identifier.
 func ValidateIdentifierLength(name string) error {
-	if len(name) > maxIdentifierLength {
+	if len(name) > MaxIdentifierLength {
 		return InvalidIdentifierLengthError{Name: name}
 	}
 	return nil
+}
+
+// VersionSchemaNameTooLongError is returned when a migration's version schema
+// name (schema + "_" + version) would exceed Postgres' identifier length
+// limit. Postgres silently truncates over-long identifiers at object creation
+// time, so accepting the migration would create a schema whose actual name
+// disagrees with what pgroll's metadata records — leaving lookups against
+// information_schema.schemata broken.
+type VersionSchemaNameTooLongError struct {
+	Schema       string // base schema, e.g. "public"
+	VersionName  string // migration.VersionSchemaName(), the suffix portion
+	ComputedName string // schema + "_" + versionName
+	Max          int    // MaxIdentifierLength
+}
+
+func (e VersionSchemaNameTooLongError) Error() string {
+	return fmt.Sprintf(
+		"version schema name %q (%d bytes) would exceed Postgres' %d-byte identifier limit; "+
+			"rename the migration file or set \"version_schema\" to a shorter value "+
+			"(max %d bytes for the suffix when using schema %q)",
+		e.ComputedName, len(e.ComputedName), e.Max, e.Max-len(e.Schema)-1, e.Schema,
+	)
 }
 
 type MultiColumnConstraintsNotSupportedError struct {
