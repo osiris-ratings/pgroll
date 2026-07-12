@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `pgroll plan` / `revert --dry-run` follow-ups from review of the
+  baselayer.15 planning commands:
+  - `in_sync` now requires the apply, revert, and blocked legs to all be
+    empty, not just leaf equality — a checkout migration older than the
+    shared leaf that was never applied (a late-merged/backdated migration)
+    no longer reports `in_sync: true` while `apply` lists it.
+  - `plan --to <baseline>` is accepted instead of rejected as "not found in
+    database history"; the baseline is a legal revert boundary, matching
+    `revert --to <baseline>`.
+  - `blocked.migrations` is now populated (the database migrations the
+    revert could not walk back) whenever `blocked.count` is non-zero,
+    instead of an empty list.
+  - `blocked.reason` is always one of the documented tokens
+    (`non-contiguous`, `target not found`, `inverse unavailable`,
+    `window open`, `no convergence target`, or the catch-all `unavailable`)
+    — a raw planner error message can no longer leak into the field.
+  - `revert --dry-run` now surfaces a pending interrupted revert (it errors
+    telling the operator to resume) and rejects `--to <in-flight> --expand-only`,
+    matching the real command instead of previewing a plan it would refuse.
+  - The apply leg is ordered by `depends_on` (topologically), matching what
+    `migrate` actually runs, rather than raw filename order.
+  - A restore-target lookup failure is now fatal rather than silently
+    reported as an "empty database" restore; two redundant state reads per
+    plan/preview were removed.
+
 ## [0.16.2-baselayer.15] - 2026-07-12
 
 ### Added

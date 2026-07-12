@@ -88,9 +88,10 @@ type RevertView struct {
 // but cannot be cleanly reverted.
 type BlockedView struct {
 	Count int `json:"count"`
-	// Reason is a short machine-branchable classification, e.g.
-	// "non-contiguous", "target not found", "inverse unavailable"; nil when
-	// nothing is blocked.
+	// Reason is a fixed, machine-branchable classification — one of
+	// "non-contiguous", "target not found", "inverse unavailable",
+	// "window open", "no convergence target", or the catch-all "unavailable";
+	// nil when nothing is blocked. Never a free-form error message.
 	Reason     *string  `json:"reason"`
 	Migrations []string `json:"migrations"`
 }
@@ -144,17 +145,16 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 		res.LiveSchema = &live
 	}
 
-	active, err := m.state.IsActiveMigrationPeriod(ctx, m.schema)
-	if err != nil {
-		return nil, fmt.Errorf("reading active migration period: %w", err)
-	}
 	dbLatest, err := m.state.LatestMigration(ctx, m.schema)
 	if err != nil {
 		return nil, fmt.Errorf("reading latest migration: %w", err)
 	}
 	if dbLatest != nil {
 		res.DBLatest = dbLatest
-		if active {
+		// The leaf is the in-flight migration exactly when the deployment is
+		// in progress — Status already resolved that from the active period,
+		// so no second state query is needed.
+		if status.Status == InProgressMigrationStatus {
 			leaf := *dbLatest
 			res.ActiveMigration = &leaf
 		}
@@ -183,42 +183,67 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 		baselineName = baseline.Name
 	}
 
-	// Local migration names (ascending, post-baseline).
-	localNames, err := localMigrationNames(dir, baselineName)
+	// Local migrations (ascending file order, post-baseline).
+	localRaws, err := localMigrations(dir, baselineName)
 	if err != nil {
 		return nil, fmt.Errorf("reading local migrations: %w", err)
 	}
-	localSet := make(map[string]struct{}, len(localNames))
-	for _, n := range localNames {
-		localSet[n] = struct{}{}
+	localNames := make([]string, len(localRaws))
+	localSet := make(map[string]struct{}, len(localRaws))
+	for i, raw := range localRaws {
+		localNames[i] = raw.Name
+		localSet[raw.Name] = struct{}{}
 	}
 	if len(localNames) > 0 {
 		leaf := localNames[len(localNames)-1]
 		res.LocalLatest = &leaf
 	}
 
-	// Divergence and sync are pure functions of the two leaves.
+	// Divergence is a pure function of the two leaves (in_sync is resolved at
+	// the end, once the apply/revert/blocked legs are known — leaf equality
+	// alone is not enough: a checkout migration older than the shared leaf can
+	// still be unapplied).
 	if res.DBLatest != nil && res.LocalLatest != nil {
 		_, dbLeafLocal := localSet[*res.DBLatest]
 		_, localLeafDB := dbSet[*res.LocalLatest]
 		res.Diverged = !dbLeafLocal && !localLeafDB
-		res.InSync = *res.DBLatest == *res.LocalLatest && status.Status == CompleteMigrationStatus
 	}
 
-	// Explicit target: revert-only, and the target must already be applied.
+	// Explicit target: revert-only. The target must already be applied — a
+	// migration in history, or the baseline (a legal revert boundary the
+	// sealed planner accepts).
 	if o.to != "" {
-		if _, ok := dbSet[o.to]; !ok {
+		_, inHistory := dbSet[o.to]
+		if !inHistory && o.to != baselineName {
 			return nil, fmt.Errorf("--to target %q not found in database history", o.to)
 		}
-		m.fillRevertLeg(ctx, res, o.to, versionSchemaByName)
+		suffix := dbNames
+		for i, n := range dbNames {
+			if n == o.to {
+				suffix = dbNames[i+1:]
+				break
+			}
+		}
+		m.fillRevertLeg(ctx, res, o.to, suffix, versionSchemaByName)
+		res.InSync = inSync(res, status.Status)
 		return res, nil
 	}
 
-	// Forward leg: local migrations not yet in the database, file order.
-	for _, n := range localNames {
-		if _, ok := dbSet[n]; !ok {
-			res.Apply.Migrations = append(res.Apply.Migrations, n)
+	// Forward leg: local migrations not yet in the database, in the order
+	// `migrate` would apply them (depends_on topological order, filename order
+	// as the tiebreaker) so the plan matches what migrate actually runs.
+	unapplied := make([]*migrations.RawMigration, 0, len(localRaws))
+	for _, raw := range localRaws {
+		if _, ok := dbSet[raw.Name]; !ok {
+			unapplied = append(unapplied, raw)
 		}
+	}
+	sorted, err := TopoSortMigrations(unapplied, dbSet)
+	if err != nil {
+		return nil, fmt.Errorf("ordering unapplied migrations: %w", err)
+	}
+	for _, raw := range sorted {
+		res.Apply.Migrations = append(res.Apply.Migrations, raw.Name)
 	}
 	res.Apply.Count = len(res.Apply.Migrations)
 
@@ -268,10 +293,10 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	if len(revertSuffix) > 0 {
 		switch {
 		case toFound:
-			m.fillRevertLeg(ctx, res, to, versionSchemaByName)
+			m.fillRevertLeg(ctx, res, to, revertSuffix, versionSchemaByName)
 		case baselineName != "":
 			// No shared migration: converge onto the baseline.
-			m.fillRevertLeg(ctx, res, baselineName, versionSchemaByName)
+			m.fillRevertLeg(ctx, res, baselineName, revertSuffix, versionSchemaByName)
 		default:
 			// No shared migration and no baseline to fall back on: there is no
 			// safe convergence target to revert toward.
@@ -288,18 +313,36 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 		res.Blocked = BlockedView{Count: len(interleaved), Reason: &reason, Migrations: interleaved}
 	}
 
+	res.InSync = inSync(res, status.Status)
 	return res, nil
+}
+
+// inSync reports whether the database already matches the checkout: the
+// deployment is contracted (Complete) and there is nothing to apply, revert,
+// or unblock. Leaf equality alone is insufficient — a checkout migration
+// older than the shared leaf can still be unapplied.
+func inSync(res *PlanResult, status MigrationStatus) bool {
+	return status == CompleteMigrationStatus &&
+		res.Apply.Count == 0 && res.Revert.Count == 0 && res.Blocked.Count == 0 &&
+		res.DBLatest != nil && res.LocalLatest != nil && *res.DBLatest == *res.LocalLatest
 }
 
 // fillRevertLeg computes the composed (window + sealed) revert down to `to`
 // and writes it into res.Revert, or classifies a planner refusal into
 // res.Blocked. Errors are reported in-band: Plan never fails because a revert
-// is structurally impossible.
-func (m *Roll) fillRevertLeg(ctx context.Context, res *PlanResult, to string, versionSchemaByName map[string]string) {
+// is structurally impossible. `candidates` are the database migrations the
+// revert was meant to walk back — reported as the blocked set when the
+// planner refuses, so Blocked.Migrations is never empty with a non-zero count.
+func (m *Roll) fillRevertLeg(ctx context.Context, res *PlanResult, to string, candidates []string, versionSchemaByName map[string]string) {
 	view, err := m.previewRevertTo(ctx, to, versionSchemaByName)
 	if err != nil {
 		reason := classifyBlockedReason(err)
-		res.Blocked = BlockedView{Count: 1, Reason: &reason, Migrations: []string{}}
+		blocked := append([]string{}, candidates...)
+		count := len(blocked)
+		if count == 0 {
+			count = 1
+		}
+		res.Blocked = BlockedView{Count: count, Reason: &reason, Migrations: blocked}
 		res.Revert.Contiguous = false
 		return
 	}
@@ -317,13 +360,11 @@ func (m *Roll) PreviewRevert(ctx context.Context, opts ...RevertOption) (*Revert
 		opt(&o)
 	}
 
-	versionSchemaByName, err := m.versionSchemasByName(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	if o.to != "" {
-		return m.previewRevertTo(ctx, o.to, versionSchemaByName)
+		// nil map: composedRevertView reads the version schemas lazily, only
+		// if it actually reaches the sealed leg — a bare window revert to `to`
+		// never touches history here.
+		return m.previewRevertTo(ctx, o.to, nil)
 	}
 
 	// Bare or --steps: the in-flight window only.
@@ -331,7 +372,7 @@ func (m *Roll) PreviewRevert(ctx context.Context, opts ...RevertOption) (*Revert
 	if err != nil {
 		return nil, err
 	}
-	return m.windowView(ctx, plan, nil), nil
+	return m.windowView(ctx, plan, nil)
 }
 
 // previewRevertTo previews a revert down to (and keeping) `to`, composing the
@@ -343,7 +384,7 @@ func (m *Roll) previewRevertTo(ctx context.Context, to string, versionSchemaByNa
 	case err == nil:
 		// Pure lossless window revert; `to` is kept as the leaf.
 		boundary := to
-		return m.windowView(ctx, plan, &boundary), nil
+		return m.windowView(ctx, plan, &boundary)
 	case errors.Is(err, ErrRevertTargetSealed):
 		return m.composedRevertView(ctx, to, versionSchemaByName)
 	default:
@@ -355,7 +396,7 @@ func (m *Roll) previewRevertTo(ctx context.Context, to string, versionSchemaByNa
 // is the migration kept as the leaf; nil means the database returns to the
 // oldest target's parent (or empty when that parent is nil), matching a bare
 // or --steps revert.
-func (m *Roll) windowView(ctx context.Context, plan []RevertTarget, boundary *string) *RevertView {
+func (m *Roll) windowView(ctx context.Context, plan []RevertTarget, boundary *string) (*RevertView, error) {
 	view := &RevertView{
 		Migrations:       make([]string, 0, len(plan)),
 		WouldDropSchemas: make([]string, 0, len(plan)),
@@ -377,14 +418,20 @@ func (m *Roll) windowView(ctx context.Context, plan []RevertTarget, boundary *st
 			restoreName = *p
 		}
 	}
+	// A nil restore target means the database returns to empty; ToSchema stays
+	// nil. When a target exists, resolving its version schema must succeed —
+	// mirroring runWindowRevert, a lookup failure is fatal rather than a
+	// silent (and misleading) "empty database" restore.
 	if restoreName != "" {
 		view.To = &restoreName
-		if mig, err := m.state.GetMigration(ctx, m.schema, restoreName); err == nil {
-			s := VersionedSchemaName(m.schema, mig.VersionSchemaName())
-			view.ToSchema = &s
+		mig, err := m.state.GetMigration(ctx, m.schema, restoreName)
+		if err != nil {
+			return nil, fmt.Errorf("unable to resolve the restore target %q: %w", restoreName, err)
 		}
+		s := VersionedSchemaName(m.schema, mig.VersionSchemaName())
+		view.ToSchema = &s
 	}
-	return view
+	return view, nil
 }
 
 // composedRevertView builds a RevertView for a revert that reaches contracted
@@ -421,6 +468,15 @@ func (m *Roll) composedRevertView(ctx context.Context, to string, versionSchemaB
 		view.WouldDropSchemas = append(view.WouldDropSchemas, VersionedSchemaName(m.schema, t.VersionSchema))
 	}
 	if sealed != nil {
+		// The sealed targets' version schemas are not carried on the plan;
+		// resolve them from history. Built lazily so callers that never reach
+		// the sealed leg (a bare window revert to `to`) pay no history read.
+		if versionSchemaByName == nil {
+			versionSchemaByName, err = m.versionSchemasByName(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
 		for _, name := range sealed.Targets {
 			view.Migrations = append(view.Migrations, name)
 			vs := name
@@ -464,29 +520,32 @@ func rawVersionSchemaName(raw migrations.RawMigration) string {
 	return raw.Name
 }
 
-// localMigrationNames returns the names of the migrations in `dir` that come
-// after the baseline, in filename (lexicographic) order. An empty directory
-// yields an empty slice rather than an error.
-func localMigrationNames(dir fs.FS, baselineName string) ([]string, error) {
+// localMigrations returns the migrations in `dir` that come after the
+// baseline, in filename (lexicographic) order. An empty directory yields an
+// empty slice rather than an error.
+func localMigrations(dir fs.FS, baselineName string) ([]*migrations.RawMigration, error) {
 	files, err := migrations.CollectFilesFromDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading migration files: %w", err)
 	}
-	names := make([]string, 0, len(files))
+	raws := make([]*migrations.RawMigration, 0, len(files))
 	for _, f := range files {
 		raw, err := migrations.ReadRawMigration(dir, f)
 		if err != nil {
 			return nil, fmt.Errorf("reading migration file %q: %w", f, err)
 		}
 		if raw.Name > baselineName {
-			names = append(names, raw.Name)
+			raws = append(raws, raw)
 		}
 	}
-	return names, nil
+	return raws, nil
 }
 
-// classifyBlockedReason maps a revert-planner refusal to a short,
-// machine-branchable reason for the Blocked field.
+// classifyBlockedReason maps a revert-planner refusal to one of the fixed,
+// machine-branchable reason tokens documented on BlockedView.Reason. It never
+// returns the raw error text: an unrecognized refusal falls through to the
+// stable catch-all "unavailable" so a consumer switching on the reason never
+// has to parse a free-form sentence.
 func classifyBlockedReason(err error) string {
 	msg := err.Error()
 	switch {
@@ -495,13 +554,18 @@ func classifyBlockedReason(err error) string {
 	case strings.Contains(msg, "irreversible"),
 		strings.Contains(msg, "cannot be inverted"),
 		strings.Contains(msg, "captured from DDL"),
-		strings.Contains(msg, "no operations"):
+		strings.Contains(msg, "no operations"),
+		strings.Contains(msg, "not a clean train boundary"):
 		return "inverse unavailable"
 	case strings.Contains(msg, "not contiguous"),
 		strings.Contains(msg, "not an ancestor"),
 		strings.Contains(msg, "advanced past the revert window"):
 		return "non-contiguous"
+	case strings.Contains(msg, "in progress"),
+		strings.Contains(msg, "window is open"),
+		strings.Contains(msg, "not sealed"):
+		return "window open"
 	default:
-		return msg
+		return "unavailable"
 	}
 }

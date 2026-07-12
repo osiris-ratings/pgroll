@@ -66,8 +66,32 @@ func revertCmd() *cobra.Command {
 
 			// --dry-run: preview the revert{} plan and return WITHOUT executing
 			// or resuming anything. Honors the same bare / --steps / --to
-			// bounds the real revert does.
+			// bounds — and the same flag validation — the real revert does.
 			if dryRun {
+				// An interrupted inversion revert leaves intermediate state the
+				// planners refuse; the real command would resume it. Surface
+				// that (read-only) instead of previewing a misleading plan
+				// against the half-applied history.
+				resume, err := m.PendingSealedRevertResume(ctx)
+				if err != nil {
+					return err
+				}
+				if resume != "" {
+					return fmt.Errorf(
+						"an interrupted revert is pending and cannot be previewed cleanly: %s — "+
+							"re-run `pgroll revert --to <boundary>` to resume it (without --dry-run)", resume,
+					)
+				}
+
+				if expandOnly && toMigration != "" {
+					// --expand-only only applies to an inversion (contracted)
+					// revert; reject the window-only combination up front, as
+					// the executing path does.
+					if _, err := m.RevertPlan(ctx, roll.WithRevertTo(toMigration)); err == nil {
+						return fmt.Errorf("--expand-only does not apply: %q is within the in-flight window and reverts losslessly", toMigration)
+					}
+				}
+
 				var opts []roll.RevertOption
 				switch {
 				case steps > 0:

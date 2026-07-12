@@ -313,6 +313,54 @@ func TestPlanExplicitTargetNotFound(t *testing.T) {
 	})
 }
 
+// TestPlanNotInSyncWhenBackdatedMigrationUnapplied: leaf equality alone must
+// not report in_sync — a checkout migration older than the shared leaf that
+// was never applied still needs applying.
+func TestPlanNotInSyncWhenBackdatedMigrationUnapplied(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		// DB applied 00_a then 02_c, skipping 01_b (added late on a branch).
+		applyAndSeal(t, mig, createTable("00_a", "t_a"))
+		applyAndSeal(t, mig, createTable("02_c", "t_c"))
+
+		plan, err := mig.Plan(ctx, localFS(t, "00_a", "01_b", "02_c"))
+		require.NoError(t, err)
+
+		require.NotNil(t, plan.DBLatest)
+		require.NotNil(t, plan.LocalLatest)
+		assert.Equal(t, *plan.DBLatest, *plan.LocalLatest) // both 02_c
+		assert.False(t, plan.InSync, "an unapplied older migration must defeat in_sync")
+		assert.Equal(t, []string{"01_b"}, plan.Apply.Migrations)
+		assert.Equal(t, 0, plan.Revert.Count)
+		assert.Equal(t, 0, plan.Blocked.Count)
+	})
+}
+
+// TestPlanExplicitTargetBaseline: --to naming the baseline is accepted (a
+// legal revert boundary) rather than rejected as "not found in history".
+func TestPlanExplicitTargetBaseline(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, _ *sql.DB) {
+		ctx := context.Background()
+
+		require.NoError(t, mig.CreateBaseline(ctx, "00_baseline"))
+		applyAndSeal(t, mig, createTable("01_a", "t_a"))
+
+		plan, err := mig.Plan(ctx, localFS(t, "00_baseline"), roll.WithPlanTo("00_baseline"))
+		require.NoError(t, err)
+
+		assert.Equal(t, 0, plan.Apply.Count)
+		assert.Equal(t, 0, plan.Blocked.Count)
+		assert.Equal(t, []string{"01_a"}, plan.Revert.Migrations)
+		require.NotNil(t, plan.Revert.To)
+		assert.Equal(t, "00_baseline", *plan.Revert.To)
+	})
+}
+
 // migrationsSignature snapshots the observable state of the pgroll history for
 // a schema so a dry-run can be asserted to leave it untouched.
 func migrationsSignature(t *testing.T, db *sql.DB, schema string) string {
