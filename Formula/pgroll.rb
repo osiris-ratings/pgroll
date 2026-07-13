@@ -6,21 +6,21 @@ require_relative "custom_download_strategy"
 class Pgroll < Formula
   desc "Postgres zero-downtime migrations made easy"
   homepage "https://github.com/osiris-ratings/pgroll"
-  version "0.16.2-baselayer.16"
+  version "0.16.2-baselayer.17"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.16/pgroll_0.16.2-baselayer.16_darwin_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "4d8cf357c255c1929bcbacd9fd891a5aafa282e5929516213a3cd6cb4ca8dc16"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.17/pgroll_0.16.2-baselayer.17_darwin_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "50a720adb290f96c5465e9a6fb5a9800dcccccbcd25e6eb62cf0470fc7f0ae9a"
 
       define_method(:install) do
         bin.install "pgroll"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.16/pgroll_0.16.2-baselayer.16_darwin_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "d970e94ca04c97973f1e0ec4b0373bfcb222190b416dfcf84cd04403ab1a2847"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.17/pgroll_0.16.2-baselayer.17_darwin_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "a720490132badb186a79da5a6246c591d13589a5e8278a5bafbb6b3b85bc9406"
 
       define_method(:install) do
         bin.install "pgroll"
@@ -30,15 +30,15 @@ class Pgroll < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.16/pgroll_0.16.2-baselayer.16_linux_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "f0d9d9cdc33b50b711b11dc24506807c2542573b96f9aad42a67997c4a5b4c72"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.17/pgroll_0.16.2-baselayer.17_linux_amd64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "a4b0938bc6c61047e61aa4e0a99cfba83b3a056ecf359470ab6f227ebd10b17b"
       define_method(:install) do
         bin.install "pgroll"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.16/pgroll_0.16.2-baselayer.16_linux_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
-      sha256 "298da1afa85d4eb78b087e27c728798861c68dbd7a7cba2c7fbb277ad14bedfa"
+      url "https://github.com/osiris-ratings/pgroll/releases/download/v0.16.2-baselayer.17/pgroll_0.16.2-baselayer.17_linux_arm64.tar.gz", using: GitHubPrivateRepositoryReleaseDownloadStrategy
+      sha256 "723fa9440e396a7ec81564fda2955ab9cce6fed1ea96e9930ee25808dd940506"
       define_method(:install) do
         bin.install "pgroll"
       end
