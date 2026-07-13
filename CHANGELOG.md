@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/guides/lifecycle-verbs.md` — a design note explaining why the
+  `migrate` / `complete` / `rollback` / `revert` / `plan` verbs are each
+  distinct and do not fold together (the "fold test"), following the seal
+  retirement.
+
+### Changed
+
+- Bumped Go module dependencies (dependabot):
+  - `github.com/testcontainers/testcontainers-go` 0.42.0 → 0.43.0
+  - `github.com/testcontainers/testcontainers-go/modules/postgres` 0.42.0 → 0.43.0
+  - `github.com/oapi-codegen/nullable` 1.1.0 → 1.2.0
+  - `golang.org/x/tools` 0.45.0 → 0.48.0
+  - `golang.org/x/mod` 0.37.0 → 0.38.0
+  - `golang.org/x/crypto` 0.48.0 → 0.52.0 (indirect)
+
 ## [0.16.2-baselayer.16] - 2026-07-12
 
 ### Fixed
