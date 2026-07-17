@@ -52,10 +52,18 @@ func (o *OpDropColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 	l.LogOperationComplete(o)
 	scope := s.MigrationScope
 
+	// Target the physical base relation (table.Name); under a deferred in-train
+	// rename it differs from the logical o.Table. Trigger-function identifiers
+	// stay keyed by o.Table to match what Start installed.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		NewDropColumnAction(conn, o.Table, o.Column),
+		NewDropColumnAction(conn, table.Name, o.Column),
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column)),
-		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
 }
 

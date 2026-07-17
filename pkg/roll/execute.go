@@ -539,9 +539,19 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 	}
 
-	// read the current schema (now reflecting every drained migration's
-	// physical effects).
-	currentSchema, err := m.state.ReadSchema(ctx, m.schema)
+	// Read the current schema for the active migration's Complete. This must
+	// go through readSchemaWithDeferred, exactly as Validate/Start do, not the
+	// raw physical read: under the WithSkipSchemaDrop (additive) path above the
+	// drain is skipped, so an earlier in-train migration's deferred rename has
+	// neither been physically applied nor replayed. The raw physical schema is
+	// still keyed by the pre-rename base-relation name, so an op that refers to
+	// the table by its post-rename logical name (e.g. add_column on a renamed
+	// table, same train) would not find it. Replaying the deferred renames here
+	// keys the table under its logical name while leaving Table.Name as the
+	// still-physical base relation — the same view op.Start operated on. In the
+	// drain branch the queue was just emptied, so this is equivalent to the raw
+	// read (readSchemaWithDeferred short-circuits when nothing is deferred).
+	currentSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
 	}

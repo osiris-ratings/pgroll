@@ -64,9 +64,14 @@ func (o *OpSetCheckConstraint) Start(ctx context.Context, l Logger, conn db.DB, 
 func (o *OpSetCheckConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
 
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		// Validate the check constraint
-		NewValidateConstraintAction(conn, o.Table, o.Check.Name),
+		// Validate the check constraint on the physical base relation
+		NewValidateConstraintAction(conn, table.Name, o.Check.Name),
 	}, nil
 }
 

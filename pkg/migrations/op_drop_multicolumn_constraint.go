@@ -103,8 +103,14 @@ func (o *OpDropMultiColumnConstraint) Complete(l Logger, conn db.DB, s *schema.S
 	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
-	table.Name = o.Table
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 
+	// All DDL targets the physical base relation (table.Name). Under a deferred
+	// in-train rename table.Name is the still-physical name while o.Table is the
+	// post-rename logical name; do not overwrite table.Name with o.Table.
+	// Trigger-function identifiers stay keyed by o.Table to match Start.
 	constraintColumns := table.GetConstraintColumns(o.Name)
 	dbActions := make([]DBAction, 0, 5*len(constraintColumns))
 	for _, columnName := range constraintColumns {
@@ -113,9 +119,9 @@ func (o *OpDropMultiColumnConstraint) Complete(l Logger, conn db.DB, s *schema.S
 			NewDropFunctionAction(conn,
 				backfill.TriggerFunctionName(scope, o.Table, columnName),
 				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, columnName))),
-			NewAlterSequenceOwnerAction(conn, o.Table, columnName, TemporaryName(scope, columnName)),
-			NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
-			NewDropColumnAction(conn, o.Table, columnName),
+			NewAlterSequenceOwnerAction(conn, table.Name, columnName, TemporaryName(scope, columnName)),
+			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
+			NewDropColumnAction(conn, table.Name, columnName),
 			NewRenameDuplicatedColumnAction(conn, scope, table, columnName),
 		)
 	}

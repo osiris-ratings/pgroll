@@ -36,11 +36,16 @@ func (o *OpRenameColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBA
 	l.LogOperationComplete(o)
 
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 	table.RenameColumn(o.From, o.To)
 	table.RenameConstraintColumns(o.From, o.To)
 
+	// Target the physical base relation (table.Name), not the logical o.Table:
+	// under a train that defers an earlier rename of this table they differ.
 	return []DBAction{
-		NewRenameColumnAction(conn, o.Table, o.From, o.To),
+		NewRenameColumnAction(conn, table.Name, o.From, o.To),
 	}, nil
 }
 

@@ -97,15 +97,21 @@ func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]D
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 	column := table.GetColumn(table.GetConstraintColumns(o.Name)[0])
 
+	// Target the physical base relation (table.Name); under a deferred in-train
+	// rename it differs from the logical o.Table. Trigger-function identifiers
+	// stay keyed by o.Table to match what Start installed.
 	return []DBAction{
 		NewDropFunctionAction(conn,
 			backfill.TriggerFunctionName(scope, o.Table, column.Name),
 			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, column.Name))),
-		NewAlterSequenceOwnerAction(conn, o.Table, column.Name, TemporaryName(scope, column.Name)),
+		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(scope, column.Name)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-		NewDropColumnAction(conn, o.Table, column.Name),
+		NewDropColumnAction(conn, table.Name, column.Name),
 		NewRenameDuplicatedColumnAction(conn, scope, table, column.Name),
 	}, nil
 }
