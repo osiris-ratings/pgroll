@@ -120,6 +120,17 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 	l.LogOperationComplete(o)
 	scope := s.MigrationScope
 
+	// Resolve the physical base relation up front. Under a deferred in-train
+	// rename table.Name is the still-physical name while o.Table is the
+	// post-rename logical name; every DDL action below targets table.Name. The
+	// delegated sub-ops (set unique/check/fk) resolve the physical name the
+	// same way, so their o.Table field can stay logical. Trigger-function
+	// identifiers (removeTriggers) stay keyed by o.Table to match Start.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	dbActions := make([]DBAction, 0)
 	switch o.Type {
 	case OpCreateConstraintTypeUnique:
@@ -157,21 +168,16 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 		}
 		dbActions = append(dbActions, actions...)
 	case OpCreateConstraintTypePrimaryKey:
-		dbActions = append(dbActions, NewAddPrimaryKeyAction(conn, o.Table, o.Name))
+		dbActions = append(dbActions, NewAddPrimaryKeyAction(conn, table.Name, o.Name))
 	}
 
 	for _, col := range o.Columns {
-		dbActions = append(dbActions, NewAlterSequenceOwnerAction(conn, o.Table, col, TemporaryName(scope, col)))
+		dbActions = append(dbActions, NewAlterSequenceOwnerAction(conn, table.Name, col, TemporaryName(scope, col)))
 	}
 
-	dbActions = append(dbActions, NewDropColumnAction(conn, o.Table, o.Columns...))
+	dbActions = append(dbActions, NewDropColumnAction(conn, table.Name, o.Columns...))
 
 	// rename new columns to old name
-	table := s.GetTable(o.Table)
-	if table == nil {
-		return nil, TableDoesNotExistError{Name: o.Table}
-	}
-	table.Name = o.Table
 	for _, col := range o.Columns {
 		column := table.GetColumn(col)
 		if column == nil {
@@ -182,7 +188,7 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 	dbActions = append(
 		dbActions,
 		o.removeTriggers(conn, scope),
-		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	)
 
 	return dbActions, nil
@@ -214,8 +220,18 @@ func (o *OpCreateConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([
 func (o *OpCreateConstraint) RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
 
+	// Target the physical base relation (table.Name); under a train that
+	// defers an earlier rename of this table it differs from the logical
+	// o.Table. rollbackCompletedOperations reads its schema via
+	// readSchemaWithDeferred, so the deferred rename is replayed and o.Table
+	// resolves with .Name left at the still-physical relation.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		NewDropConstraintAction(conn, o.Table, o.Name),
+		NewDropConstraintAction(conn, table.Name, o.Name),
 	}, nil
 }
 

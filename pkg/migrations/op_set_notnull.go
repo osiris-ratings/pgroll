@@ -73,16 +73,18 @@ func (o *OpSetNotNull) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 		// The constraint must be valid because:
 		// * Existing NULL values in the old column were rewritten using the `up` SQL during backfill.
 		// * New NULL values written to the old column during the migration period were also rewritten using `up` SQL.
-		NewValidateConstraintAction(conn, o.Table, NotNullConstraintName(o.Column)),
+		NewValidateConstraintAction(conn, table.Name, NotNullConstraintName(o.Column)),
 		// Use the validated constraint to add `NOT NULL` to the new column.
 		// The action is invoked on the temp column name (the rename to the
 		// final name happens later in OpAlterColumn.Complete via
 		// RenameDuplicatedColumnAction), so we pass the canonical name keyed
 		// off the *final* column name so the post-rename pg_constraint row
-		// matches what pg_dump treats as the default form.
-		NewSetNotNullAction(conn, o.Table, TemporaryName(s.MigrationScope, o.Column), CanonicalNotNullName(o.Table, o.Column)),
+		// matches what pg_dump treats as the default form. table.Name (the
+		// physical base relation) is used throughout — under a deferred
+		// in-train rename it differs from the logical o.Table.
+		NewSetNotNullAction(conn, table.Name, TemporaryName(s.MigrationScope, o.Column), CanonicalNotNullName(table.Name, o.Column)),
 		// Drop the NOT NULL constraint
-		NewDropConstraintAction(conn, o.Table, NotNullConstraintName(o.Column)),
+		NewDropConstraintAction(conn, table.Name, NotNullConstraintName(o.Column)),
 	}, nil
 }
 

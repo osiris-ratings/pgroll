@@ -13,6 +13,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/xataio/pgroll/pkg/backfill"
+	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/schema"
 )
@@ -539,9 +540,19 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 	}
 
-	// read the current schema (now reflecting every drained migration's
-	// physical effects).
-	currentSchema, err := m.state.ReadSchema(ctx, m.schema)
+	// Read the current schema for the active migration's Complete. This must
+	// go through readSchemaWithDeferred, exactly as Validate/Start do, not the
+	// raw physical read: under the WithSkipSchemaDrop (additive) path above the
+	// drain is skipped, so an earlier in-train migration's deferred rename has
+	// neither been physically applied nor replayed. The raw physical schema is
+	// still keyed by the pre-rename base-relation name, so an op that refers to
+	// the table by its post-rename logical name (e.g. add_column on a renamed
+	// table, same train) would not find it. Replaying the deferred renames here
+	// keys the table under its logical name while leaving Table.Name as the
+	// still-physical base relation — the same view op.Start operated on. In the
+	// drain branch the queue was just emptied, so this is equivalent to the raw
+	// read (readSchemaWithDeferred short-circuits when nothing is deferred).
+	currentSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
 	}
@@ -687,6 +698,18 @@ func (m *Roll) rollbackExpandPhase(ctx context.Context, migration *migrations.Mi
 		}
 	}
 
+	// The parent snapshot (resulting_schema) is a raw physical read, so it is
+	// keyed by pre-rename base-relation names. Re-key it into the logical view
+	// by replaying the still-deferred ancestor renames, so this migration's
+	// ops (replayed next) resolve their post-rename logical table/column names.
+	// Renames are the only deferred effect the physical snapshot lacks in a way
+	// that breaks name resolution — non-rename deferred artifacts (temp
+	// columns, triggers) are already physically present in the snapshot and
+	// must NOT be re-applied.
+	if err := m.applyDeferredRenames(ctx, schema, migration.Name); err != nil {
+		return err
+	}
+
 	// Set the migration's scope so naming helpers in op.Start (replayed
 	// here via UpdateVirtualSchema) and op.Rollback produce identifiers
 	// matching the physical artifacts installed during Start.
@@ -698,6 +721,51 @@ func (m *Roll) rollbackExpandPhase(ctx context.Context, migration *migrations.Mi
 	}
 
 	return m.rollbackOperations(ctx, migration, schema)
+}
+
+// applyDeferredRenames re-keys s by replaying the rename operations
+// (OpRenameTable / OpRenameColumn) of every still-deferred migration except
+// `exclude`, in apply order. It transforms the raw physical parent snapshot
+// used by rollbackExpandPhase into the logical view a later op expects: within
+// one unsealed train a deferred rename is not physically applied until seal, so
+// the physical read is still keyed by the pre-rename name while the migration
+// being reverted refers to the table by its post-rename logical name.
+//
+// Only renames are replayed: they are the sole deferred effect that changes the
+// schema's table/column keys, and every other deferred artifact is already
+// present in the physical snapshot (re-applying a full Start would double-add
+// it). `exclude` is the migration currently being reverted — its own Start,
+// including any intra-migration rename, is replayed separately by the caller
+// via UpdateVirtualSchema, so replaying it here too would double-apply it.
+//
+// When nothing is deferred (the common non-train revert) this is a no-op and
+// the snapshot is used unchanged.
+func (m *Roll) applyDeferredRenames(ctx context.Context, s *schema.Schema, exclude string) error {
+	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+
+	fake := &db.FakeDB{}
+	for _, dm := range deferred {
+		if dm.Name == exclude {
+			continue
+		}
+		// Rename Start uses no naming helpers, but set the scope per migration
+		// to match readSchemaWithDeferred's discipline.
+		s.MigrationScope = migrations.MigrationScopeFor(dm.Name)
+		for _, op := range dm.Operations {
+			switch op.(type) {
+			case *migrations.OpRenameTable, *migrations.OpRenameColumn:
+				if _, err := op.Start(ctx, migrations.NewNoopLogger(), fake, s); err != nil {
+					return fmt.Errorf("unable to replay deferred rename from %q: %w", dm.Name, err)
+				}
+			}
+		}
+	}
+	// Reset so the caller's explicit scope assignment is the source of truth.
+	s.MigrationScope = ""
+	return nil
 }
 
 // rollbackOperations runs each operation's Rollback in reverse order against

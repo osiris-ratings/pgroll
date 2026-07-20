@@ -30,7 +30,7 @@ func (o *OpSetComment) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 	}
 
 	dbActions := []DBAction{
-		NewCommentColumnAction(conn, o.Table, TemporaryName(s.MigrationScope, o.Column), o.Comment),
+		NewCommentColumnAction(conn, tbl.Name, TemporaryName(s.MigrationScope, o.Column), o.Comment),
 	}
 
 	return &StartResult{Actions: dbActions, BackfillTask: backfill.NewTask(tbl)}, nil
@@ -39,8 +39,13 @@ func (o *OpSetComment) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 func (o *OpSetComment) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
 
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		NewCommentColumnAction(conn, o.Table, o.Column, o.Comment),
+		NewCommentColumnAction(conn, table.Name, o.Column, o.Comment),
 	}, nil
 }
 

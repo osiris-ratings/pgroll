@@ -24,9 +24,14 @@ func (o *OpRenameConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 func (o *OpRenameConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationComplete(o)
 
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		// rename the constraint in the underlying table
-		NewRenameConstraintAction(conn, o.Table, o.From, o.To),
+		// rename the constraint in the underlying (physical) table
+		NewRenameConstraintAction(conn, table.Name, o.From, o.To),
 	}, nil
 }
 
@@ -47,8 +52,16 @@ func (o *OpRenameConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([
 func (o *OpRenameConstraint) RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
 
+	// Target the physical base relation (table.Name); under a train that
+	// defers an earlier rename of this table it differs from the logical
+	// o.Table.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		NewRenameConstraintAction(conn, o.Table, o.To, o.From),
+		NewRenameConstraintAction(conn, table.Name, o.To, o.From),
 	}, nil
 }
 

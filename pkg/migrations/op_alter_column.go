@@ -136,9 +136,12 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 	if column == nil {
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
 	}
-	table.Name = o.Table
 
-	// Rename the new column to the old column name
+	// All DDL targets the physical base relation (table.Name). Under a deferred
+	// in-train rename table.Name is the still-physical name while o.Table is the
+	// post-rename logical name; do not overwrite table.Name with o.Table (that
+	// would misdirect the duplicated-column rename below). Trigger-function
+	// identifiers stay keyed by o.Table to match what Start installed.
 	return append(dbActions, []DBAction{
 		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(scope, column.Name)),
 		NewDropColumnAction(conn, table.Name, o.Column),
@@ -147,7 +150,7 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 			backfill.TriggerFunctionName(scope, o.Table, o.Column),
 			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
 		),
-		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 		NewRenameDuplicatedColumnAction(conn, scope, table, o.Column),
 	}...), nil
 }

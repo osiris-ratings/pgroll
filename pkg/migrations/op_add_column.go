@@ -143,36 +143,46 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 	l.LogOperationComplete(o)
 	scope := s.MigrationScope
 
+	// Resolve the physical relation. Under a train that defers an earlier
+	// rename of this table, o.Table is the post-rename logical name while the
+	// base relation is still physically table.Name; every DDL action below must
+	// target the physical name. Identifier-derivation helpers (the backfill
+	// trigger function name) stay keyed by o.Table to match what Start installed.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	dbActions := []DBAction{
-		NewRenameColumnAction(conn, o.Table, TemporaryName(scope, o.Column.Name), o.Column.Name),
+		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name),
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
-		NewDropColumnAction(conn, o.Table, backfill.NeedsBackfillColumnName(scope)),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 
 	if !o.Column.IsNullable() && o.Column.Default == nil {
-		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, o.Table, o.Column.Name)...)
+		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
 	}
 
 	if o.Column.Check != nil {
-		dbActions = append(dbActions, NewValidateConstraintAction(conn, o.Table, o.Column.Check.Name))
+		dbActions = append(dbActions, NewValidateConstraintAction(conn, table.Name, o.Column.Check.Name))
 	}
 
 	if o.Column.Unique {
 		dbActions = append(dbActions, NewAddConstraintUsingUniqueIndex(conn,
-			o.Table,
+			table.Name,
 			o.Column.Name,
 			UniqueIndexName(o.Column.Name)))
 	}
 
 	// If the column has a DEFAULT that could not be set using the fast-path
 	// optimization, set it here.
-	column := s.GetTable(o.Table).GetColumn(TemporaryName(scope, o.Column.Name))
+	column := table.GetColumn(TemporaryName(scope, o.Column.Name))
 	if o.Column.HasDefault() && column.Default == nil {
-		dbActions = append(dbActions, NewSetDefaultValueAction(conn, o.Table, o.Column.Name, *o.Column.Default))
+		dbActions = append(dbActions, NewSetDefaultValueAction(conn, table.Name, o.Column.Name, *o.Column.Default))
 
 		// Validate the `NOT NULL` constraint on the column if necessary
 		if !o.Column.IsNullable() {
-			dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, o.Table, o.Column.Name)...)
+			dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
 		}
 	}
 

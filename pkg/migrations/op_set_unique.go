@@ -62,8 +62,10 @@ func (o *OpSetUnique) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	// Create a unique constraint using the unique index
-	return []DBAction{NewAddConstraintUsingUniqueIndex(conn, o.Table, o.Name, o.Name)}, nil
+	// Create a unique constraint using the unique index, on the physical base
+	// relation (table.Name differs from the logical o.Table under a deferred
+	// in-train rename).
+	return []DBAction{NewAddConstraintUsingUniqueIndex(conn, table.Name, o.Name, o.Name)}, nil
 }
 
 func (o *OpSetUnique) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
