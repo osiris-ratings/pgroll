@@ -72,11 +72,16 @@ func (o *OpDropColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 	scope := s.MigrationScope
 
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 
 	// Mark the column as no longer deleted so thats it's visible to preceding
 	// rollback operations in the same migration
-	s.GetTable(o.Table).UnRemoveColumn(o.Column)
+	table.UnRemoveColumn(o.Column)
 
+	// NeedsBackfill cleanup targets the physical base relation (table.Name);
+	// the trigger-function identifier stays keyed by o.Table to match Start.
 	return []DBAction{
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),

@@ -122,10 +122,17 @@ func (o *OpDropConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]D
 
 	// We have already validated that there is single column related to this constraint.
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 	columnName := table.GetConstraintColumns(o.Name)[0]
 
+	// Physical DDL targets the physical base relation (table.Name); under a
+	// train that defers an earlier rename of this table it differs from the
+	// logical o.Table. Trigger-function identifiers stay keyed by o.Table to
+	// match what Start installed.
 	return []DBAction{
-		NewDropColumnAction(conn, o.Table, TemporaryName(scope, columnName)),
+		NewDropColumnAction(conn, table.Name, TemporaryName(scope, columnName)),
 		NewDropFunctionAction(conn,
 			backfill.TriggerFunctionName(scope, o.Table, columnName),
 			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, columnName))),

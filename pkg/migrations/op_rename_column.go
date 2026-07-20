@@ -54,6 +54,9 @@ func (o *OpRenameColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBA
 
 	// Rename the column back to the original name in the in-memory schema.
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 	table.RenameColumn(o.To, o.From)
 
 	return nil, nil

@@ -133,7 +133,13 @@ func (o *OpDropMultiColumnConstraint) Rollback(l Logger, conn db.DB, s *schema.S
 	l.LogOperationRollback(o)
 	scope := s.MigrationScope
 
+	// Physical DDL targets the physical base relation (table.Name); under a
+	// train that defers an earlier rename of this table it differs from the
+	// logical o.Table. Trigger-function identifiers stay keyed by o.Table.
 	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
 
 	constraintColumns := table.GetConstraintColumns(o.Name)
 	dbAction := make([]DBAction, 0, 3*len(constraintColumns))

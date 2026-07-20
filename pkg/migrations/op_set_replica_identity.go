@@ -16,8 +16,18 @@ var _ Operation = (*OpSetReplicaIdentity)(nil)
 func (o *OpSetReplicaIdentity) Start(ctx context.Context, l Logger, conn db.DB, s *schema.Schema) (*StartResult, error) {
 	l.LogOperationStart(o)
 
+	// Target the physical base relation (table.Name), not the logical o.Table:
+	// under a train that defers an earlier rename of this table they differ,
+	// and the ALTER TABLE ... REPLICA IDENTITY runs inline here while the
+	// physical rename is still queued for seal. The index (o.Identity.Index)
+	// travels with the table, so it needs no resolution.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	dbActions := []DBAction{
-		NewSetReplicaIdentityAction(conn, o.Table, o.Identity.Type, o.Identity.Index),
+		NewSetReplicaIdentityAction(conn, table.Name, o.Identity.Type, o.Identity.Index),
 	}
 	return &StartResult{Actions: dbActions}, nil
 }

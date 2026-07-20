@@ -369,10 +369,23 @@ func (m *Roll) revertMigration(ctx context.Context, t RevertTarget) error {
 		// final column rather than its long-gone temporary name).
 		// Operations whose Complete restructures user-facing objects
 		// implement RollbackCompleted and take that path instead.
+		//
+		// Read via readSchemaWithDeferred, exactly as Complete/Start do, not
+		// the raw physical read: an earlier in-train migration's deferred
+		// rename is still queued (it reverts later in this same window walk),
+		// so the raw physical schema is keyed by the pre-rename base-relation
+		// name and s.GetTable(<post-rename logical name>) would be nil. The
+		// applied migration completed inline, so its own Start is not among
+		// the replayed deferred set and its final-named columns stay at their
+		// final names; replaying the deferred renames only keys the table
+		// under its logical name while leaving Table.Name at the still-physical
+		// base relation — the relation this rollback's DDL must target. When
+		// nothing is deferred, readSchemaWithDeferred short-circuits to the
+		// raw read, so non-train reverts are unchanged.
 		if err := m.dropVersionSchema(ctx, migration); err != nil {
 			return err
 		}
-		sch, err := m.state.ReadSchema(ctx, m.schema)
+		sch, err := m.readSchemaWithDeferred(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to read schema: %w", err)
 		}

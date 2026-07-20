@@ -220,8 +220,18 @@ func (o *OpCreateConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([
 func (o *OpCreateConstraint) RollbackCompleted(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	l.LogOperationRollback(o)
 
+	// Target the physical base relation (table.Name); under a train that
+	// defers an earlier rename of this table it differs from the logical
+	// o.Table. rollbackCompletedOperations reads its schema via
+	// readSchemaWithDeferred, so the deferred rename is replayed and o.Table
+	// resolves with .Name left at the still-physical relation.
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
 	return []DBAction{
-		NewDropConstraintAction(conn, o.Table, o.Name),
+		NewDropConstraintAction(conn, table.Name, o.Name),
 	}, nil
 }
 
