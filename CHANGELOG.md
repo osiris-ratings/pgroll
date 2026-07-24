@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2-baselayer.19] - 2026-07-24
+
 ### Fixed
 
 - `pgroll migrate` is now idempotent across the expand→complete window. The
