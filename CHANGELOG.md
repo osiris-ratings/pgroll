@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `pgroll migrate` is now idempotent across the expand→complete window. The
+  additive train model leaves the final migration active (expand applied,
+  awaiting `pgroll complete`), which is also the resting state a database
+  inherits when provisioned from a snapshot captured mid-train. Re-running
+  `migrate` in that state previously hard-failed as `INTERRUPTED` and told the
+  operator to run `pgroll rollback` — wedging every fresh-instance deploy and
+  any deploy retried after a mid-deploy failure. `migrate` now recognizes the
+  fully-materialized expand phase as a new benign `EXPANDED` state and treats a
+  re-run as a no-op (or, with `--complete`, finishes the contraction).
+  Genuine interruptions are still caught: the expand counts as materialized
+  only when the active migration's version schema is projected *and* its
+  backfill has no rows still flagged (`_pgroll_needs_backfill`), so a Start
+  killed mid-backfill remains `INTERRUPTED`. Adds `Roll.HasPendingBackfill`.
+
 ## [0.16.2-baselayer.18] - 2026-07-20
 
 ## [0.16.2-baselayer.17] - 2026-07-13

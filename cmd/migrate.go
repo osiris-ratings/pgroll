@@ -109,20 +109,45 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("unable to determine active migration period: %w", err)
 			}
 			if active {
-				if preFlightState == cycleInProgress {
+				switch preFlightState {
+				case cycleInProgress:
 					return fmt.Errorf(
 						"migration %q is currently being run by another pgroll process; "+
 							"wait for that run to finish before retrying",
 						*latestMigration,
 					)
+				case cycleAwaitingComplete:
+					// The final migration of a prior `pgroll migrate` is
+					// intentionally left active — its Start (expand) applied
+					// and projected the new version schema, and `pgroll
+					// complete` will contract it. This is the normal
+					// production state between expand and contract, so
+					// re-running migrate here must be idempotent: a deploy
+					// interrupted in this window (e.g. a failed fleet rollout)
+					// has to be retryable without a destructive `pgroll
+					// rollback` that would tear down the expand the fleet may
+					// already be pinned to.
+					if !complete {
+						fmt.Printf("Migration %q is already applied (expand phase); awaiting `pgroll complete`. Nothing to do\n", *latestMigration)
+						return nil
+					}
+					// --complete was requested (the dev/CI one-shot converge):
+					// finish the pending contraction instead of erroring, so
+					// `migrate --complete` is idempotent too.
+					if err := m.Complete(ctx); err != nil {
+						return fmt.Errorf("failed to complete already-applied migration %q: %w", *latestMigration, err)
+					}
+					fmt.Printf("Migration %q completed\n", *latestMigration)
+					return nil
+				default:
+					return fmt.Errorf(
+						"migration %q is in progress and was not completed; "+
+							"this usually means a previous run was interrupted "+
+							"(e.g. lock_timeout under contention or SIGINT). "+
+							"Run `pgroll rollback` to clean up before retrying",
+						*latestMigration,
+					)
 				}
-				return fmt.Errorf(
-					"migration %q is in progress and was not completed; "+
-						"this usually means a previous run was interrupted "+
-						"(e.g. lock_timeout under contention or SIGINT). "+
-						"Run `pgroll rollback` to clean up before retrying",
-					*latestMigration,
-				)
 			}
 
 			if len(rawMigs) == 0 {
@@ -259,12 +284,13 @@ func migrateCmd() *cobra.Command {
 type cycleState string
 
 const (
-	cycleFresh       cycleState = "FRESH"
-	cycleIncremental cycleState = "INCREMENTAL"
-	cycleRecovery    cycleState = "RECOVERY"
-	cycleInProgress  cycleState = "IN-PROGRESS"
-	cycleInterrupted cycleState = "INTERRUPTED"
-	cycleNoOp        cycleState = "NO-OP"
+	cycleFresh            cycleState = "FRESH"
+	cycleIncremental      cycleState = "INCREMENTAL"
+	cycleRecovery         cycleState = "RECOVERY"
+	cycleInProgress       cycleState = "IN-PROGRESS"
+	cycleInterrupted      cycleState = "INTERRUPTED"
+	cycleAwaitingComplete cycleState = "EXPANDED"
+	cycleNoOp             cycleState = "NO-OP"
 )
 
 // printMigratePreFlight reports the current deployment state and the plan
@@ -301,6 +327,7 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		return "", fmt.Errorf("reading active migration period: %w", err)
 	}
 	var inProgressName string
+	var expandComplete bool
 	otherBackends := 0
 	if activePeriod {
 		latestMig, err := m.State().LatestMigration(ctx, m.Schema())
@@ -309,6 +336,40 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 		if latestMig != nil {
 			inProgressName = *latestMig
+		}
+
+		// Decide whether the active migration's Start (expand) fully
+		// materialized. That requires BOTH:
+		//
+		//   1. Its version schema was projected — the atomic marker that the
+		//      DDL phase finished and the fleet can pin to the new schema.
+		//   2. Its backfill (if any) completed — no rows still carry the
+		//      `_pgroll_needs_backfill` marker.
+		//
+		// Both are needed because Start projects the version schema *before*
+		// running the backfill, so a Start killed mid-backfill leaves the
+		// schema in place with data half-filled. Treating that as "done"
+		// would let a deploy proceed on incomplete data and seal it at
+		// Complete. Only when both hold is the migration the normal "left
+		// active awaiting `pgroll complete`" state rather than a genuinely
+		// interrupted run. On any error we leave expandComplete false and
+		// fall back to the INTERRUPTED classification — never weaker than the
+		// status quo.
+		if activeMig, err := m.State().GetActiveMigration(ctx, m.Schema()); err == nil {
+			want := roll.VersionedSchemaName(m.Schema(), activeMig.VersionSchemaName())
+			schemaProjected := false
+			for _, s := range liveSchemas {
+				if s == want {
+					schemaProjected = true
+					break
+				}
+			}
+			if schemaProjected {
+				pending, err := m.HasPendingBackfill(ctx, activeMig.Name)
+				if err == nil && !pending {
+					expandComplete = true
+				}
+			}
 		}
 
 		// Probe pg_stat_activity for other live pgroll backends so we can
@@ -349,7 +410,7 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 	}
 
-	state := classifyCycle(activePeriod, otherBackends, remainingCount, appliedCount, stateInSync)
+	state := classifyCycle(activePeriod, otherBackends, remainingCount, appliedCount, stateInSync, expandComplete)
 
 	stateColor := pterm.FgGreen
 	switch state {
@@ -357,7 +418,7 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		stateColor = pterm.FgRed
 	case cycleInProgress, cycleRecovery:
 		stateColor = pterm.FgYellow
-	case cycleNoOp:
+	case cycleAwaitingComplete, cycleNoOp:
 		stateColor = pterm.FgGray
 	}
 
@@ -420,6 +481,25 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		} else {
 			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Run `pgroll rollback` to clean up before retrying."))
 		}
+	case cycleAwaitingComplete:
+		// Expand applied, awaiting contraction: benign. Show the migration
+		// left active and the live schemas, and make clear a re-run is a
+		// no-op — this is what an operator sees when they retry a deploy that
+		// failed after `pgroll migrate` but before `pgroll complete`.
+		if inProgressName != "" {
+			field("Applied", inProgressName)
+		}
+		liveLabel := "Live schema"
+		if len(liveSchemas) != 1 {
+			liveLabel = "Live schemas"
+		}
+		liveValue := "—"
+		if len(liveSchemas) > 0 {
+			liveValue = strings.Join(liveSchemas, ", ")
+		}
+		field(liveLabel, liveValue)
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, pterm.FgGray.Sprint("    Expand phase already applied — awaiting `pgroll complete`. Re-running migrate is a no-op."))
 	case cycleNoOp:
 		current := "—"
 		if len(liveSchemas) > 0 {
@@ -484,11 +564,20 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 // summary. otherBackends is the count of *other* pgroll processes connected
 // to the same database; when an activePeriod row exists but a live pgroll
 // backend is also present, the migration is genuinely in progress (a
-// concurrent run) rather than abandoned.
-func classifyCycle(activePeriod bool, otherBackends int, remaining, applied int, stateInSync bool) cycleState {
+// concurrent run) rather than abandoned. expandComplete reports whether the
+// active migration's Start fully materialized (its version schema is live and
+// no backfill is still pending); an active period with a completed expand and
+// nothing left to apply is the benign "awaiting `pgroll complete`" state
+// (EXPANDED), not an interruption.
+func classifyCycle(activePeriod bool, otherBackends int, remaining, applied int, stateInSync, expandComplete bool) cycleState {
 	switch {
 	case activePeriod && otherBackends > 0:
 		return cycleInProgress
+	case activePeriod && expandComplete && remaining == 0:
+		// Expand applied and its version schema projected, with nothing left
+		// to apply: the deployment is in the normal window between `pgroll
+		// migrate` (expand) and `pgroll complete` (contract), not broken.
+		return cycleAwaitingComplete
 	case activePeriod:
 		return cycleInterrupted
 	case remaining == 0:

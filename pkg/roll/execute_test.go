@@ -1656,6 +1656,73 @@ func TestExistingVersionSchemas(t *testing.T) {
 	})
 }
 
+// TestHasPendingBackfill covers the signal `pgroll migrate` uses to tell a
+// fully-materialized expand phase (safe to treat as awaiting-complete) from a
+// Start interrupted mid-backfill (must stay INTERRUPTED). A projected version
+// schema alone is not enough — Start projects it BEFORE running the backfill —
+// so the migrate guard also consults HasPendingBackfill.
+func TestHasPendingBackfill(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// A migration that needs no backfill never gets a marker column, so
+		// there is nothing pending.
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name:       "01_create_users",
+			Operations: migrations.Operations{createTableOp("users")},
+		}, backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		pending, err := mig.HasPendingBackfill(ctx, "01_create_users")
+		require.NoError(t, err)
+		assert.False(t, pending, "a create-table migration needs no backfill")
+
+		// Seed rows, then run a backfilling migration (type change with Up)
+		// and leave it active — the expand-phase state a re-run of migrate
+		// re-enters.
+		_, err = db.ExecContext(ctx, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+		require.NoError(t, err)
+
+		const backfillMig = "02_change_type"
+		require.NoError(t, mig.Start(ctx, &migrations.Migration{
+			Name: backfillMig,
+			Operations: migrations.Operations{
+				&migrations.OpAlterColumn{
+					Table:  "users",
+					Column: "name",
+					Type:   ptr("varchar(255)"),
+					Up:     "name",
+					Down:   "name",
+				},
+			},
+		}, backfill.NewConfig()))
+
+		// Start ran the backfill to completion, so nothing is pending even
+		// though the migration is still active (awaiting complete).
+		pending, err = mig.HasPendingBackfill(ctx, backfillMig)
+		require.NoError(t, err)
+		assert.False(t, pending, "a completed Start leaves no pending backfill")
+
+		// Simulate a Start interrupted mid-backfill: a row still carrying the
+		// DEFAULT-true marker the batcher never reached. The backfill trigger
+		// flips the marker to false on any write, so disable it while planting
+		// the un-backfilled row (the physical state a killed Start leaves).
+		marker := backfill.NeedsBackfillColumnName(migrations.MigrationScopeFor(backfillMig))
+		_, err = db.ExecContext(ctx, `ALTER TABLE users DISABLE TRIGGER USER`)
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, fmt.Sprintf(`UPDATE users SET "%s" = true WHERE id = 1`, marker))
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, `ALTER TABLE users ENABLE TRIGGER USER`)
+		require.NoError(t, err)
+
+		pending, err = mig.HasPendingBackfill(ctx, backfillMig)
+		require.NoError(t, err)
+		assert.True(t, pending, "a row still flagged means the backfill did not finish")
+	})
+}
+
 // TestDeferCompleteAllowsMidBatchDestructiveOp is the load-bearing scenario
 // for WithDeferComplete: a weekly batched release where a destructive
 // migration sits between additive ones. With WithDeferComplete on every
