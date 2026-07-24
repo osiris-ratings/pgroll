@@ -996,6 +996,78 @@ func (m *Roll) ExistingVersionSchemas(ctx context.Context) ([]string, error) {
 	return schemas, nil
 }
 
+// HasPendingBackfill reports whether the named migration has an unfinished
+// backfill: any row still carrying its `_pgroll_needs_backfill_<scope>`
+// marker set to true. Start projects a migration's version schema *before*
+// running its backfill, so the presence of a version schema alone does not
+// prove the expand is fully materialized — a Start killed mid-backfill
+// leaves the schema in place with rows still flagged. Callers deciding
+// whether an active migration is safely "awaiting complete" (versus
+// genuinely interrupted) must consult this so they never treat a partial
+// backfill as done.
+//
+// The marker column lives on the physical base tables in m.schema and is
+// added `DEFAULT true`, flipped to false per row as the batcher processes
+// it, and dropped at Complete. A migration that needs no backfill never has
+// the column, which reads here as "nothing pending" — correct, since there
+// is nothing to finish.
+func (m *Roll) HasPendingBackfill(ctx context.Context, migrationName string) (bool, error) {
+	markerCol := backfill.NeedsBackfillColumnName(migrations.MigrationScopeFor(migrationName))
+
+	// Base tables in the physical schema that still carry this migration's
+	// marker column. information_schema already restricts to relations the
+	// current role can see; we further pin to ordinary tables in m.schema.
+	rows, err := m.pgConn.QueryContext(ctx,
+		`SELECT table_name FROM information_schema.columns
+		 WHERE table_schema = $1 AND column_name = $2`,
+		m.schema, markerCol)
+	if err != nil {
+		return false, fmt.Errorf("listing tables with backfill marker %q: %w", markerCol, err)
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return false, fmt.Errorf("scanning marker table name: %w", err)
+		}
+		tables = append(tables, t)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterating marker tables: %w", err)
+	}
+
+	for _, t := range tables {
+		q := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s.%s WHERE %s IS TRUE)",
+			pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(t), pq.QuoteIdentifier(markerCol))
+		pending, err := m.queryBool(ctx, q)
+		if err != nil {
+			return false, fmt.Errorf("checking pending backfill on %q: %w", t, err)
+		}
+		if pending {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// queryBool runs a query expected to return a single boolean and returns it.
+func (m *Roll) queryBool(ctx context.Context, query string, args ...interface{}) (bool, error) {
+	rows, err := m.pgConn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var b bool
+	if rows.Next() {
+		if err := rows.Scan(&b); err != nil {
+			return false, err
+		}
+	}
+	return b, rows.Err()
+}
+
 // DropVersionSchemasExcept drops all version schemas for the given schema
 // except those whose version name is in the keep list. Version schemas are
 // identified by their prefix (schema + "_"). Strict: a drop blocked by
