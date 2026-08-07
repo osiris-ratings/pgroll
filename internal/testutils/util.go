@@ -276,6 +276,63 @@ func WithMigratorAndConnectionToContainer(t *testing.T, fn func(mig *roll.Roll, 
 	WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public", []roll.Option{roll.WithLockTimeoutMs(500)}, fn)
 }
 
+// WithMigratorAndConnStrToContainer is WithMigratorAndConnectionToContainer
+// plus the connection string, so a test can open a *second* Roll against the
+// same database with different options. Needed to exercise a database whose
+// history was written by one configuration and is later read by another — the
+// shape of an ETL host cloned from an application database and thereafter
+// migrated with a --target.
+func WithMigratorAndConnStrToContainer(t *testing.T, opts []roll.Option, fn func(mig *roll.Roll, connStr string, db *sql.DB)) {
+	t.Helper()
+	ctx := context.Background()
+
+	db, connStr, _ := setupTestDatabase(t)
+
+	st, err := state.New(ctx, connStr, "pgroll")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	mig, err := roll.New(ctx, connStr, "public", st, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := mig.Close(); err != nil {
+			t.Fatalf("Failed to close migrator connection: %v", err)
+		}
+	})
+
+	fn(mig, connStr, db)
+}
+
+// NewMigratorForConnStr opens an additional Roll against an already-initialized
+// database. Pair it with WithMigratorAndConnStrToContainer.
+func NewMigratorForConnStr(t *testing.T, connStr string, opts ...roll.Option) *roll.Roll {
+	t.Helper()
+	ctx := context.Background()
+
+	st, err := state.New(ctx, connStr, "pgroll")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mig, err := roll.New(ctx, connStr, "public", st, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := mig.Close(); err != nil {
+			t.Fatalf("Failed to close migrator connection: %v", err)
+		}
+	})
+
+	return mig
+}
+
 // setupTestDatabase creates a new database in the test container and returns:
 // - a connection to the new database
 // - the connection string to the new database

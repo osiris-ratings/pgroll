@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/xataio/pgroll/cmd/flags"
 	"github.com/xataio/pgroll/pkg/roll"
 )
 
@@ -61,7 +63,7 @@ func latestMigrationNameLocal(ctx context.Context, migrationsDir string) (string
 	}
 
 	// Get the latest migration name from the migrations in the local directory
-	latestName, err := roll.LatestMigrationNameLocal(ctx, os.DirFS(migrationsDir))
+	latestName, err := roll.LatestMigrationNameLocal(ctx, os.DirFS(migrationsDir), flags.Target())
 	if err != nil {
 		return "", err
 	}

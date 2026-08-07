@@ -495,6 +495,11 @@
       "default": "public"
     },
     {
+      "name": "target",
+      "description": "Only apply migrations whose `targets` include this name; unset applies every migration",
+      "default": ""
+    },
+    {
       "name": "use-version-schema",
       "description": "Create version schemas for each migration",
       "default": "true"

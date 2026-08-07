@@ -60,17 +60,23 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
-			rawMigs, err := m.UnappliedMigrations(ctx, os.DirFS(migrationsDir))
+			resolution, err := m.ResolveMigrations(ctx, os.DirFS(migrationsDir))
 			if err != nil {
 				return fmt.Errorf("failed to get migrations to apply: %w", err)
 			}
+			rawMigs := resolution.Apply
 
 			// Bound the train: apply only up to (and including) the target.
-			// An already-applied target is a successful no-op so callers can
-			// use --to for idempotent converging.
+			//
+			// The target is located in the full local sequence, not in the
+			// list this run would apply. Those are different sets — the target
+			// may already be applied, or be routed to another --target — and
+			// searching only the apply list means an already-applied target
+			// reads as "nothing to do" even when migrations *before* it are
+			// still pending, silently no-opping the whole run.
 			if toMigration != "" {
 				idx := -1
-				for i, rm := range rawMigs {
+				for i, rm := range resolution.All {
 					if rm.Name == toMigration {
 						idx = i
 						break
@@ -85,9 +91,25 @@ func migrateCmd() *cobra.Command {
 						fmt.Printf("Database is already at %q; nothing to apply.\n", toMigration)
 						return nil
 					}
-					return fmt.Errorf("migration %q not found among unapplied migrations", toMigration)
+					return fmt.Errorf("migration %q not found in %s", toMigration, migrationsDir)
 				}
-				rawMigs = rawMigs[:idx+1]
+
+				if _, excluded := resolution.Excluded[toMigration]; excluded {
+					fmt.Printf("Note: %q is not routed to target %q; bounding this run at its position.\n",
+						toMigration, m.Target())
+				}
+
+				bound := make(map[string]struct{}, idx+1)
+				for _, rm := range resolution.All[:idx+1] {
+					bound[rm.Name] = struct{}{}
+				}
+				bounded := make([]*migrations.RawMigration, 0, len(rawMigs))
+				for _, rm := range rawMigs {
+					if _, ok := bound[rm.Name]; ok {
+						bounded = append(bounded, rm)
+					}
+				}
+				rawMigs = bounded
 			}
 
 			// Pre-flight summary: print the deployment state and the plan for
@@ -223,6 +245,13 @@ func migrateCmd() *cobra.Command {
 			//     internal state (e.g. the per-table _pgroll_needs_backfill
 			//     marker column or temp column names colliding with the
 			//     next migration's Start).
+			// Dependencies on migrations the active --target does not select
+			// are satisfied by construction: they will never be applied to
+			// this database. Start cannot work that out for itself — it never
+			// sees the migrations directory — so the set resolved above is
+			// handed to every Start in the batch.
+			satisfiedDeps := AsStartOption(roll.WithSatisfiedDependencies(resolution.Excluded))
+
 			for _, mig := range migs[:len(migs)-1] {
 				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
 				if mig.CompleteMustBeDeferred() {
@@ -231,6 +260,7 @@ func migrateCmd() *cobra.Command {
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
 					AsStartOption(roll.WithoutVersionSchema()),
+					satisfiedDeps,
 					completeOpt,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
@@ -248,7 +278,7 @@ func migrateCmd() *cobra.Command {
 			// schema and a later `pgroll complete` contracts the deployment.
 			// Until that contraction, the whole batch is losslessly
 			// revertible via `pgroll revert`.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
+			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, satisfiedDeps); err != nil {
 				return err
 			}
 
@@ -355,13 +385,25 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		// interrupted run. On any error we leave expandComplete false and
 		// fall back to the INTERRUPTED classification — never weaker than the
 		// status quo.
+		//
+		// With --use-version-schema=false there is no version schema to look
+		// for: Start never calls ensureViews, so condition 1 can never hold
+		// and the backfill check below would be unreachable. Requiring it
+		// anyway would classify every expand-only run on such a database as
+		// INTERRUPTED on the *next* invocation, which makes expand-only
+		// unusable there — and, because the idempotent-complete path sits
+		// behind the awaiting-complete classification, disables it too. Fall
+		// back to the backfill marker as the sole discriminator, which is the
+		// half of the test that does not depend on the view layer.
 		if activeMig, err := m.State().GetActiveMigration(ctx, m.Schema()); err == nil {
-			want := roll.VersionedSchemaName(m.Schema(), activeMig.VersionSchemaName())
-			schemaProjected := false
-			for _, s := range liveSchemas {
-				if s == want {
-					schemaProjected = true
-					break
+			schemaProjected := !m.UseVersionSchema()
+			if !schemaProjected {
+				want := roll.VersionedSchemaName(m.Schema(), activeMig.VersionSchemaName())
+				for _, s := range liveSchemas {
+					if s == want {
+						schemaProjected = true
+						break
+					}
 				}
 			}
 			if schemaProjected {

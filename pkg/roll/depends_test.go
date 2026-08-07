@@ -21,7 +21,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMig("03_third"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 3)
 		assert.Equal(t, "01_first", sorted[0].Name)
@@ -37,7 +37,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMig("03_C"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 3)
 		// B must come before A; C has no constraints
@@ -54,7 +54,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMig("01_A"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 3)
 		assert.Equal(t, "01_A", sorted[0].Name)
@@ -72,7 +72,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMig("03_C"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, applied)
+		sorted, err := TopoSortMigrations(migs, applied, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 2)
 		assert.Equal(t, "02_B", sorted[0].Name)
@@ -84,7 +84,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMigWithDeps("01_A", "nonexistent"),
 		}
 
-		_, err := TopoSortMigrations(migs, nil)
+		_, err := TopoSortMigrations(migs, nil, nil)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrMismatchedMigration)
 		assert.Contains(t, err.Error(), "nonexistent")
@@ -96,7 +96,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMigWithDeps("02_B", "01_A"),
 		}
 
-		_, err := TopoSortMigrations(migs, nil)
+		_, err := TopoSortMigrations(migs, nil, nil)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrDependencyCycle)
 	})
@@ -108,7 +108,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMigWithDeps("03_C", "02_B"),
 		}
 
-		_, err := TopoSortMigrations(migs, nil)
+		_, err := TopoSortMigrations(migs, nil, nil)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrDependencyCycle)
 	})
@@ -122,7 +122,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMigWithDeps("03_E", "01_A"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 3)
 		assert.Equal(t, "01_A", sorted[0].Name)
@@ -135,14 +135,14 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMig("01_only"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 1)
 		assert.Equal(t, "01_only", sorted[0].Name)
 	})
 
 	t.Run("empty list returns empty", func(t *testing.T) {
-		sorted, err := TopoSortMigrations(nil, nil)
+		sorted, err := TopoSortMigrations(nil, nil, nil)
 		require.NoError(t, err)
 		assert.Empty(t, sorted)
 	})
@@ -156,7 +156,7 @@ func TestTopoSortMigrations(t *testing.T) {
 			rawMigWithDeps("04_D", "02_B", "03_C"),
 		}
 
-		sorted, err := TopoSortMigrations(migs, nil)
+		sorted, err := TopoSortMigrations(migs, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, sorted, 4)
 		assert.Equal(t, "01_A", sorted[0].Name)

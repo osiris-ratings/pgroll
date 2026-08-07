@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Migration targets.** A migration may declare `targets: [name, ...]`, and
+  `pgroll` accepts a persistent `--target <name>` (`PGROLL_TARGET`) that
+  restricts which migrations are applied. Target names are free-form strings
+  compared verbatim; pgroll assigns them no meaning, so adding a new target
+  costs no pgroll change and the vocabulary stays with the caller's linter.
+
+  Without `--target` nothing is filtered — every migration applies. That is
+  single-database mode, so dev, CI and per-developer instances need no change:
+  the number of `--target` flags in play equals the number of databases you
+  have.
+
+  **Filtering applies to selection only; history validation always reads the
+  unfiltered directory.** This is the load-bearing part. A database may hold
+  history for migrations the active target does not select — an ETL host
+  provisioned as a volume clone of the application database inherits the
+  application's entire chain — and it keeps that history, validates cleanly,
+  and simply stops receiving migrations it is not a target of. No re-baseline,
+  no staggered cutover. See `docs/guides/migration-targets.md`.
+
+  With `--target` in effect every *selection candidate* (post-baseline and not
+  yet applied) must declare `targets`; an untagged candidate is a hard error
+  naming the file. There is no default target and no fail-open, because a
+  migration silently withheld from a database it should have reached surfaces
+  later as replication quietly dropping rows. Already-applied migrations are
+  never inspected, so adopting targets requires no back-stamping of history.
+
+  `targets` is excluded from `Migration.ContentHash`: routing records which
+  databases a migration reaches, not what it does, so re-routing must not clear
+  a re-application tombstone.
+
+  `pgroll check` gains two advisories — a dependency whose targets do not cover
+  the dependent's, and target names that differ only by case — plus hard errors
+  for a malformed `targets` list.
+
+  **This is a one-way binary lockstep.** Migration files are decoded strictly,
+  so any pgroll older than this release hard-rejects a file carrying `targets`,
+  and the rejection takes out the whole directory for every command. Upgrade
+  every consumer before committing the first tagged migration. Parse errors for
+  unknown fields now say so explicitly rather than naming a Go type.
+
+### Fixed
+
+- `pgroll migrate --to` no longer silently no-ops an entire run. The target was
+  located in the list the run would apply, while `MigrationExists` consults the
+  whole history table, so an already-applied target read as "nothing to do"
+  even when migrations before it were still pending. The target is now located
+  in the full local sequence and bounds the run positionally.
+- `pgroll migrate` with `--use-version-schema=false` no longer misclassifies an
+  expand-only run as `INTERRUPTED` on the next invocation. `expandComplete`
+  required the active migration's version schema to exist, which that flag
+  guarantees never happens, so every re-run demanded `pgroll rollback` and the
+  idempotent-complete path was unreachable. The backfill marker is now the sole
+  discriminator when version schemas are disabled.
+- `pgroll complete` no longer drains a deferred queue it cannot prove belongs to
+  a finished batch. With `--use-version-schema=false` the "unfinished batch"
+  guard was skipped wholesale, so a `migrate` that died mid-train left queued
+  destructive completions that the next `complete` stamped sealed and executed —
+  firing the destructive half of a batch whose forward half never ran. It now
+  refuses and points at `pgroll migrate` or `pgroll revert`.
+- `pgroll latest schema --local` and `latest migration --local` honour
+  `--target`. Unfiltered, a directory whose newest file belongs to another
+  target would have an application fleet repinned to a version schema the
+  database never created.
+
 ## [0.16.2-baselayer.19] - 2026-07-24
 
 ### Fixed

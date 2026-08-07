@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -56,6 +58,32 @@ func (r *CheckResult) addWarning(file, msg string) {
 //   - Advisory: raw SQL operations without preconditions
 //   - Reversibility: ops that need a 'down' expression have one, unless the
 //     migration is marked 'irreversible: true'
+//
+// checkTargets validates the shape of a migration's `targets` field. The
+// values themselves are never validated — pgroll has no vocabulary of its own
+// for target names — but a malformed field is always an authoring error.
+func checkTargets(result *CheckResult, file string, raw *migrations.RawMigration) {
+	if raw.Targets == nil {
+		return
+	}
+	if len(raw.Targets) == 0 {
+		result.addError(file, "declares an empty 'targets' list; omit the field or name at least one target")
+		return
+	}
+
+	seen := make(map[string]struct{}, len(raw.Targets))
+	for _, t := range raw.Targets {
+		if strings.TrimSpace(t) == "" {
+			result.addError(file, "'targets' contains an empty entry")
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			result.addError(file, fmt.Sprintf("'targets' lists %q more than once", t))
+		}
+		seen[t] = struct{}{}
+	}
+}
+
 func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 	result := &CheckResult{}
 
@@ -98,6 +126,8 @@ func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 			))
 		}
 
+		checkTargets(result, file, raw)
+
 		allNames[raw.Name] = struct{}{}
 		parsed = append(parsed, parsedMig{file: file, raw: raw})
 	}
@@ -119,12 +149,78 @@ func CheckMigrationsDir(dir fs.FS) (*CheckResult, error) {
 		}
 	}
 
+	rawByName := make(map[string]*migrations.RawMigration, len(parsed))
+	for _, p := range parsed {
+		rawByName[p.raw.Name] = p.raw
+	}
+
+	// Advisory: a dependency that does not cover every target of the migration
+	// depending on it will be skipped on at least one database, where pgroll
+	// treats it as satisfied by construction. That is correct when depends_on
+	// expresses ordering — its documented purpose — and a latent runtime
+	// failure when it was meant as a semantic prerequisite. pgroll cannot tell
+	// the two apart, so warn and let the author confirm.
+	for _, p := range parsed {
+		if len(p.raw.Targets) == 0 {
+			continue
+		}
+		for _, dep := range p.raw.DependsOn {
+			depRaw, ok := rawByName[dep]
+			if !ok || len(depRaw.Targets) == 0 {
+				// Missing deps already errored above; an untagged dependency
+				// applies everywhere and so covers any target.
+				continue
+			}
+			uncovered := make([]string, 0, len(p.raw.Targets))
+			for _, t := range p.raw.Targets {
+				if !slices.Contains(depRaw.Targets, t) {
+					uncovered = append(uncovered, t)
+				}
+			}
+			if len(uncovered) > 0 {
+				result.addWarning(p.file, fmt.Sprintf(
+					"depends_on %q does not declare target(s) %v, so the dependency is skipped there; "+
+						"fine if it only expresses ordering, a latent failure if it is a prerequisite",
+					dep, uncovered,
+				))
+			}
+		}
+	}
+
+	// Advisory: target names that differ only by case or surrounding
+	// whitespace. pgroll compares them verbatim and has no vocabulary of its
+	// own, so "ETL" and "etl" are two different targets and one of them
+	// selects nothing. Which names are legal stays with the caller's linter;
+	// this only flags the directory being inconsistent with itself.
+	variants := make(map[string]map[string]struct{})
+	for _, p := range parsed {
+		for _, t := range p.raw.Targets {
+			key := strings.ToLower(strings.TrimSpace(t))
+			if variants[key] == nil {
+				variants[key] = map[string]struct{}{}
+			}
+			variants[key][t] = struct{}{}
+		}
+	}
+	for key, spellings := range variants {
+		if len(spellings) < 2 {
+			continue
+		}
+		result.addWarning("", fmt.Sprintf(
+			"target %q is spelled %d different ways across the directory (%v); "+
+				"pgroll matches target names verbatim, so these are distinct targets",
+			key, len(spellings), slices.Sorted(maps.Keys(spellings)),
+		))
+	}
+
 	// Check for dependency cycles using topological sort
 	rawMigs := make([]*migrations.RawMigration, len(parsed))
 	for i, p := range parsed {
 		rawMigs[i] = p.raw
 	}
-	_, err = TopoSortMigrations(rawMigs, map[string]struct{}{})
+	// nil excluded set: check validates the directory as a whole corpus and
+	// never filters by target, so no migration is excluded here.
+	_, err = TopoSortMigrations(rawMigs, map[string]struct{}{}, nil)
 	if err != nil {
 		result.addError("", fmt.Sprintf("dependency graph: %v", err))
 	}

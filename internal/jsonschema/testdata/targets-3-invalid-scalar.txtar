@@ -1,0 +1,17 @@
+'targets' is a list, not a scalar, so a migration can belong to more than
+one target without a special "both" value.
+
+-- targets.json --
+{
+  "targets": "app",
+  "operations": [
+    {
+      "sql": {
+        "up": "SELECT 1"
+      }
+    }
+  ]
+}
+
+-- valid --
+false

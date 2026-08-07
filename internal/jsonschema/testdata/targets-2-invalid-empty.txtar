@@ -1,0 +1,17 @@
+An explicitly empty 'targets' list is not a way to declare routing.
+Omit the field instead — absent means "untargeted".
+
+-- targets.json --
+{
+  "targets": [],
+  "operations": [
+    {
+      "sql": {
+        "up": "SELECT 1"
+      }
+    }
+  ]
+}
+
+-- valid --
+false

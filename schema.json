@@ -1355,6 +1355,16 @@
           "description": "Explicitly marks this migration as not revertible by pgroll revert. Without this marker, operations that need a 'down' expression are required to declare one.",
           "type": "boolean",
           "default": false
+        },
+        "targets": {
+          "description": "Deployment targets this migration belongs to. Free-form names, compared verbatim against pgroll's --target flag; pgroll assigns them no meaning of its own. When --target is not given the field is ignored and every migration applies, which is single-database mode. When --target is given, a migration that is still unapplied must declare this field.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
         }
       },
       "required": ["operations"],

@@ -119,7 +119,23 @@ func (m *Roll) FinishContraction(ctx context.Context) (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	if !resuming && !m.disableVersionSchemas {
+	if !resuming {
+		if m.disableVersionSchemas {
+			// No version schemas exist to probe, so the physical test above is
+			// unavailable and the queue cannot be told apart from a crashed
+			// batch's leftovers. Refuse rather than guess: a finished batch
+			// awaiting contraction always leaves its final migration active,
+			// which `Complete` handles and this function never sees, and a
+			// genuine resume is sealed and took the branch above. Draining on
+			// a guess would fire the destructive half of a batch whose forward
+			// half never ran.
+			return 0, 0, fmt.Errorf(
+				"cannot contract: %d deferred completion(s) are queued with no active migration and "+
+					"version schemas disabled, so pgroll cannot confirm the batch finished; resume it by "+
+					"re-running `pgroll migrate`, or abort it with `pgroll revert`", len(queued),
+			)
+		}
+
 		existing, err := m.ExistingVersionSchemas(ctx)
 		if err != nil {
 			return 0, 0, err

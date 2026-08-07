@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/xataio/pgroll/cmd/flags"
+	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
 	"github.com/xataio/pgroll/pkg/state"
 )
@@ -30,6 +31,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 	skipValidation := flags.SkipValidation()
 	verbose := flags.Verbose()
 	useVersionSchema := flags.UseVersionSchema()
+	target := flags.Target()
 
 	state, err := state.New(ctx, pgURL, stateSchema, state.WithPgrollVersion(Version))
 	if err != nil {
@@ -44,6 +46,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 		roll.WithSkipValidation(skipValidation),
 		roll.WithLogging(verbose),
 		roll.WithVersionSchema(useVersionSchema),
+		roll.WithTarget(target),
 		// Reversibility by construction: the CLI always requires migrations
 		// to be revertible (or explicitly marked `irreversible: true`) so
 		// `pgroll revert` can walk back out of any applied migration.
@@ -100,6 +103,7 @@ func Prepare() *cobra.Command {
 	rootCmd.PersistentFlags().Duration("lock-retry-timeout", 5*time.Minute, "Total wall-clock budget for retrying lock_timeout errors before giving up (e.g. 5m, 30s); negative disables retries")
 	rootCmd.PersistentFlags().String("role", "", "Optional postgres role to set when executing migrations")
 	rootCmd.PersistentFlags().Bool("use-version-schema", true, "Create version schemas for each migration")
+	rootCmd.PersistentFlags().String("target", "", "Only apply migrations whose `targets` include this name; unset applies every migration")
 	rootCmd.PersistentFlags().Bool("verbose", false, "Enable verbose logging")
 
 	viper.BindPFlag("PG_URL", rootCmd.PersistentFlags().Lookup("postgres-url"))
@@ -109,6 +113,7 @@ func Prepare() *cobra.Command {
 	viper.BindPFlag("LOCK_RETRY_TIMEOUT", rootCmd.PersistentFlags().Lookup("lock-retry-timeout"))
 	viper.BindPFlag("ROLE", rootCmd.PersistentFlags().Lookup("role"))
 	viper.BindPFlag("USE_VERSION_SCHEMA", rootCmd.PersistentFlags().Lookup("use-version-schema"))
+	viper.BindPFlag("TARGET", rootCmd.PersistentFlags().Lookup("target"))
 	viper.BindPFlag("VERBOSE", rootCmd.PersistentFlags().Lookup("verbose"))
 
 	// register subcommands
@@ -143,6 +148,11 @@ func Prepare() *cobra.Command {
 // process exits. A second signal after stop() is invoked restores default
 // behavior, allowing a hard kill.
 func Execute() error {
+	// Let migration-file parse errors name the binary that rejected the file.
+	// Strict decoding makes every new migration-file field a binary lockstep,
+	// and "unknown field" alone does not tell an operator to upgrade.
+	migrations.BinaryVersion = Version
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	cmd := Prepare()

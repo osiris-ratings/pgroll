@@ -17,9 +17,10 @@ var (
 )
 
 // LatestVersionLocal returns the version schema name of the last migration in
-// `dir`, where the migration files are lexicographically ordered by filename.
-func LatestVersionLocal(ctx context.Context, dir fs.FS) (string, error) {
-	migration, err := latestMigrationLocal(dir)
+// `dir` selected by `target`, where the migration files are lexicographically
+// ordered by filename. An empty target selects every migration.
+func LatestVersionLocal(ctx context.Context, dir fs.FS, target string) (string, error) {
+	migration, err := latestMigrationLocal(dir, target)
 	if err != nil {
 		return "", fmt.Errorf("getting latest local migration: %w", err)
 	}
@@ -27,10 +28,11 @@ func LatestVersionLocal(ctx context.Context, dir fs.FS) (string, error) {
 	return migration.VersionSchemaName(), nil
 }
 
-// LatestMigrationNameLocal returns the name of the last migration in `dir`,
-// where the migration files are lexicographically ordered by filename.
-func LatestMigrationNameLocal(ctx context.Context, dir fs.FS) (string, error) {
-	migration, err := latestMigrationLocal(dir)
+// LatestMigrationNameLocal returns the name of the last migration in `dir`
+// selected by `target`, where the migration files are lexicographically
+// ordered by filename. An empty target selects every migration.
+func LatestMigrationNameLocal(ctx context.Context, dir fs.FS, target string) (string, error) {
+	migration, err := latestMigrationLocal(dir, target)
 	if err != nil {
 		return "", fmt.Errorf("getting latest local migration: %w", err)
 	}
@@ -69,24 +71,35 @@ func (m *Roll) LatestMigrationNameRemote(ctx context.Context) (string, error) {
 }
 
 // latestMigrationLocal returns the latest migration from the local migration
-// directory, where the migration files are lexicographically ordered by
-// filename.
-func latestMigrationLocal(dir fs.FS) (*migrations.Migration, error) {
+// directory selected by `target`, where the migration files are
+// lexicographically ordered by filename.
+//
+// The target filter matters more here than it looks: this feeds
+// `pgroll latest schema`, which deploys use to compute the version schema to
+// repin an application fleet to. Unfiltered, a directory whose newest file
+// belongs to another target would have the fleet repinned to a version schema
+// this database never created.
+func latestMigrationLocal(dir fs.FS, target string) (*migrations.Migration, error) {
 	files, err := migrations.CollectFilesFromDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("getting migration files from dir: %w", err)
 	}
 
-	if len(files) == 0 {
-		return nil, ErrNoMigrationFiles
+	for i := len(files) - 1; i >= 0; i-- {
+		raw, err := migrations.ReadRawMigration(dir, files[i])
+		if err != nil {
+			return nil, fmt.Errorf("reading migration file %q: %w", files[i], err)
+		}
+		if !raw.SelectedBy(target) {
+			continue
+		}
+
+		migration, err := migrations.ParseMigration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("reading migration file %q: %w", files[i], err)
+		}
+		return migration, nil
 	}
 
-	latest := files[len(files)-1]
-
-	migration, err := migrations.ReadMigration(dir, latest)
-	if err != nil {
-		return nil, fmt.Errorf("reading migration file %q: %w", latest, err)
-	}
-
-	return migration, nil
+	return nil, ErrNoMigrationFiles
 }

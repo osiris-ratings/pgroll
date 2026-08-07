@@ -225,7 +225,7 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return err
 	}
 
-	if err := m.validateDependencies(ctx, migration); err != nil {
+	if err := m.validateDependencies(ctx, migration, o.satisfiedDependencies); err != nil {
 		return err
 	}
 
