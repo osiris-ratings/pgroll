@@ -154,10 +154,58 @@ CREATE TABLE IF NOT EXISTS placeholder.migrations (
     FOREIGN KEY (schema, parent) REFERENCES placeholder.migrations (schema, name)
 );
 
--- Only one migration can be active at a time
-CREATE UNIQUE INDEX IF NOT EXISTS only_one_active ON placeholder.migrations (schema, name, done)
-WHERE
-    done = FALSE;
+-- Only one migration can be active at a time.
+--
+-- Indexed on (schema) alone, deliberately. The original form indexed
+-- (schema, name, done) WHERE done = FALSE, which enforced nothing: (schema,
+-- name) is already the PRIMARY KEY, so at most one row exists per pair
+-- regardless, the partial index was trivially satisfied, and two *different*
+-- migrations could both sit done = FALSE. Single-active then rested entirely
+-- on the read-then-insert check in Roll.Start -- a TOCTOU that two concurrent
+-- pgroll processes can both pass.
+--
+-- Same shape as only_first_migration_without_parent below, for the same
+-- reason: the constraint is "one row per schema matching this predicate".
+--
+-- Recreated rather than CREATE ... IF NOT EXISTS, because the broken index
+-- carries the same name and would otherwise survive untouched on every
+-- database that already ran an older pgroll. Dropping it loses nothing: it
+-- enforced no constraint the PRIMARY KEY did not already imply.
+--
+-- If a database really does hold two active migrations, this raises instead of
+-- letting a silent unique violation abort init with nothing actionable in it.
+-- That state was always broken -- GetActiveMigration returns whichever row
+-- Postgres yields first -- so surfacing it is the point.
+DO $$
+DECLARE
+    dupe_schema name;
+    dupe_names text;
+BEGIN
+    DROP INDEX IF EXISTS placeholder.only_one_active;
+    SELECT
+        SCHEMA,
+        string_agg(name, ', ' ORDER BY created_at)
+    INTO
+        dupe_schema,
+        dupe_names
+    FROM
+        placeholder.migrations
+    WHERE
+        done = FALSE
+    GROUP BY
+        SCHEMA
+    HAVING
+        count(*) > 1
+    LIMIT 1;
+    IF dupe_schema IS NOT NULL THEN
+        RAISE EXCEPTION 'schema % has more than one active migration (%), which pgroll cannot represent', dupe_schema, dupe_names
+            USING HINT = 'Resolve with `pgroll rollback` (or `pgroll revert`) until one active migration remains, then re-run `pgroll init`.';
+        END IF;
+        CREATE UNIQUE INDEX only_one_active ON placeholder.migrations (schema)
+        WHERE
+            done = FALSE;
+END
+$$;
 
 -- Only first migration can exist without parent
 CREATE UNIQUE INDEX IF NOT EXISTS only_first_migration_without_parent ON placeholder.migrations (schema)

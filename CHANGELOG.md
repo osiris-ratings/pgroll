@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pgroll migrate`'s interrupted-run message named the wrong verb for a
+  batch.** It told the operator to run `pgroll rollback`, which undoes only the
+  *one* active migration — so a run that died partway through a train left the
+  earlier migrations applied, unsealed and carrying queued contraction, with
+  nothing said about them. The message now names both verbs, states what each
+  covers, and counts the already-applied-but-uncontracted migrations so the
+  choice is concrete.
+- **`only_one_active` enforced nothing.** It was a unique index on
+  `(schema, name, done) WHERE done = FALSE`, but `(schema, name)` is already
+  the primary key — at most one row exists per pair regardless, so the partial
+  index was trivially satisfied and two *different* migrations could both sit
+  `done = FALSE`. It is now `UNIQUE (schema) WHERE done = FALSE`, matching the
+  shape `only_first_migration_without_parent` uses. Existing state schemas are
+  upgraded in place; a database that already holds two active migrations gets a
+  clear error naming them rather than an opaque unique violation.
+- **The `RECOVERY` pre-flight state was unreachable.** `stateInSync` compared
+  `state.LatestVersion` against the live schemas, but `LatestVersion` resolves
+  through `find_version_schema`, whose own `WHERE` clause requires the schema
+  to exist — so it was checked against a superset of itself and was always
+  true. `classifyCycle` never reached its default branch, and the unit test
+  passed `stateInSync: false` straight into the pure function, keeping the
+  branch green while it was dead. It now compares the history *leaf's* version
+  schema, which is the condition the warning always described: history has
+  advanced to a migration whose projection is not deployed, repairable with
+  `pgroll materialize`. Trivially in sync when version schemas are disabled.
+
 ## [0.16.2-baselayer.20] - 2026-08-09
 
 ### Added
