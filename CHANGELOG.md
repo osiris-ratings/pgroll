@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2-baselayer.20] - 2026-08-09
+
 ### Added
 
 - **Migration targets.** A migration may declare `targets: [name, ...]`, and
