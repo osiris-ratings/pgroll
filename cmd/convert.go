@@ -23,6 +23,10 @@ func convertCmd() *cobra.Command {
 		Args:      cobra.MaximumNArgs(1),
 		ValidArgs: []string{"migration-file"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseTarget(cmd); err != nil {
+				return err
+			}
+
 			reader, err := openSQLReader(args)
 			if err != nil {
 				return fmt.Errorf("open SQL migration: %w", err)

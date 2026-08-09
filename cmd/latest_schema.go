@@ -63,7 +63,7 @@ func latestVersionLocal(ctx context.Context, migrationsDir string) (string, erro
 
 	// Get the latest version schema name from the migrations in the local
 	// directory
-	latestVersion, err := roll.LatestVersionLocal(ctx, os.DirFS(migrationsDir))
+	latestVersion, err := roll.LatestVersionLocal(ctx, os.DirFS(migrationsDir), flags.Target())
 	if err != nil {
 		return "", err
 	}

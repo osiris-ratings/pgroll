@@ -29,7 +29,7 @@ func TestLatestVersionLocal(t *testing.T) {
 		ctx := context.Background()
 
 		// Get the latest version schema name from the directory
-		latest, err := roll.LatestVersionLocal(ctx, fs)
+		latest, err := roll.LatestVersionLocal(ctx, fs, "")
 		require.NoError(t, err)
 
 		// Assert last version schema name
@@ -42,7 +42,7 @@ func TestLatestVersionLocal(t *testing.T) {
 		ctx := context.Background()
 
 		// Get the latest version schema name in the directory
-		_, err := roll.LatestVersionLocal(ctx, fs)
+		_, err := roll.LatestVersionLocal(ctx, fs, "")
 
 		// Assert expected error
 		assert.ErrorIs(t, err, roll.ErrNoMigrationFiles)
@@ -158,7 +158,7 @@ func TestLatestMigrationNameLocal(t *testing.T) {
 		ctx := context.Background()
 
 		// Get the name of the last migration from the directory
-		latest, err := roll.LatestMigrationNameLocal(ctx, fs)
+		latest, err := roll.LatestMigrationNameLocal(ctx, fs, "")
 		require.NoError(t, err)
 
 		// Assert last migration name
@@ -171,7 +171,7 @@ func TestLatestMigrationNameLocal(t *testing.T) {
 		ctx := context.Background()
 
 		// Get the latest version schema name in the directory
-		_, err := roll.LatestMigrationNameLocal(ctx, fs)
+		_, err := roll.LatestMigrationNameLocal(ctx, fs, "")
 
 		// Assert expected error
 		assert.ErrorIs(t, err, roll.ErrNoMigrationFiles)

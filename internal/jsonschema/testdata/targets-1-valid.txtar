@@ -1,0 +1,17 @@
+A migration may declare the deployment targets it belongs to.
+The names are free-form: pgroll compares them verbatim against --target.
+
+-- targets.json --
+{
+  "targets": ["app", "etl"],
+  "operations": [
+    {
+      "sql": {
+        "up": "SELECT 1"
+      }
+    }
+  ]
+}
+
+-- valid --
+true

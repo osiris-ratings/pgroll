@@ -153,13 +153,56 @@ func ReadRawMigration(dir fs.FS, filename string) (*RawMigration, error) {
 		err = yaml.UnmarshalStrict(byteValue, &mig)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("reading migration file: %w", err)
+		return nil, fmt.Errorf("reading migration file: %w", annotateUnknownField(err))
 	}
 
-	// Extract base filename without extension as the migration name
-	mig.Name = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	mig.Name = MigrationNameFromFile(filename)
 
 	return &mig, nil
+}
+
+// MigrationNameFromFile returns the migration name a file will be read under:
+// its base name with the extension stripped. Migration files carry no `name`
+// key — the filename is the name — so callers that need to order or filter by
+// name can do so without opening the file.
+func MigrationNameFromFile(filename string) string {
+	return strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+}
+
+// BinaryVersion is the pgroll version string, injected by the CLI so that
+// migration-file parse errors can name the binary that rejected the file.
+// Empty when pgroll is used as a library.
+var BinaryVersion string
+
+// annotateUnknownField adds rollout context to the strict-decoding failure
+// produced when a migration file carries a key this binary does not know.
+//
+// Migration files are decoded strictly — json.Decoder.DisallowUnknownFields
+// for .json, yaml.UnmarshalStrict for .yaml/.yml — which makes every new
+// migration-file field a one-way binary lockstep: a file written for a newer
+// pgroll is hard-rejected by an older one with a bare `unknown field "x"`
+// that explains nothing. Worse, the rejection takes out the whole directory,
+// so check, plan, latest and migrate all fail on every database, including
+// ones that have nothing to do with the new field.
+//
+// Note the limit honestly: this only helps for fields added *after* the
+// release that introduces this function. Whoever hits the `targets` form of
+// the error is by construction running a binary that predates the annotation.
+// The real mitigation is a version floor checked at install time, and the pin
+// bump landing everywhere before the first tagged file is committed.
+func annotateUnknownField(err error) error {
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		return err
+	}
+
+	version := BinaryVersion
+	if version == "" {
+		version = "unknown version"
+	}
+
+	return fmt.Errorf("%w — this pgroll (%s) does not recognize that field, so it is "+
+		"probably older than the migration. Upgrade to the pgroll version pinned by the "+
+		"repository that owns this migrations directory", err, version)
 }
 
 // ParseMigration converts a RawMigration to a fully parsed Migration
@@ -176,6 +219,7 @@ func ParseMigration(raw *RawMigration) (*Migration, error) {
 		DependsOn:     raw.DependsOn,
 		Preconditions: raw.Preconditions,
 		Irreversible:  raw.Irreversible,
+		Targets:       raw.Targets,
 		RevertOf:      raw.RevertOf,
 	}, nil
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
+	"github.com/xataio/pgroll/cmd/flags"
 	"github.com/xataio/pgroll/pkg/migrations"
 )
 
@@ -58,6 +59,15 @@ func baselineCmd() *cobra.Command {
 			mig := &migrations.RawMigration{
 				Name:       version,
 				Operations: opsJSON,
+			}
+			// Carry the target through, so a baseline taken on a routed
+			// database does not write an untagged file into the shared
+			// directory. Left untagged it would break the *other* target's
+			// leg — which matters because baselining is exactly what the guide
+			// suggests for bootstrapping a routed database, so the escape
+			// hatch would arm the trap it is meant to avoid.
+			if target := flags.Target(); target != "" {
+				mig.Targets = []string{target}
 			}
 
 			// Write the placeholder migration to disk

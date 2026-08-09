@@ -32,9 +32,14 @@ type PlanResult struct {
 	// DBLatest is the newest migration in the database, including an active
 	// (done=false) leaf; nil when history is empty.
 	DBLatest *string `json:"db_latest"`
-	// LocalLatest is the newest migration file on disk; nil when the directory
+	// LocalLatest is the newest migration file on disk that the active target
+	// selects; with no target, simply the newest file. Nil when the directory
 	// holds no migrations.
 	LocalLatest *string `json:"local_latest"`
+	// Target is the deployment target this plan was computed for; empty when
+	// no filtering was in effect. Reported so a plan produced with the wrong
+	// --target is self-evidently so.
+	Target string `json:"target,omitempty"`
 	// InSync is true when the database leaf equals the local leaf and the
 	// deployment is Complete (nothing to apply, revert, or contract).
 	InSync bool `json:"in_sync"`
@@ -184,20 +189,30 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	}
 
 	// Local migrations (ascending file order, post-baseline).
-	localRaws, err := localMigrations(dir, baselineName)
+	//
+	// Note carefully which of the two sets each consumer below takes. localSet
+	// answers "does this database migration still exist on disk?" and MUST be
+	// the unfiltered set: under a --target, a database legitimately holds
+	// history for migrations this target does not select, and treating those
+	// as absent makes the convergence search below walk past them and emit a
+	// revert leg covering the whole inherited history. Only the forward leg is
+	// filtered, because only it describes what `migrate` would apply.
+	local, err := resolveLocalSet(dir, baselineName, dbSet, m.target)
 	if err != nil {
 		return nil, fmt.Errorf("reading local migrations: %w", err)
 	}
+	localRaws := local.All
 	localNames := make([]string, len(localRaws))
 	localSet := make(map[string]struct{}, len(localRaws))
 	for i, raw := range localRaws {
 		localNames[i] = raw.Name
 		localSet[raw.Name] = struct{}{}
 	}
-	if len(localNames) > 0 {
-		leaf := localNames[len(localNames)-1]
+	if len(local.Selected) > 0 {
+		leaf := local.Selected[len(local.Selected)-1].Name
 		res.LocalLatest = &leaf
 	}
+	res.Target = m.target
 
 	// Divergence is a pure function of the two leaves (in_sync is resolved at
 	// the end, once the apply/revert/blocked legs are known — leaf equality
@@ -225,20 +240,22 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 			}
 		}
 		m.fillRevertLeg(ctx, res, o.to, suffix, versionSchemaByName)
-		res.InSync = inSync(res, status.Status)
+		res.InSync = inSync(res, status.Status, m.target != "")
 		return res, nil
 	}
 
 	// Forward leg: local migrations not yet in the database, in the order
 	// `migrate` would apply them (depends_on topological order, filename order
 	// as the tiebreaker) so the plan matches what migrate actually runs.
-	unapplied := make([]*migrations.RawMigration, 0, len(localRaws))
-	for _, raw := range localRaws {
+	// This is the one leg that filters: it must match what `migrate` would do,
+	// or the plan stops being a truthful preview of it.
+	unapplied := make([]*migrations.RawMigration, 0, len(local.Selected))
+	for _, raw := range local.Selected {
 		if _, ok := dbSet[raw.Name]; !ok {
 			unapplied = append(unapplied, raw)
 		}
 	}
-	sorted, err := TopoSortMigrations(unapplied, dbSet)
+	sorted, err := TopoSortMigrations(unapplied, dbSet, local.Excluded)
 	if err != nil {
 		return nil, fmt.Errorf("ordering unapplied migrations: %w", err)
 	}
@@ -313,7 +330,7 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 		res.Blocked = BlockedView{Count: len(interleaved), Reason: &reason, Migrations: interleaved}
 	}
 
-	res.InSync = inSync(res, status.Status)
+	res.InSync = inSync(res, status.Status, m.target != "")
 	return res, nil
 }
 
@@ -321,10 +338,21 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 // deployment is contracted (Complete) and there is nothing to apply, revert,
 // or unblock. Leaf equality alone is insufficient — a checkout migration
 // older than the shared leaf can still be unapplied.
-func inSync(res *PlanResult, status MigrationStatus) bool {
-	return status == CompleteMigrationStatus &&
-		res.Apply.Count == 0 && res.Revert.Count == 0 && res.Blocked.Count == 0 &&
-		res.DBLatest != nil && res.LocalLatest != nil && *res.DBLatest == *res.LocalLatest
+func inSync(res *PlanResult, status MigrationStatus, targeted bool) bool {
+	if status != CompleteMigrationStatus ||
+		res.Apply.Count != 0 || res.Revert.Count != 0 || res.Blocked.Count != 0 {
+		return false
+	}
+	if targeted {
+		// Under a --target the database leaf may be a migration this target
+		// does not select — on a host that inherited another target's history
+		// it usually is — so leaf equality is not a convergence signal and
+		// would report a fully converged database as permanently out of sync.
+		// The three empty legs already establish that this target's slice of
+		// the directory is fully applied and nothing extraneous is present.
+		return true
+	}
+	return res.DBLatest != nil && res.LocalLatest != nil && *res.DBLatest == *res.LocalLatest
 }
 
 // fillRevertLeg computes the composed (window + sealed) revert down to `to`
@@ -518,27 +546,6 @@ func rawVersionSchemaName(raw migrations.RawMigration) string {
 		return raw.VersionSchema
 	}
 	return raw.Name
-}
-
-// localMigrations returns the migrations in `dir` that come after the
-// baseline, in filename (lexicographic) order. An empty directory yields an
-// empty slice rather than an error.
-func localMigrations(dir fs.FS, baselineName string) ([]*migrations.RawMigration, error) {
-	files, err := migrations.CollectFilesFromDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("reading migration files: %w", err)
-	}
-	raws := make([]*migrations.RawMigration, 0, len(files))
-	for _, f := range files {
-		raw, err := migrations.ReadRawMigration(dir, f)
-		if err != nil {
-			return nil, fmt.Errorf("reading migration file %q: %w", f, err)
-		}
-		if raw.Name > baselineName {
-			raws = append(raws, raw)
-		}
-	}
-	return raws, nil
 }
 
 // classifyBlockedReason maps a revert-planner refusal to one of the fixed,

@@ -60,17 +60,23 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
-			rawMigs, err := m.UnappliedMigrations(ctx, os.DirFS(migrationsDir))
+			resolution, err := m.ResolveMigrations(ctx, os.DirFS(migrationsDir))
 			if err != nil {
 				return fmt.Errorf("failed to get migrations to apply: %w", err)
 			}
+			rawMigs := resolution.Apply
 
 			// Bound the train: apply only up to (and including) the target.
-			// An already-applied target is a successful no-op so callers can
-			// use --to for idempotent converging.
+			//
+			// The target is located in the full local sequence, not in the
+			// list this run would apply. Those are different sets — the target
+			// may already be applied, or be routed to another --target — and
+			// searching only the apply list means an already-applied target
+			// reads as "nothing to do" even when migrations *before* it are
+			// still pending, silently no-opping the whole run.
 			if toMigration != "" {
 				idx := -1
-				for i, rm := range rawMigs {
+				for i, rm := range resolution.All {
 					if rm.Name == toMigration {
 						idx = i
 						break
@@ -85,9 +91,65 @@ func migrateCmd() *cobra.Command {
 						fmt.Printf("Database is already at %q; nothing to apply.\n", toMigration)
 						return nil
 					}
-					return fmt.Errorf("migration %q not found among unapplied migrations", toMigration)
+					return fmt.Errorf("migration %q not found in %s", toMigration, migrationsDir)
 				}
-				rawMigs = rawMigs[:idx+1]
+
+				if _, excluded := resolution.Excluded[toMigration]; excluded {
+					fmt.Printf("Note: %q is not routed to target %q; bounding this run at its position.\n",
+						toMigration, m.Target())
+				}
+
+				bound := make(map[string]struct{}, idx+1)
+				for _, rm := range resolution.All[:idx+1] {
+					bound[rm.Name] = struct{}{}
+				}
+
+				// Close the bound under depends_on.
+				//
+				// Locating --to in the full sequence makes the bound a
+				// filename-order prefix, and filename order is not
+				// dependency-closed: given 01, 02, 03 where 02 depends_on 03,
+				// `--to 02` selects {01, 02} and 02 then starts without 03.
+				// Truncating the topologically sorted list — what this used to
+				// do — was closed by construction, and that property has to be
+				// put back explicitly now that the bound is positional.
+				//
+				// Only dependencies inside this run's apply list are pulled in.
+				// One that is already applied needs nothing, and one excluded
+				// by the active target is satisfied by construction.
+				inRun := make(map[string]*migrations.RawMigration, len(rawMigs))
+				for _, rm := range rawMigs {
+					inRun[rm.Name] = rm
+				}
+				var pull func(name string)
+				pull = func(name string) {
+					rm, ok := inRun[name]
+					if !ok {
+						return
+					}
+					for _, dep := range rm.DependsOn {
+						if _, already := bound[dep]; already {
+							continue
+						}
+						if _, isDep := inRun[dep]; !isDep {
+							continue
+						}
+						bound[dep] = struct{}{}
+						fmt.Printf("Note: also applying %q, which %q depends on.\n", dep, name)
+						pull(dep)
+					}
+				}
+				for name := range bound {
+					pull(name)
+				}
+
+				bounded := make([]*migrations.RawMigration, 0, len(rawMigs))
+				for _, rm := range rawMigs {
+					if _, ok := bound[rm.Name]; ok {
+						bounded = append(bounded, rm)
+					}
+				}
+				rawMigs = bounded
 			}
 
 			// Pre-flight summary: print the deployment state and the plan for
@@ -223,6 +285,13 @@ func migrateCmd() *cobra.Command {
 			//     internal state (e.g. the per-table _pgroll_needs_backfill
 			//     marker column or temp column names colliding with the
 			//     next migration's Start).
+			// Dependencies on migrations the active --target does not select
+			// are satisfied by construction: they will never be applied to
+			// this database. Start cannot work that out for itself — it never
+			// sees the migrations directory — so the set resolved above is
+			// handed to every Start in the batch.
+			satisfiedDeps := AsStartOption(roll.WithSatisfiedDependencies(resolution.Excluded))
+
 			for _, mig := range migs[:len(migs)-1] {
 				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
 				if mig.CompleteMustBeDeferred() {
@@ -231,6 +300,7 @@ func migrateCmd() *cobra.Command {
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
 					AsStartOption(roll.WithoutVersionSchema()),
+					satisfiedDeps,
 					completeOpt,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
@@ -248,7 +318,7 @@ func migrateCmd() *cobra.Command {
 			// schema and a later `pgroll complete` contracts the deployment.
 			// Until that contraction, the whole batch is losslessly
 			// revertible via `pgroll revert`.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig); err != nil {
+			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, satisfiedDeps); err != nil {
 				return err
 			}
 

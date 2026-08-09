@@ -4,6 +4,7 @@ package roll
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -69,7 +70,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"03_create_posts.json": &fstest.MapFile{Data: validMigrationJSON(t)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 	})
@@ -77,7 +78,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 	t.Run("empty directory passes", func(t *testing.T) {
 		fs := fstest.MapFS{}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 		assert.Empty(t, result.Warnings)
@@ -88,7 +89,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_bad.json": &fstest.MapFile{Data: []byte(`{invalid json`)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "invalid syntax")
@@ -100,7 +101,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_empty.json": &fstest.MapFile{Data: []byte(`{}`)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "operations")
@@ -116,7 +117,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_empty_ops.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "operations")
@@ -129,7 +130,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			longName + ".json": &fstest.MapFile{Data: validMigrationJSON(t)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 
 		schemaName := "public_" + longName
@@ -145,7 +146,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"02_dependent.json": &fstest.MapFile{Data: migrationWithDependsOn(t, []string{"nonexistent"})},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		// Produces 2 errors: explicit depends_on check + TopoSortMigrations unknown dep
 		require.GreaterOrEqual(t, len(result.Errors), 1)
@@ -158,7 +159,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"02_dependent.json": &fstest.MapFile{Data: migrationWithDependsOn(t, []string{"01_base"})},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 	})
@@ -169,7 +170,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"02_b.json": &fstest.MapFile{Data: migrationWithDependsOn(t, []string{"01_a"})},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "dependency")
@@ -180,7 +181,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_raw_sql.json": &fstest.MapFile{Data: validMigrationJSON(t)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 		require.Len(t, result.Warnings, 1)
@@ -193,7 +194,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_raw_sql.json": &fstest.MapFile{Data: migrationWithPreconditions(t)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 		assert.Empty(t, result.Warnings)
@@ -204,7 +205,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_structured.json": &fstest.MapFile{Data: structuredMigrationJSON(t)},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 		assert.Empty(t, result.Warnings)
@@ -220,7 +221,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_raw_sql.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "down")
@@ -238,7 +239,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_raw_sql.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 	})
@@ -253,7 +254,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_on_complete.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 	})
@@ -270,7 +271,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_drop_email.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "down")
@@ -289,7 +290,7 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_drop_email.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		assert.Empty(t, result.Errors)
 	})
@@ -304,9 +305,98 @@ func TestCheckMigrationsDir(t *testing.T) {
 			"01_unknown_op.json": &fstest.MapFile{Data: data},
 		}
 
-		result, err := CheckMigrationsDir(fs)
+		result, err := CheckMigrationsDir(fs, false)
 		require.NoError(t, err)
 		require.Len(t, result.Errors, 1)
 		assert.Contains(t, result.Errors[0].Message, "invalid operations")
+	})
+}
+
+func TestCheckTargets(t *testing.T) {
+	t.Parallel()
+
+	mig := func(body string) *fstest.MapFile {
+		return &fstest.MapFile{Data: []byte(body)}
+	}
+	// irreversible so the fork's reversibility check does not fire; these
+	// fixtures exist to exercise `targets`, not revertibility.
+	ops := "irreversible: true\npreconditions: []\noperations:\n  - sql:\n      up: SELECT 1\n"
+
+	t.Run("an empty targets list is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets: []\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		require.Contains(t, res.Errors[0].Message, "empty 'targets' list")
+	})
+
+	t.Run("an empty entry is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets:\n  - \"\"\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		require.Contains(t, res.Errors[0].Message, "empty entry")
+	})
+
+	t.Run("a duplicate entry is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets:\n  - etl\n  - etl\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		require.Contains(t, res.Errors[0].Message, "more than once")
+	})
+
+	t.Run("targets are not required by default", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{"01_a.yaml": mig(ops)}, false)
+		require.NoError(t, err)
+		require.False(t, res.HasErrors())
+	})
+
+	t.Run("--require-targets makes an undeclared migration an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{"01_a.yaml": mig(ops)}, true)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		require.Contains(t, res.Errors[0].Message, "declares no `targets`")
+	})
+
+	// The one shape where treating an excluded dependency as satisfied can
+	// actually break a database, so it must fail the check rather than warn:
+	// cmd/check.go only exits non-zero on errors.
+	t.Run("a depends_on that does not cover the dependent is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets:\n  - app\n" + ops),
+			"02_b.yaml": mig("targets:\n  - app\n  - etl\ndepends_on:\n  - 01_a\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		require.Contains(t, res.Errors[0].Message, "[etl]")
+	})
+
+	t.Run("a depends_on that covers the dependent is fine", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets:\n  - app\n  - etl\n" + ops),
+			"02_b.yaml": mig("targets:\n  - etl\ndepends_on:\n  - 01_a\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.False(t, res.HasErrors())
+	})
+
+	t.Run("case-variant target names are flagged", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_a.yaml": mig("targets:\n  - etl\n" + ops),
+			"02_b.yaml": mig("targets:\n  - ETL\n" + ops),
+		}, false)
+		require.NoError(t, err)
+		require.False(t, res.HasErrors(), "spelling is advisory, not fatal")
+		var found bool
+		for _, w := range res.Warnings {
+			if strings.Contains(w.Message, "verbatim") {
+				found = true
+			}
+		}
+		require.True(t, found, "expected a case-variant warning, got %v", res.Warnings)
 	})
 }

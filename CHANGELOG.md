@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Migration targets.** A migration may declare `targets: [name, ...]`, and
+  `pgroll` accepts a persistent `--target <name>` (`PGROLL_TARGET`) that
+  restricts which migrations are applied. Target names are free-form strings
+  compared verbatim; pgroll assigns them no meaning, so adding a new target
+  costs no pgroll change and the vocabulary stays with the caller's linter.
+
+  Without `--target` nothing is filtered — every migration applies. That is
+  single-database mode, so dev, CI and per-developer instances need no change:
+  the number of `--target` flags in play equals the number of databases you
+  have.
+
+  **Filtering applies to selection only; history validation always reads the
+  unfiltered directory.** This is the load-bearing part. A database may hold
+  history for migrations the active target does not select — an ETL host
+  provisioned as a volume clone of the application database inherits the
+  application's entire chain — and it keeps that history, validates cleanly,
+  and simply stops receiving migrations it is not a target of. No re-baseline,
+  no staggered cutover. See `docs/guides/migration-targets.md`.
+
+  With `--target` in effect every *selection candidate* (post-baseline and not
+  yet applied) must declare `targets`; an untagged candidate is a hard error
+  naming the file. There is no default target and no fail-open, because a
+  migration silently withheld from a database it should have reached surfaces
+  later as replication quietly dropping rows. Already-applied migrations are
+  never inspected, so adopting targets requires no back-stamping of history.
+
+  `targets` is excluded from `Migration.ContentHash`: routing records which
+  databases a migration reaches, not what it does, so re-routing must not clear
+  a re-application tombstone.
+
+  `--target` is honoured or refused everywhere, never silently ignored. `start`
+  refuses a migration whose `targets` exclude the active one — that path takes a
+  single file and never consults directory resolution, so without the guard
+  `pgroll start ./migrations/04_etl.yaml --target app` applied an ETL migration
+  to the application database and exited 0. `stamp` filters the directory form
+  (a history row makes its migration a non-candidate permanently, so an
+  unfiltered stamp is unrecoverable) and `baseline` carries the target into the
+  placeholder it writes. Commands with no migration set to filter — `pull`,
+  `validate`, `rollback`, `prune`, `update`, `convert` — reject the flag.
+
+  `pgroll check` gains `--require-targets`, so an undeclared migration fails at
+  review time rather than at the first targeted deploy, where it would take out
+  every target's leg at once. A `depends_on` that does not cover the dependent's
+  targets is now an **error**: it is the one shape where treating an excluded
+  dependency as satisfied can genuinely break a database, and as a warning it
+  merged green. Malformed `targets` lists are errors; target names differing
+  only by case remain advisory. Base-branch ordering only compares migrations
+  that share a target, since two targets releasing on independent cadences is
+  the steady state this feature creates and cross-target comparison demanded a
+  rebase that changes nothing.
+
+  `migrate --to` closes its bound under `depends_on`. Locating the target in the
+  full local sequence makes the bound a filename-order prefix, which — unlike
+  the topologically sorted slice it replaced — is not dependency-closed.
+
+  **This is a one-way binary lockstep.** Migration files are decoded strictly,
+  so any pgroll older than this release hard-rejects a file carrying `targets`,
+  and the rejection takes out the whole directory for every command. Upgrade
+  every consumer before committing the first tagged migration. Parse errors for
+  unknown fields now say so explicitly rather than naming a Go type.
+
+### Fixed
+
+- `pgroll migrate --to` no longer silently no-ops an entire run. The target was
+  located in the list the run would apply, while `MigrationExists` consults the
+  whole history table, so an already-applied target read as "nothing to do"
+  even when migrations before it were still pending. The target is now located
+  in the full local sequence and bounds the run positionally.
+- `pgroll latest schema --local` and `latest migration --local` honour
+  `--target`, and raise the same missing-`targets` error the migrate path does
+  rather than silently skipping an undeclared file.
+
 ## [0.16.2-baselayer.19] - 2026-07-24
 
 ### Fixed

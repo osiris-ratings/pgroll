@@ -502,6 +502,13 @@ type PgRollMigration struct {
 	// any precondition fails, the migration is rejected.
 	Preconditions []Precondition `json:"preconditions,omitempty"`
 
+	// Deployment targets this migration belongs to. Free-form names, compared
+	// verbatim against pgroll's --target flag; pgroll assigns them no meaning of its
+	// own. When --target is not given the field is ignored and every migration
+	// applies, which is single-database mode. When --target is given, a migration
+	// that is still unapplied must declare this field.
+	Targets []string `json:"targets,omitempty"`
+
 	// Name of the version schema to use for this migration
 	VersionSchema *string `json:"version_schema,omitempty"`
 }

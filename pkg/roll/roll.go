@@ -41,6 +41,9 @@ type Roll struct {
 	// disable pgroll version schemas creation and deletion
 	disableVersionSchemas bool
 
+	// deployment target migrations are filtered to; empty means no filtering
+	target string
+
 	migrationHooks    MigrationHooks
 	state             *state.State
 	pgVersion         PGVersion
@@ -83,6 +86,7 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 		state:                 state,
 		pgVersion:             pgMajorVersion,
 		disableVersionSchemas: rollOpts.disableVersionSchemas,
+		target:                rollOpts.target,
 		migrationHooks:        rollOpts.migrationHooks,
 		skipValidation:        rollOpts.skipValidation,
 		requireReversible:     rollOpts.requireReversible,
@@ -185,6 +189,12 @@ func (m *Roll) Schema() string {
 
 func (m *Roll) UseVersionSchema() bool {
 	return !m.disableVersionSchemas
+}
+
+// Target returns the deployment target migrations are filtered to, or the
+// empty string when no filtering is in effect.
+func (m *Roll) Target() string {
+	return m.target
 }
 
 func (m *Roll) Close() error {

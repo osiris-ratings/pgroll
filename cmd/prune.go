@@ -32,6 +32,10 @@ func pruneCmd() *cobra.Command {
 			"with `pgroll materialize`.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := refuseTarget(cmd); err != nil {
+				return err
+			}
+
 			ctx := cmd.Context()
 
 			m, err := NewRollWithInitCheck(ctx)

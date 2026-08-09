@@ -17,6 +17,10 @@ var validateCmd = &cobra.Command{
 	Args:      cobra.ExactArgs(1),
 	ValidArgs: []string{"file"},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := refuseTarget(cmd); err != nil {
+			return err
+		}
+
 		ctx := cmd.Context()
 		fileName := args[0]
 

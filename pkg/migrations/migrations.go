@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	_ "github.com/lib/pq"
 
@@ -91,6 +92,12 @@ type (
 		DependsOn     []string       `json:"depends_on,omitempty"`
 		Preconditions []Precondition `json:"preconditions,omitempty"`
 		Irreversible  bool           `json:"irreversible,omitempty"`
+		// Targets mirrors RawMigration.Targets. It marshals so that the
+		// round-trip through ParseMigration and MigrationWriter preserves
+		// routing — without it `pgroll update` would strip `targets` out of
+		// every file it rewrites. It is deliberately excluded from
+		// ContentHash; see the note there.
+		Targets []string `json:"targets,omitempty"`
 		// RevertOf marks an engine-synthesized inverse migration with the
 		// name of the sealed migration it reverts. Never set on authored
 		// migrations; used by the sealed-revert orchestrator for durable
@@ -105,6 +112,20 @@ type (
 		DependsOn     []string        `json:"depends_on,omitempty"`
 		Preconditions []Precondition  `json:"preconditions,omitempty"`
 		Irreversible  bool            `json:"irreversible,omitempty"`
+		// Targets names the deployment targets this migration belongs to.
+		//
+		// Free-form by design: pgroll assigns no meaning to the values and
+		// compares them verbatim against the active --target. Which names are
+		// legal is a question for the caller's linter, not for pgroll —
+		// adding a third target must cost zero pgroll changes.
+		//
+		// Absent means "untargeted". Untargeted migrations apply
+		// unconditionally when no --target is in effect (single-database
+		// mode: dev, CI, per-developer instances). When --target IS in
+		// effect, an untargeted migration that is still a selection candidate
+		// is a hard error — there is no default target and no fail-open. See
+		// roll.resolveLocalSet.
+		Targets []string `json:"targets,omitempty"`
 		// RevertOf mirrors Migration.RevertOf. It MUST survive the
 		// SchemaHistory → RawMigration → ParseMigration round-trip: the
 		// sealed-revert orchestrator's crash recovery identifies leftover
@@ -125,13 +146,41 @@ type (
 // the hash of what it undid, and `pgroll migrate` refuses to re-apply a
 // same-named migration whose content still matches — any edit changes the
 // hash and confirms intent.
+//
+// Targets is excluded deliberately. It records which databases a migration
+// reaches, not what it does, so re-routing a migration is not the kind of
+// edit that should confirm intent to re-run DDL a sealed revert has already
+// undone. Including it would let a one-line routing change silently clear a
+// tombstone.
 func (m *Migration) ContentHash() (string, error) {
-	raw, err := json.Marshal(m)
+	hashable := *m
+	hashable.Targets = nil
+
+	raw, err := json.Marshal(&hashable)
 	if err != nil {
 		return "", fmt.Errorf("unable to marshal migration %q for hashing: %w", m.Name, err)
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// SelectedBy reports whether this migration is selected by target t.
+//
+// An empty t means no --target was given, i.e. no filtering was requested at
+// all: every migration is selected. That is single-database mode, and it is
+// why `targets` can be adopted without touching dev, CI or per-developer
+// instance workflows.
+//
+// Comparison is verbatim and case-sensitive. pgroll has no vocabulary of its
+// own for target names, so "ETL" and "etl" are two different targets; making
+// them the same would be inventing a normalization rule that belongs to the
+// caller's linter. `pgroll check` warns when a directory is inconsistent with
+// itself on this point.
+func (m *RawMigration) SelectedBy(t string) bool {
+	if t == "" {
+		return true
+	}
+	return slices.Contains(m.Targets, t)
 }
 
 // VersionSchemaName returns the version schema name for the migration.

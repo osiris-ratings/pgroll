@@ -310,3 +310,66 @@ func exampleMigration(t *testing.T) []byte {
 
 	return bytes
 }
+
+// TestContentHashIgnoresTargets pins the backward-compatibility invariant that
+// makes re-application tombstones survive the introduction of `targets`.
+//
+// It holds today only because the field is omitempty and nil on both sides, so
+// the existing assertions pass identically with the exclusion deleted. These
+// two do not.
+func TestContentHashIgnoresTargets(t *testing.T) {
+	t.Parallel()
+
+	base := migrations.Migration{
+		Name:       "01_migration",
+		Operations: migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
+	}
+	tagged := base
+	tagged.Targets = []string{"app", "etl"}
+	rerouted := base
+	rerouted.Targets = []string{"etl"}
+
+	baseHash, err := base.ContentHash()
+	require.NoError(t, err)
+	taggedHash, err := tagged.ContentHash()
+	require.NoError(t, err)
+	reroutedHash, err := rerouted.ContentHash()
+	require.NoError(t, err)
+
+	require.Equal(t, baseHash, taggedHash,
+		"adding targets must not change the hash, or every tombstone recorded before "+
+			"the field existed silently stops matching")
+	require.Equal(t, taggedHash, reroutedHash,
+		"re-routing a migration must not clear its tombstone: routing records which "+
+			"databases it reaches, not what it does")
+
+	// A real content change still moves the hash.
+	edited := tagged
+	edited.Operations = migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 2"}}
+	editedHash, err := edited.ContentHash()
+	require.NoError(t, err)
+	require.NotEqual(t, taggedHash, editedHash)
+}
+
+// TestTargetsRoundTrip covers the path `pgroll update` and `pgroll pull` take.
+// Without Targets on both RawMigration and Migration, ParseMigration drops it
+// and those commands rewrite every file with its routing stripped.
+func TestTargetsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, ext := range []string{"json", "yaml"} {
+		t.Run(ext, func(t *testing.T) {
+			body := `{"targets":["etl"],"operations":[{"sql":{"up":"SELECT 1"}}]}`
+			fsys := fstest.MapFS{"01_m." + ext: &fstest.MapFile{Data: []byte(body)}}
+
+			raw, err := migrations.ReadRawMigration(fsys, "01_m."+ext)
+			require.NoError(t, err)
+			require.Equal(t, []string{"etl"}, raw.Targets)
+
+			parsed, err := migrations.ParseMigration(raw)
+			require.NoError(t, err)
+			require.Equal(t, []string{"etl"}, parsed.Targets,
+				"ParseMigration must carry targets, or pgroll update strips them")
+		})
+	}
+}

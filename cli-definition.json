@@ -46,6 +46,11 @@
           "name": "base",
           "description": "Git ref for base-branch ordering check (e.g., origin/main)",
           "default": ""
+        },
+        {
+          "name": "require-targets",
+          "description": "Require every migration to declare `targets`; catches at review time what a targeted deploy would otherwise refuse",
+          "default": "false"
         }
       ],
       "subcommands": [],
@@ -58,7 +63,13 @@
       "short": "Complete an ongoing migration with the operations present in the given file",
       "use": "complete <file>",
       "example": "",
-      "flags": [],
+      "flags": [
+        {
+          "name": "force",
+          "description": "Drain a deferred queue pgroll cannot prove belongs to a finished batch (version schemas disabled only)",
+          "default": "false"
+        }
+      ],
       "subcommands": [],
       "args": []
     },
@@ -493,6 +504,11 @@
       "name": "schema",
       "description": "Postgres schema to use for the migration",
       "default": "public"
+    },
+    {
+      "name": "target",
+      "description": "Only apply migrations whose `targets` include this name; unset applies every migration",
+      "default": ""
     },
     {
       "name": "use-version-schema",

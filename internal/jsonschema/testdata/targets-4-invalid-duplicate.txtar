@@ -1,0 +1,16 @@
+Target names must be unique within a migration.
+
+-- targets.json --
+{
+  "targets": ["etl", "etl"],
+  "operations": [
+    {
+      "sql": {
+        "up": "SELECT 1"
+      }
+    }
+  ]
+}
+
+-- valid --
+false

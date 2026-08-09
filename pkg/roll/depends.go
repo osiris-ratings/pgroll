@@ -17,7 +17,11 @@ var (
 
 // validateDependencies checks that all migrations listed in the migration's
 // depends_on field have already been applied to the database.
-func (m *Roll) validateDependencies(ctx context.Context, migration *migrations.Migration) error {
+//
+// satisfied names dependencies to accept without a history row: local
+// migrations the active --target does not select, which will never be applied
+// to this database and so impose no ordering. See WithSatisfiedDependencies.
+func (m *Roll) validateDependencies(ctx context.Context, migration *migrations.Migration, satisfied map[string]struct{}) error {
 	if len(migration.DependsOn) == 0 {
 		return nil
 	}
@@ -34,9 +38,13 @@ func (m *Roll) validateDependencies(ctx context.Context, migration *migrations.M
 
 	var missing []string
 	for _, dep := range migration.DependsOn {
-		if _, ok := applied[dep]; !ok {
-			missing = append(missing, dep)
+		if _, ok := applied[dep]; ok {
+			continue
 		}
+		if _, ok := satisfied[dep]; ok {
+			continue
+		}
+		missing = append(missing, dep)
 	}
 
 	if len(missing) > 0 {
@@ -52,7 +60,17 @@ func (m *Roll) validateDependencies(ctx context.Context, migration *migrations.M
 //
 // The applied set contains names of migrations already applied to the database;
 // dependencies satisfied by applied migrations are considered met.
-func TopoSortMigrations(migs []*migrations.RawMigration, applied map[string]struct{}) ([]*migrations.RawMigration, error) {
+//
+// The excluded set contains names present in the local directory but not
+// selected by the active --target. A dependency on one of those is satisfied
+// by construction: it will never be applied to this database, so there is
+// nothing here to order against. depends_on expresses ordering rather than
+// reference (see the field's documentation), which is what makes that the
+// correct reading rather than a convenient one. `pgroll check` warns about
+// cross-target dependencies at authoring time so that a depends_on written as
+// a semantic prerequisite is caught before it relies on this leniency. Pass
+// nil when no target filter is in effect.
+func TopoSortMigrations(migs []*migrations.RawMigration, applied, excluded map[string]struct{}) ([]*migrations.RawMigration, error) {
 	// Check if any migration has depends_on; if none do, skip sorting entirely
 	hasDeps := false
 	for _, m := range migs {
@@ -85,12 +103,20 @@ func TopoSortMigrations(migs []*migrations.RawMigration, applied map[string]stru
 			if _, isUnapplied := migByName[dep]; isUnapplied {
 				inDegree[m.Name]++
 				dependents[dep] = append(dependents[dep], m.Name)
-			} else if _, isApplied := applied[dep]; !isApplied {
-				// Dependency is neither applied nor in the unapplied set
-				return nil, fmt.Errorf("%w: migration %q depends on unknown migration %q",
-					ErrMismatchedMigration, m.Name, dep)
+				continue
 			}
-			// If dep is in applied set, it's already satisfied — skip
+			if _, isApplied := applied[dep]; isApplied {
+				// Already satisfied — skip
+				continue
+			}
+			if _, isExcluded := excluded[dep]; isExcluded {
+				// Satisfied by construction: a local migration the active
+				// target does not select, so it imposes no ordering here.
+				continue
+			}
+			// Dependency is neither applied, nor unapplied, nor excluded
+			return nil, fmt.Errorf("%w: migration %q depends on unknown migration %q",
+				ErrMismatchedMigration, m.Name, dep)
 		}
 	}
 

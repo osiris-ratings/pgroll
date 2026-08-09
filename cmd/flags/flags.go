@@ -39,3 +39,10 @@ func Verbose() bool { return viper.GetBool("VERBOSE") }
 func UseVersionSchema() bool {
 	return viper.GetBool("USE_VERSION_SCHEMA")
 }
+
+// Target is the deployment target migrations are filtered to. Empty means no
+// filtering was requested — every migration applies, which is single-database
+// mode.
+func Target() string {
+	return viper.GetString("TARGET")
+}

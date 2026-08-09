@@ -13,6 +13,7 @@ import (
 
 func checkCmd() *cobra.Command {
 	var baseRef string
+	var requireTargets bool
 
 	cmd := &cobra.Command{
 		Use:   "check <directory>",
@@ -25,6 +26,11 @@ func checkCmd() *cobra.Command {
   - depends_on targets that don't exist in the migration set
   - Dependency cycles
   - Raw SQL operations without preconditions (advisory warning)
+  - Malformed 'targets', and cross-target depends_on (advisory warning)
+
+With --require-targets, every migration must declare 'targets'. Use it in CI
+for a repository that routes migrations to more than one database, so an
+undeclared migration fails review instead of the deploy.
 
 With --base, also checks that new migrations sort after the base
 branch's latest migration (requires git).`,
@@ -44,7 +50,7 @@ branch's latest migration (requires git).`,
 			}
 
 			// Run filesystem checks
-			result, err := roll.CheckMigrationsDir(os.DirFS(migrationsDir))
+			result, err := roll.CheckMigrationsDir(os.DirFS(migrationsDir), requireTargets)
 			if err != nil {
 				return err
 			}
@@ -82,6 +88,8 @@ branch's latest migration (requires git).`,
 
 	cmd.Flags().StringVar(&baseRef, "base", "",
 		"Git ref for base-branch ordering check (e.g., origin/main)")
+	cmd.Flags().BoolVar(&requireTargets, "require-targets", false,
+		"Require every migration to declare `targets`; catches at review time what a targeted deploy would otherwise refuse")
 
 	return cmd
 }
