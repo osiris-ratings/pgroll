@@ -150,6 +150,28 @@ func WithLogging(enabled bool) Option {
 	}
 }
 
+// contractOptions holds options for a single FinishContraction invocation.
+type contractOptions struct {
+	force bool
+}
+
+// ContractOption is a functional option for FinishContraction.
+type ContractOption func(*contractOptions)
+
+// WithForceContract drains a deferred queue that pgroll cannot prove belongs to
+// a finished batch.
+//
+// Only reachable with version schemas disabled, where the physical projection
+// that would settle the question does not exist. The refusal it bypasses
+// protects one genuinely unrecoverable case — a `pgroll migrate` interrupted
+// mid-train, whose queue holds the destructive half of work that was never
+// applied forward. It also catches two harmless ones (a window re-opened by a
+// bounded revert, a database carried over from the delayed-contraction
+// lifecycle), and this is how an operator gets through those.
+func WithForceContract() ContractOption {
+	return func(o *contractOptions) { o.force = true }
+}
+
 // startOptions holds options for a single Start invocation.
 type startOptions struct {
 	skipVersionSchema bool

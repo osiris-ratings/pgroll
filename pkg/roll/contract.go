@@ -35,7 +35,12 @@ import (
 // contractions never invalidate the live views: renames auto-follow, dropped
 // columns were never projected, dropped tables are filtered out). It is
 // recreated from the post-drain physical state immediately after.
-func (m *Roll) FinishContraction(ctx context.Context) (int, int64, error) {
+func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (int, int64, error) {
+	var o contractOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	queued, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to query deferred completes: %w", err)
@@ -119,20 +124,34 @@ func (m *Roll) FinishContraction(ctx context.Context) (int, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	if !resuming {
+	if !resuming && !o.force {
 		if m.disableVersionSchemas {
-			// No version schemas exist to probe, so the physical test above is
-			// unavailable and the queue cannot be told apart from a crashed
-			// batch's leftovers. Refuse rather than guess: a finished batch
-			// awaiting contraction always leaves its final migration active,
-			// which `Complete` handles and this function never sees, and a
-			// genuine resume is sealed and took the branch above. Draining on
-			// a guess would fire the destructive half of a batch whose forward
-			// half never ran.
+			// No version schema exists to probe, so the physical test below is
+			// unavailable and this queue cannot be told apart from a crashed
+			// batch's leftovers by state alone.
+			//
+			// Three things produce this exact shape — queue non-empty, nothing
+			// active, nothing sealed — and only the first is dangerous:
+			//
+			//   1. a `pgroll migrate` that died mid-train, leaving the applied
+			//      prefix's defer-class rows queued. Draining fires the
+			//      destructive half of a batch whose forward half never ran.
+			//   2. a train re-opened by a bounded revert.
+			//   3. a database carried over from the delayed-contraction
+			//      lifecycle with its window still open.
+			//
+			// Telling them apart needs to know whether migrations beyond the
+			// queue are still unapplied, which is a property of the migrations
+			// directory and not of this database. So refuse by default — (1)
+			// is unrecoverable and (2) and (3) are not — and say plainly that
+			// --force is the way through for the harmless two, rather than
+			// pointing at `pgroll migrate`, which is a no-op in both.
 			return 0, 0, fmt.Errorf(
-				"cannot contract: %d deferred completion(s) are queued with no active migration and "+
-					"version schemas disabled, so pgroll cannot confirm the batch finished; resume it by "+
-					"re-running `pgroll migrate`, or abort it with `pgroll revert`", len(queued),
+				"cannot contract: %d deferred completion(s) are queued with nothing active and version "+
+					"schemas disabled, so pgroll cannot confirm the batch finished. If a `pgroll migrate` "+
+					"was interrupted, resume it by re-running `pgroll migrate`. If this window was opened "+
+					"by a bounded revert or carried over from an older lifecycle, the queue is safe to "+
+					"drain: re-run with --force", len(queued),
 			)
 		}
 

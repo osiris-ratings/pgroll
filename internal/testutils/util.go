@@ -277,11 +277,14 @@ func WithMigratorAndConnectionToContainer(t *testing.T, fn func(mig *roll.Roll, 
 }
 
 // WithMigratorAndConnStrToContainer is WithMigratorAndConnectionToContainer
-// plus the connection string, so a test can open a *second* Roll against the
-// same database with different options. Needed to exercise a database whose
-// history was written by one configuration and is later read by another — the
-// shape of an ETL host cloned from an application database and thereafter
-// migrated with a --target.
+// plus the connection string, so a test can open a second Roll against the
+// SAME database with different options.
+//
+// One database, two Rolls — deliberately, and it is not the two-database
+// harness. It models the *clone*: a database whose history was written by one
+// configuration and is afterwards read by another, which is exactly an ETL host
+// restored from an application-database volume and thereafter migrated with a
+// --target. For two genuinely independent databases use WithTwoMigrators.
 func WithMigratorAndConnStrToContainer(t *testing.T, opts []roll.Option, fn func(mig *roll.Roll, connStr string, db *sql.DB)) {
 	t.Helper()
 	ctx := context.Background()
@@ -307,6 +310,41 @@ func WithMigratorAndConnStrToContainer(t *testing.T, opts []roll.Option, fn func
 	})
 
 	fn(mig, connStr, db)
+}
+
+// WithTwoMigrators runs fn against two genuinely separate databases, each with
+// its own pgroll state, so a test can prove that applying one target's
+// migrations to one of them leaves the other untouched.
+func WithTwoMigrators(t *testing.T, aOpts, bOpts []roll.Option, fn func(a, b *roll.Roll, aDB, bDB *sql.DB)) {
+	t.Helper()
+	ctx := context.Background()
+
+	open := func(opts []roll.Option) (*roll.Roll, *sql.DB) {
+		db, connStr, _ := setupTestDatabase(t)
+
+		st, err := state.New(ctx, connStr, "pgroll")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Init(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		mig, err := roll.New(ctx, connStr, "public", st, opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := mig.Close(); err != nil {
+				t.Fatalf("Failed to close migrator connection: %v", err)
+			}
+		})
+		return mig, db
+	}
+
+	a, aDB := open(aOpts)
+	b, bDB := open(bOpts)
+	fn(a, b, aDB, bDB)
 }
 
 // NewMigratorForConnStr opens an additional Roll against an already-initialized

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -208,6 +209,23 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 	var o startOptions
 	for _, opt := range opts {
 		opt(&o)
+	}
+
+	// Routing is enforced here, not only in the directory resolution, because
+	// Start is reachable without it: `pgroll start ./migrations/04_etl.yaml`
+	// names a single file and never consults resolveLocalSet. Without this,
+	// `--target app` on an etl-routed file applies it to the application
+	// database and exits 0 — the exact silent mis-routing the design exists to
+	// prevent.
+	if m.target != "" {
+		if len(migration.Targets) == 0 {
+			return fmt.Errorf("%w: migration %q must declare `targets` (--target %q is in effect)",
+				ErrTargetRequired, migration.Name, m.target)
+		}
+		if !slices.Contains(migration.Targets, m.target) {
+			return fmt.Errorf("%w: migration %q declares targets %v, which do not include %q",
+				ErrWrongTarget, migration.Name, migration.Targets, m.target)
+		}
 	}
 
 	// Fail early if we have existing schema without migration history

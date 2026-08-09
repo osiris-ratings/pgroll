@@ -13,6 +13,7 @@ import (
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 
+	"github.com/xataio/pgroll/cmd/flags"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
 )
@@ -68,7 +69,7 @@ func stampCmd() *cobra.Command {
 			}
 			defer m.Close()
 
-			raws, err := collectStampInputs(path, info, upTo)
+			raws, err := collectStampInputs(path, info, upTo, flags.Target())
 			if err != nil {
 				return err
 			}
@@ -156,7 +157,14 @@ func stampCmd() *cobra.Command {
 // implicit in the path: a regular file yields a single-element slice; a
 // directory yields every migration file in lex order, optionally truncated
 // by upTo. Rejects upTo when the input is a single file (it's meaningless).
-func collectStampInputs(path string, info os.FileInfo, upTo string) ([]*migrations.RawMigration, error) {
+//
+// target filters the directory form. Stamp writes history rows, and a row makes
+// its migration a non-candidate forever — so stamping a whole directory against
+// a routed database records every other target's migrations as applied there,
+// and the tag requirement can never catch the mistake afterwards. This is the
+// documented dump-restore recovery flow, so it runs on production-shaped
+// databases; it has to honour the flag rather than ignore it.
+func collectStampInputs(path string, info os.FileInfo, upTo, target string) ([]*migrations.RawMigration, error) {
 	if !info.IsDir() {
 		if upTo != "" {
 			return nil, fmt.Errorf("--up-to is only valid when stamping a directory; %q is a file", path)
@@ -168,6 +176,14 @@ func collectStampInputs(path string, info os.FileInfo, upTo string) ([]*migratio
 		raw, err := migrations.ReadRawMigration(os.DirFS(dir), base)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read migration %q: %w", path, err)
+		}
+		// Single-file mode is an explicit instruction naming one migration, so
+		// it is not filtered — but stamping a file into a target it is not
+		// routed to is the same mistake as applying it there, recorded
+		// permanently.
+		if target != "" && !raw.SelectedBy(target) {
+			return nil, fmt.Errorf("%w: migration %q declares targets %v, which do not include %q",
+				roll.ErrWrongTarget, raw.Name, raw.Targets, target)
 		}
 		return []*migrations.RawMigration{raw}, nil
 	}
@@ -185,6 +201,14 @@ func collectStampInputs(path string, info os.FileInfo, upTo string) ([]*migratio
 		raw, err := migrations.ReadRawMigration(fsys, name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read migration %q: %w", name, err)
+		}
+		if target != "" {
+			if len(raw.Targets) == 0 {
+				return nil, roll.TargetRequiredError(name, target, raw.Targets != nil)
+			}
+			if !raw.SelectedBy(target) {
+				continue
+			}
 		}
 		raws = append(raws, raw)
 	}

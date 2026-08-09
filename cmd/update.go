@@ -21,6 +21,10 @@ func updateCmd() *cobra.Command {
 		Args:      cobra.ExactArgs(1),
 		ValidArgs: []string{"directory"},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := refuseTarget(cmd); err != nil {
+				return err
+			}
+
 			ctx := cmd.Context()
 			migrationsDir := args[0]
 

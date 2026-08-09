@@ -14,44 +14,58 @@ import (
 	"github.com/xataio/pgroll/pkg/state"
 )
 
-var completeCmd = &cobra.Command{
-	Use:   "complete <file>",
-	Short: "Complete an ongoing migration with the operations present in the given file",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		// Create a roll instance and check if pgroll is initialized
-		m, err := NewRollWithInitCheck(cmd.Context())
-		if err != nil {
-			return err
-		}
-		defer m.Close()
+func completeCmd() *cobra.Command {
+	var force bool
 
-		sp, _ := pterm.DefaultSpinner.WithText("Completing migration...").Start()
-		err = m.Complete(cmd.Context())
-		if err != nil {
-			// No active migration: contract whatever the deployment left
-			// pending — drain the deferred queue (a resumed batch, or a
-			// database upgraded with its delayed-contraction window still
-			// open) and stamp the deployment sealed.
-			if errors.Is(err, state.ErrNoActiveMigration) {
-				drained, stamped, finishErr := m.FinishContraction(cmd.Context())
-				if finishErr != nil {
-					sp.Fail(fmt.Sprintf("Failed to contract the deployment: %s", finishErr))
-					return finishErr
-				}
-				if drained > 0 || stamped > 0 {
-					sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) and sealed %d migration(s).", drained, stamped))
-				} else {
-					sp.Success("Nothing to complete: no active migration and no pending contraction.")
-				}
-				return finishPendingRevert(cmd.Context(), m)
+	cmd := &cobra.Command{
+		Use:   "complete <file>",
+		Short: "Complete an ongoing migration with the operations present in the given file",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Create a roll instance and check if pgroll is initialized
+			m, err := NewRollWithInitCheck(cmd.Context())
+			if err != nil {
+				return err
 			}
-			sp.Fail(fmt.Sprintf("Failed to complete migration: %s", err))
-			return err
-		}
+			defer m.Close()
 
-		sp.Success("Migration successful!")
-		return finishPendingRevert(cmd.Context(), m)
-	},
+			var contractOpts []roll.ContractOption
+			if force {
+				contractOpts = append(contractOpts, roll.WithForceContract())
+			}
+
+			sp, _ := pterm.DefaultSpinner.WithText("Completing migration...").Start()
+			err = m.Complete(cmd.Context())
+			if err != nil {
+				// No active migration: contract whatever the deployment left
+				// pending — drain the deferred queue (a resumed batch, or a
+				// database upgraded with its delayed-contraction window still
+				// open) and stamp the deployment sealed.
+				if errors.Is(err, state.ErrNoActiveMigration) {
+					drained, stamped, finishErr := m.FinishContraction(cmd.Context(), contractOpts...)
+					if finishErr != nil {
+						sp.Fail(fmt.Sprintf("Failed to contract the deployment: %s", finishErr))
+						return finishErr
+					}
+					if drained > 0 || stamped > 0 {
+						sp.Success(fmt.Sprintf("No active migration; drained %d deferred completion(s) and sealed %d migration(s).", drained, stamped))
+					} else {
+						sp.Success("Nothing to complete: no active migration and no pending contraction.")
+					}
+					return finishPendingRevert(cmd.Context(), m)
+				}
+				sp.Fail(fmt.Sprintf("Failed to complete migration: %s", err))
+				return err
+			}
+
+			sp.Success("Migration successful!")
+			return finishPendingRevert(cmd.Context(), m)
+		},
+	}
+
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Drain a deferred queue pgroll cannot prove belongs to a finished batch (version schemas disabled only)")
+
+	return cmd
 }
 
 // finishPendingRevert finishes an applied-but-unpruned inverse train, if the

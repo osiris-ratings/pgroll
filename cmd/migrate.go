@@ -103,6 +103,46 @@ func migrateCmd() *cobra.Command {
 				for _, rm := range resolution.All[:idx+1] {
 					bound[rm.Name] = struct{}{}
 				}
+
+				// Close the bound under depends_on.
+				//
+				// Locating --to in the full sequence makes the bound a
+				// filename-order prefix, and filename order is not
+				// dependency-closed: given 01, 02, 03 where 02 depends_on 03,
+				// `--to 02` selects {01, 02} and 02 then starts without 03.
+				// Truncating the topologically sorted list — what this used to
+				// do — was closed by construction, and that property has to be
+				// put back explicitly now that the bound is positional.
+				//
+				// Only dependencies inside this run's apply list are pulled in.
+				// One that is already applied needs nothing, and one excluded
+				// by the active target is satisfied by construction.
+				inRun := make(map[string]*migrations.RawMigration, len(rawMigs))
+				for _, rm := range rawMigs {
+					inRun[rm.Name] = rm
+				}
+				var pull func(name string)
+				pull = func(name string) {
+					rm, ok := inRun[name]
+					if !ok {
+						return
+					}
+					for _, dep := range rm.DependsOn {
+						if _, already := bound[dep]; already {
+							continue
+						}
+						if _, isDep := inRun[dep]; !isDep {
+							continue
+						}
+						bound[dep] = struct{}{}
+						fmt.Printf("Note: also applying %q, which %q depends on.\n", dep, name)
+						pull(dep)
+					}
+				}
+				for name := range bound {
+					pull(name)
+				}
+
 				bounded := make([]*migrations.RawMigration, 0, len(rawMigs))
 				for _, rm := range rawMigs {
 					if _, ok := bound[rm.Name]; ok {
@@ -385,25 +425,13 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		// interrupted run. On any error we leave expandComplete false and
 		// fall back to the INTERRUPTED classification — never weaker than the
 		// status quo.
-		//
-		// With --use-version-schema=false there is no version schema to look
-		// for: Start never calls ensureViews, so condition 1 can never hold
-		// and the backfill check below would be unreachable. Requiring it
-		// anyway would classify every expand-only run on such a database as
-		// INTERRUPTED on the *next* invocation, which makes expand-only
-		// unusable there — and, because the idempotent-complete path sits
-		// behind the awaiting-complete classification, disables it too. Fall
-		// back to the backfill marker as the sole discriminator, which is the
-		// half of the test that does not depend on the view layer.
 		if activeMig, err := m.State().GetActiveMigration(ctx, m.Schema()); err == nil {
-			schemaProjected := !m.UseVersionSchema()
-			if !schemaProjected {
-				want := roll.VersionedSchemaName(m.Schema(), activeMig.VersionSchemaName())
-				for _, s := range liveSchemas {
-					if s == want {
-						schemaProjected = true
-						break
-					}
+			want := roll.VersionedSchemaName(m.Schema(), activeMig.VersionSchemaName())
+			schemaProjected := false
+			for _, s := range liveSchemas {
+				if s == want {
+					schemaProjected = true
+					break
 				}
 			}
 			if schemaProjected {

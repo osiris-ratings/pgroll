@@ -15,6 +15,7 @@ import (
 	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 // targetedMigration builds a migration file carrying an explicit `targets`
@@ -280,6 +281,222 @@ func TestPlanWithTarget(t *testing.T) {
 				require.Equal(t, 0, res.Apply.Count)
 				require.Equal(t, 0, res.Revert.Count)
 				require.Equal(t, 0, res.Blocked.Count)
+				require.True(t, res.InSync)
+			})
+	})
+}
+
+// TestTwoDatabases is the feature itself: two genuinely separate databases,
+// each applying only its own target's slice of one directory, converging
+// independently and staying converged.
+//
+// The clone tests above share a database deliberately (they model a restored
+// volume). This one does not, so it is the only place that proves applying one
+// target leaves the other database's state untouched.
+func TestTwoDatabases(t *testing.T) {
+	t.Parallel()
+
+	fs := cloneFixture(t)
+
+	testutils.WithTwoMigrators(t,
+		[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("app")},
+		[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("etl")},
+		func(app, etl *roll.Roll, _, _ *sql.DB) {
+			ctx := context.Background()
+
+			appMigs, err := app.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+			require.Equal(t, []string{"01_app_only", "02_shared", "03_app_only_2"}, names(appMigs))
+
+			etlMigs, err := etl.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+			require.Equal(t, []string{"02_shared", "04_etl_new"}, names(etlMigs))
+
+			// Apply each database's own slice.
+			applyRaw(t, ctx, app, appMigs)
+			applyRaw(t, ctx, etl, etlMigs)
+
+			// Each converges, and neither picked up the other's migrations.
+			remainingApp, err := app.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+			require.Empty(t, remainingApp)
+
+			remainingETL, err := etl.UnappliedMigrations(ctx, fs)
+			require.NoError(t, err)
+			require.Empty(t, remainingETL)
+
+			appHistory, err := app.State().SchemaHistory(ctx, app.Schema())
+			require.NoError(t, err)
+			require.Equal(t, []string{"01_app_only", "02_shared", "03_app_only_2"}, historyNames(appHistory))
+
+			etlHistory, err := etl.State().SchemaHistory(ctx, etl.Schema())
+			require.NoError(t, err)
+			require.Equal(t, []string{"02_shared", "04_etl_new"}, historyNames(etlHistory),
+				"the etl database must never have recorded an app-only migration")
+
+			// And both report in sync rather than perpetually diverged.
+			appPlan, err := app.Plan(ctx, fs)
+			require.NoError(t, err)
+			require.True(t, appPlan.InSync)
+
+			etlPlan, err := etl.Plan(ctx, fs)
+			require.NoError(t, err)
+			require.True(t, etlPlan.InSync)
+		})
+}
+
+// TestStartRefusesWrongTarget covers the direct-apply path, which bypasses
+// directory resolution entirely: `pgroll start ./migrations/04_etl.yaml`
+// names one file and never consults resolveLocalSet.
+func TestStartRefusesWrongTarget(t *testing.T) {
+	t.Parallel()
+
+	fs := cloneFixture(t)
+
+	t.Run("a migration routed elsewhere is refused", func(t *testing.T) {
+		testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+			[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("app")},
+			func(m *roll.Roll, _ *sql.DB) {
+				ctx := context.Background()
+
+				mig := parseFixture(t, fs, "04_etl_new")
+				err := m.Start(ctx, mig, backfill.NewConfig())
+				require.ErrorIs(t, err, roll.ErrWrongTarget)
+			})
+	})
+
+	t.Run("an undeclared migration is refused", func(t *testing.T) {
+		untagged := fstest.MapFS{
+			"01_untagged.json": &fstest.MapFile{Data: targetedMigration(t, "01_untagged", nil)},
+		}
+		testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+			[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("app")},
+			func(m *roll.Roll, _ *sql.DB) {
+				ctx := context.Background()
+
+				mig := parseFixture(t, untagged, "01_untagged")
+				err := m.Start(ctx, mig, backfill.NewConfig())
+				require.ErrorIs(t, err, roll.ErrTargetRequired)
+			})
+	})
+
+	t.Run("with no target every migration is accepted", func(t *testing.T) {
+		testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			mig := parseFixture(t, fs, "04_etl_new")
+			require.NoError(t, m.Start(ctx, mig, backfill.NewConfig()))
+		})
+	})
+}
+
+// TestStartSatisfiedDependencies exercises WithSatisfiedDependencies at Start
+// time, which is where a cross-target depends_on actually fails. Resolution
+// proves the set is computed; only this proves it is honoured.
+func TestStartSatisfiedDependencies(t *testing.T) {
+	t.Parallel()
+
+	dependent := &migrations.Migration{
+		Name:       "02_etl",
+		Targets:    []string{"etl"},
+		DependsOn:  []string{"01_app"},
+		Operations: migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
+	}
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+		[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("etl")},
+		func(m *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			// Without the excluded set, the dependency is simply missing.
+			err := m.Start(ctx, dependent, backfill.NewConfig())
+			require.ErrorIs(t, err, roll.ErrDependencyNotApplied)
+
+			// Declared excluded, it is satisfied by construction.
+			require.NoError(t, m.Start(ctx, dependent, backfill.NewConfig(),
+				roll.WithSatisfiedDependencies(map[string]struct{}{"01_app": {}})))
+		})
+}
+
+func names(migs []*migrations.RawMigration) []string {
+	out := make([]string, len(migs))
+	for i, m := range migs {
+		out[i] = m.Name
+	}
+	return out
+}
+
+func historyNames(history []state.HistoryEntry) []string {
+	out := make([]string, len(history))
+	for i, h := range history {
+		out[i] = h.Migration.Name
+	}
+	return out
+}
+
+func parseFixture(t *testing.T, fs fstest.MapFS, name string) *migrations.Migration {
+	t.Helper()
+	raw, err := migrations.ReadRawMigration(fs, name+".json")
+	require.NoError(t, err)
+	mig, err := migrations.ParseMigration(raw)
+	require.NoError(t, err)
+	return mig
+}
+
+func applyRaw(t *testing.T, ctx context.Context, m *roll.Roll, migs []*migrations.RawMigration) {
+	t.Helper()
+	for _, raw := range migs {
+		mig, err := migrations.ParseMigration(raw)
+		require.NoError(t, err)
+		require.NoError(t, m.Start(ctx, mig, backfill.NewConfig()))
+		require.NoError(t, m.Complete(ctx))
+	}
+}
+
+// TestInSyncWithNoSelectedMigrations pins the edge the targeted short-circuit
+// creates. Two cases, and they differ:
+//
+//   - empty database: status is "No migrations", so the status guard already
+//     answers false and the target logic never gets a say.
+//   - database with history but nothing on disk for this target: in_sync is
+//     true. Recorded deliberately rather than left as a side effect, because
+//     it is an unqualified yes — a caller gating a deploy on in_sync gets
+//     "converged" from a directory holding no migrations for it at all.
+func TestInSyncWithNoSelectedMigrations(t *testing.T) {
+	t.Parallel()
+
+	fs := fstest.MapFS{
+		"01_app_only.json": &fstest.MapFile{Data: targetedMigration(t, "01_app_only", []string{"app"})},
+	}
+
+	t.Run("empty database is not in sync", func(t *testing.T) {
+		testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
+			[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithTarget("etl")},
+			func(m *roll.Roll, _ *sql.DB) {
+				ctx := context.Background()
+
+				res, err := m.Plan(ctx, fs)
+				require.NoError(t, err)
+				require.Equal(t, 0, res.Apply.Count)
+				require.Nil(t, res.LocalLatest, "nothing on disk is selected by this target")
+				require.False(t, res.InSync, "an empty database is caught by the status guard")
+			})
+	})
+
+	t.Run("history present but nothing selected reports in sync", func(t *testing.T) {
+		testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+			func(seed *roll.Roll, connStr string, _ *sql.DB) {
+				ctx := context.Background()
+
+				applyAll(t, ctx, seed, fs, "01_app_only")
+
+				etl := testutils.NewMigratorForConnStr(t, connStr,
+					roll.WithLockTimeoutMs(500), roll.WithTarget("etl"))
+
+				res, err := etl.Plan(ctx, fs)
+				require.NoError(t, err)
+				require.Equal(t, 0, res.Apply.Count)
+				require.Equal(t, 0, res.Revert.Count)
 				require.True(t, res.InSync)
 			})
 	})

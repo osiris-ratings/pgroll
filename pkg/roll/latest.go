@@ -90,6 +90,15 @@ func latestMigrationLocal(dir fs.FS, target string) (*migrations.Migration, erro
 		if err != nil {
 			return nil, fmt.Errorf("reading migration file %q: %w", files[i], err)
 		}
+
+		// Same rule as resolveLocalSet, deliberately. An undeclared migration
+		// under a target must not be silently skipped here while it is a hard
+		// error there: that would make "untagged" mean two different things
+		// depending on which command you ran, and this path would answer
+		// "no migrations" for a directory full of them.
+		if target != "" && len(raw.Targets) == 0 {
+			return nil, TargetRequiredError(files[i], target, raw.Targets != nil)
+		}
 		if !raw.SelectedBy(target) {
 			continue
 		}

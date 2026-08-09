@@ -39,9 +39,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   databases a migration reaches, not what it does, so re-routing must not clear
   a re-application tombstone.
 
-  `pgroll check` gains two advisories — a dependency whose targets do not cover
-  the dependent's, and target names that differ only by case — plus hard errors
-  for a malformed `targets` list.
+  `--target` is honoured or refused everywhere, never silently ignored. `start`
+  refuses a migration whose `targets` exclude the active one — that path takes a
+  single file and never consults directory resolution, so without the guard
+  `pgroll start ./migrations/04_etl.yaml --target app` applied an ETL migration
+  to the application database and exited 0. `stamp` filters the directory form
+  (a history row makes its migration a non-candidate permanently, so an
+  unfiltered stamp is unrecoverable) and `baseline` carries the target into the
+  placeholder it writes. Commands with no migration set to filter — `pull`,
+  `validate`, `rollback`, `prune`, `update`, `convert` — reject the flag.
+
+  `pgroll check` gains `--require-targets`, so an undeclared migration fails at
+  review time rather than at the first targeted deploy, where it would take out
+  every target's leg at once. A `depends_on` that does not cover the dependent's
+  targets is now an **error**: it is the one shape where treating an excluded
+  dependency as satisfied can genuinely break a database, and as a warning it
+  merged green. Malformed `targets` lists are errors; target names differing
+  only by case remain advisory. Base-branch ordering only compares migrations
+  that share a target, since two targets releasing on independent cadences is
+  the steady state this feature creates and cross-target comparison demanded a
+  rebase that changes nothing.
+
+  `migrate --to` closes its bound under `depends_on`. Locating the target in the
+  full local sequence makes the bound a filename-order prefix, which — unlike
+  the topologically sorted slice it replaced — is not dependency-closed.
 
   **This is a one-way binary lockstep.** Migration files are decoded strictly,
   so any pgroll older than this release hard-rejects a file carrying `targets`,
@@ -56,22 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole history table, so an already-applied target read as "nothing to do"
   even when migrations before it were still pending. The target is now located
   in the full local sequence and bounds the run positionally.
-- `pgroll migrate` with `--use-version-schema=false` no longer misclassifies an
-  expand-only run as `INTERRUPTED` on the next invocation. `expandComplete`
-  required the active migration's version schema to exist, which that flag
-  guarantees never happens, so every re-run demanded `pgroll rollback` and the
-  idempotent-complete path was unreachable. The backfill marker is now the sole
-  discriminator when version schemas are disabled.
-- `pgroll complete` no longer drains a deferred queue it cannot prove belongs to
-  a finished batch. With `--use-version-schema=false` the "unfinished batch"
-  guard was skipped wholesale, so a `migrate` that died mid-train left queued
-  destructive completions that the next `complete` stamped sealed and executed —
-  firing the destructive half of a batch whose forward half never ran. It now
-  refuses and points at `pgroll migrate` or `pgroll revert`.
 - `pgroll latest schema --local` and `latest migration --local` honour
-  `--target`. Unfiltered, a directory whose newest file belongs to another
-  target would have an application fleet repinned to a version schema the
-  database never created.
+  `--target`, and raise the same missing-`targets` error the migrate path does
+  rather than silently skipping an undeclared file.
 
 ## [0.16.2-baselayer.19] - 2026-07-24
 

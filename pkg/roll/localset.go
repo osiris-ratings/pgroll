@@ -3,11 +3,26 @@
 package roll
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 
 	"github.com/xataio/pgroll/pkg/migrations"
 )
+
+// ErrTargetRequired is returned when a migration that a --target run would have
+// to consider carries no `targets` field. There is no default target and no
+// fail-open: a migration silently withheld from a database it should have
+// reached does not announce itself, and shows up later as replication quietly
+// dropping rows.
+//
+// Wrapped rather than formatted so callers — and tests — can branch on it with
+// errors.Is instead of matching on message text.
+var ErrTargetRequired = errors.New("migration declares no targets")
+
+// ErrWrongTarget is returned when a migration is applied directly — by name,
+// bypassing directory resolution — to a target its `targets` exclude.
+var ErrWrongTarget = errors.New("migration is not routed to this target")
 
 // localSet is the resolved view of a migrations directory for one run: every
 // post-baseline file, plus the subset the active target selects.
@@ -109,7 +124,7 @@ func resolveLocalSet(
 		}
 
 		if _, isApplied := applied[mig.Name]; !isApplied && len(mig.Targets) == 0 {
-			return nil, targetRequiredError(file, target, mig.Targets != nil)
+			return nil, TargetRequiredError(file, target, mig.Targets != nil)
 		}
 
 		if !mig.SelectedBy(target) {
@@ -132,15 +147,20 @@ func resolveLocalSet(
 	return set, nil
 }
 
-// targetRequiredError explains that an unapplied migration carries no routing
-// while a target is in effect. It names the file rather than the migration
-// because the fix is an edit to that file.
-func targetRequiredError(file, target string, declaredEmpty bool) error {
+// TargetRequiredError explains that a migration carries no routing while a
+// target is in effect. It names the file rather than the migration because the
+// fix is an edit to that file, and wraps ErrTargetRequired so callers and tests
+// can branch with errors.Is rather than matching message text.
+//
+// Exported so every site that has to apply the same rule — resolveLocalSet,
+// the local `latest` resolution, `check --require-targets` — produces one
+// error rather than three lookalikes.
+func TargetRequiredError(file, target string, declaredEmpty bool) error {
 	if declaredEmpty {
-		return fmt.Errorf("migration file %q declares an empty `targets` list; "+
-			"omit the field or name at least one target", file)
+		return fmt.Errorf("%w: migration file %q declares an empty `targets` list; "+
+			"omit the field or name at least one target", ErrTargetRequired, file)
 	}
-	return fmt.Errorf("migration file %q must declare `targets` (--target %q is in effect); "+
+	return fmt.Errorf("%w: migration file %q must declare `targets` (--target %q is in effect); "+
 		"name the target(s) this migration belongs to, for example `targets: [%s]`. "+
-		"There is no default target", file, target, target)
+		"There is no default target", ErrTargetRequired, file, target, target)
 }
