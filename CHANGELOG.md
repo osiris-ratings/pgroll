@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2-baselayer.21] - 2026-08-09
+
 ### Fixed
 
 - **`pgroll migrate`'s interrupted-run message named the wrong verb for a
