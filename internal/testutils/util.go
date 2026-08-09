@@ -35,10 +35,22 @@ var tConnStr string
 func SharedTestMain(m *testing.M, postRunHooks ...func() error) {
 	ctx := context.Background()
 
+	// The timeout is a ceiling, not a sleep: the wait returns the instant the
+	// log line appears, so a generous value costs nothing when the machine is
+	// idle and is the difference between green and red when it is not.
+	//
+	// Five seconds was too tight. `go test ./...` runs package binaries in
+	// parallel and eight packages start their own Postgres, so on a busy CI
+	// runner several containers pull and boot at once. Whichever one loses the
+	// race blows the budget and every test in that package fails with
+	// "database system is not yet accepting connections" — which reads like a
+	// test failure and is really a scheduling one. It showed up as unrelated
+	// packages (defaults, benchmarks, backfill) failing in different jobs of
+	// the same run.
 	waitForLogs := wait.
 		ForLog("database system is ready to accept connections").
 		WithOccurrence(2).
-		WithStartupTimeout(5 * time.Second)
+		WithStartupTimeout(60 * time.Second)
 
 	pgVersion := os.Getenv("POSTGRES_VERSION")
 	if pgVersion == "" {
