@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -202,13 +203,7 @@ func migrateCmd() *cobra.Command {
 					fmt.Printf("Migration %q completed\n", *latestMigration)
 					return nil
 				default:
-					return fmt.Errorf(
-						"migration %q is in progress and was not completed; "+
-							"this usually means a previous run was interrupted "+
-							"(e.g. lock_timeout under contention or SIGINT). "+
-							"Run `pgroll rollback` to clean up before retrying",
-						*latestMigration,
-					)
+					return fmt.Errorf("%s", interruptedMessage(ctx, m, *latestMigration))
 				}
 			}
 
@@ -382,11 +377,6 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		return "", fmt.Errorf("listing existing version schemas: %w", err)
 	}
 
-	stateLatestVersion, err := m.State().LatestVersion(ctx, m.Schema())
-	if err != nil {
-		return "", fmt.Errorf("reading state.LatestVersion: %w", err)
-	}
-
 	history, err := m.State().SchemaHistory(ctx, m.Schema())
 	if err != nil {
 		return "", fmt.Errorf("reading schema history: %w", err)
@@ -469,15 +459,35 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 	// are marked done=true without projecting a schema), so a mismatch
 	// is the signal that a prior batch ran past where deployment caught
 	// up to. That's a recovery run, not necessarily an error.
-	stateInSync := stateLatestVersion == nil
-	if stateLatestVersion != nil {
-		want := prefix + *stateLatestVersion
-		for _, s := range liveSchemas {
-			if s == want {
-				stateInSync = true
-				break
-			}
+	// Is the history leaf's projection actually deployed?
+	//
+	// This used to compare state.LatestVersion against liveSchemas, which
+	// could never disagree and so made RECOVERY unreachable: LatestVersion
+	// resolves through find_version_schema, whose own WHERE clause requires
+	// the schema to exist in information_schema.schemata, and liveSchemas is
+	// the same set matched with a broader LIKE. The wanted value was in the
+	// live set by construction, `stateInSync` was always true, and
+	// classifyCycle never reached its default branch. The unit test passed
+	// `stateInSync: false` straight into the pure function, so the branch
+	// stayed green while being dead.
+	//
+	// The condition worth reporting is the one the warning already describes:
+	// history has advanced to a migration whose version schema is not
+	// deployed — a projection that was dropped, or never created — which is
+	// exactly what `pgroll materialize` exists to repair. Compare the LEAF's
+	// schema, which find_version_schema deliberately skips past.
+	//
+	// Trivially in sync when version schemas are disabled: there is no
+	// projection to be missing.
+	stateInSync := true
+	if m.UseVersionSchema() && len(history) > 0 {
+		leaf := history[len(history)-1].Migration
+		leafVersion := leaf.VersionSchema
+		if leafVersion == "" {
+			leafVersion = leaf.Name
 		}
+		want := prefix + leafVersion
+		stateInSync = slices.Contains(liveSchemas, want)
 	}
 
 	state := classifyCycle(activePeriod, otherBackends, remainingCount, appliedCount, stateInSync, expandComplete)
@@ -618,11 +628,16 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 		applies(names)
 
-		if state == cycleRecovery && stateLatestVersion != nil {
+		if state == cycleRecovery && len(history) > 0 {
+			leaf := history[len(history)-1].Migration
+			leafVersion := leaf.VersionSchema
+			if leafVersion == "" {
+				leafVersion = leaf.Name
+			}
 			fmt.Fprintln(out)
-			fmt.Fprintf(out, "    %s pgroll state advanced to %s — ahead of the live schema.\n",
-				pterm.FgYellow.Sprint("⚠"), *stateLatestVersion)
-			fmt.Fprintln(out, pterm.FgYellow.Sprint("    A previous migrate completed migrations whose schema was never deployed."))
+			fmt.Fprintf(out, "    %s history is at %s, but %s is not deployed.\n",
+				pterm.FgYellow.Sprint("⚠"), leaf.Name, prefix+leafVersion)
+			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Its projection was dropped or never created; `pgroll materialize` rebuilds it."))
 		}
 	}
 
@@ -677,4 +692,74 @@ func parseMigrations(migs []*migrations.RawMigration) ([]*migrations.Migration, 
 		return nil, fmt.Errorf("incompatible migration(s): %w", errs)
 	}
 	return parsedMigrations, nil
+}
+
+// interruptedMessage explains a genuinely interrupted run and — crucially —
+// which verb actually cleans it up.
+//
+// `pgroll rollback` undoes the *one* active migration and deletes its row. In
+// a batch that is almost never the whole story: `pgroll migrate` applies a
+// train, so a run that died on the third of five leaves the first two applied,
+// unsealed, and carrying queued contraction. Telling the operator to run
+// `rollback` there hands them a partial cleanup and says nothing about the
+// remainder — which is the worst time to be imprecise, because they are
+// mid-incident and about to retry.
+//
+// So name both verbs and say what each covers, and count the already-applied
+// migrations rather than describing them in the abstract. The count comes from
+// the unsealed set: everything this deployment has applied and not yet
+// contracted, minus the active migration itself.
+func interruptedMessage(ctx context.Context, m *roll.Roll, active string) string {
+	base := fmt.Sprintf(
+		"migration %q is in progress and was not completed; "+
+			"this usually means a previous run was interrupted "+
+			"(e.g. lock_timeout under contention or SIGINT).",
+		active,
+	)
+
+	// Best effort: if the count cannot be read, fall back to naming both verbs
+	// without it rather than failing the error path. The unsealed set is
+	// everything this deployment has applied and not yet contracted, so
+	// excluding the active migration leaves exactly the ones `rollback` would
+	// walk past.
+	applied, counted := 0, false
+	if unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema()); err == nil {
+		counted = true
+		for _, rec := range unsealed {
+			if rec.Name != active {
+				applied++
+			}
+		}
+	}
+
+	switch {
+	case counted && applied > 0:
+		return fmt.Sprintf(
+			"%s\n\n"+
+				"  This deployment has already applied %d other migration(s) that are not yet\n"+
+				"  contracted, so the two cleanup verbs differ:\n\n"+
+				"    pgroll rollback   undoes ONLY %q, leaving the other %d applied\n"+
+				"    pgroll revert     walks the whole uncontracted window back\n\n"+
+				"  Re-running `pgroll migrate` also resumes from where it stopped, which is\n"+
+				"  usually what you want after a transient failure.",
+			base, applied, active, applied,
+		)
+	case counted:
+		return fmt.Sprintf(
+			"%s\n\n"+
+				"  Nothing else is applied-but-uncontracted, so `pgroll rollback` cleans this\n"+
+				"  up completely. Re-running `pgroll migrate` also resumes from where it\n"+
+				"  stopped, which is usually what you want after a transient failure.",
+			base,
+		)
+	default:
+		return fmt.Sprintf(
+			"%s\n\n"+
+				"  Run `pgroll rollback` to undo this migration, or `pgroll revert` to walk\n"+
+				"  back the whole uncontracted window if earlier migrations in the same batch\n"+
+				"  were already applied. Re-running `pgroll migrate` resumes from where it\n"+
+				"  stopped.",
+			base,
+		)
+	}
 }
