@@ -338,3 +338,46 @@ func TestStampEmptyInputIsNoop(t *testing.T) {
 		assert.Equal(t, 0, count, "empty stamp must not insert any rows")
 	})
 }
+
+func TestStampRecordsBaselineMarkedFileAsBaseline(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+
+		// The dump-restore recovery flow against a truncated directory: the
+		// first file is the marked baseline. Whatever --type the caller
+		// passes, it must be recorded as a baseline or the chain is left
+		// unanchored and the next reconciliation fails on every deleted
+		// pre-baseline file.
+		base := rawMig(t, "01_base", migrations.Operations{createTableOp("widgets")})
+		base.Baseline = true
+		next := rawMig(t, "02_next", migrations.Operations{createTableOp("gadgets")})
+
+		execNoInferred(
+			t, ctx, db,
+			"CREATE TABLE widgets(id integer PRIMARY KEY, name varchar(255))",
+			"CREATE TABLE gadgets(id integer PRIMARY KEY, name varchar(255))",
+		)
+
+		stamped, err := m.Stamp(ctx, []*migrations.RawMigration{base, next}, roll.MigrationTypePgroll)
+		require.NoError(t, err)
+		require.Equal(t, []string{"01_base", "02_next"}, stamped)
+
+		types := map[string]string{}
+		rows, err := db.QueryContext(ctx,
+			"SELECT name, migration_type FROM pgroll.migrations WHERE schema = $1", cSchema)
+		require.NoError(t, err)
+		defer rows.Close()
+		for rows.Next() {
+			var name, typ string
+			require.NoError(t, rows.Scan(&name, &typ))
+			types[name] = typ
+		}
+		require.NoError(t, rows.Err())
+
+		assert.Equal(t, "baseline", types["01_base"],
+			"a `baseline: true` file must be stamped as a baseline regardless of --type")
+		assert.Equal(t, "pgroll", types["02_next"])
+	})
+}

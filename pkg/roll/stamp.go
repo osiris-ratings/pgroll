@@ -114,12 +114,22 @@ func (m *Roll) Stamp(
 		if i == len(todo)-1 {
 			resulting = leafSchemaJSON
 		}
+		// A file marked `baseline: true` IS a baseline, whatever --type the
+		// caller passed: recording it as an ordinary migration would leave
+		// the chain unanchored, and the next directory reconciliation would
+		// hard-fail on every pre-baseline file missing from disk. This is
+		// what keeps the dump-restore recovery flow (load dump → stamp the
+		// directory) correct against a truncated migrations directory.
+		typ := migrationType
+		if p.raw.Baseline {
+			typ = MigrationTypeBaseline
+		}
 		if err := m.state.Stamp(
-			ctx, m.schema, p.raw.Name, p.body, resulting, parent, migrationType,
+			ctx, m.schema, p.raw.Name, p.body, resulting, parent, typ,
 		); err != nil {
 			return stamped, err
 		}
-		m.logger.Info("stamped migration", "name", p.raw.Name, "type", migrationType)
+		m.logger.Info("stamped migration", "name", p.raw.Name, "type", typ)
 		stamped = append(stamped, p.raw.Name)
 		name := p.raw.Name
 		parent = &name

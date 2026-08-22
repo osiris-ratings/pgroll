@@ -373,3 +373,27 @@ func TestTargetsRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestBaselineMarkerRoundTrip covers the same path as TestTargetsRoundTrip:
+// without Baseline on both RawMigration and Migration, ParseMigration drops
+// the marker and `pgroll update` rewrites the baseline file as an ordinary
+// migration — un-anchoring the whole directory.
+func TestBaselineMarkerRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, ext := range []string{"json", "yaml"} {
+		t.Run(ext, func(t *testing.T) {
+			body := `{"baseline":true,"irreversible":true,"operations":[{"sql":{"up":"SELECT 1"}}]}`
+			fsys := fstest.MapFS{"01_m." + ext: &fstest.MapFile{Data: []byte(body)}}
+
+			raw, err := migrations.ReadRawMigration(fsys, "01_m."+ext)
+			require.NoError(t, err)
+			require.True(t, raw.Baseline)
+
+			parsed, err := migrations.ParseMigration(raw)
+			require.NoError(t, err)
+			require.True(t, parsed.Baseline,
+				"ParseMigration must carry the baseline marker, or pgroll update strips it")
+		})
+	}
+}

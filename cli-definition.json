@@ -314,6 +314,29 @@
       ]
     },
     {
+      "name": "rebaseline",
+      "short": "Adopt the directory's marked baseline by converting its applied row in place",
+      "use": "rebaseline <directory>",
+      "example": "rebaseline ./migrations",
+      "flags": [
+        {
+          "name": "check",
+          "description": "Report whether a conversion is pending without writing anything (exit 3 when pending)",
+          "default": "false"
+        },
+        {
+          "name": "yes",
+          "shorthand": "y",
+          "description": "Skip confirmation prompt",
+          "default": "false"
+        }
+      ],
+      "subcommands": [],
+      "args": [
+        "directory"
+      ]
+    },
+    {
       "name": "revert",
       "short": "Revert migrations, restoring an earlier point in the migration chain",
       "use": "revert",

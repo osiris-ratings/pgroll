@@ -91,6 +91,10 @@ func checkTargets(result *CheckResult, file string, raw *migrations.RawMigration
 //   - Advisory: raw SQL operations without preconditions
 //   - Reversibility: ops that need a 'down' expression have one, unless the
 //     migration is marked 'irreversible: true'
+//   - Baseline marker: at most one file declares `baseline: true`, it is the
+//     lexicographically first migration in the directory, and it is marked
+//     'irreversible: true'. Advisory: a filename containing "baseline" that
+//     lacks the marker
 //
 // It validates the directory as a corpus. It never
 // filters by target: a migration routed away from the caller's target is still
@@ -273,7 +277,56 @@ func CheckMigrationsDir(dir fs.FS, requireTargets bool) (*CheckResult, error) {
 		}
 	}
 
+	parsedFiles := make([]string, len(parsed))
+	for i, p := range parsed {
+		parsedFiles[i] = p.file
+	}
+	checkBaselineMarker(result, files, parsedFiles, rawMigs)
+
 	return result, nil
+}
+
+// checkBaselineMarker enforces the `baseline: true` rules on a directory.
+// A marked file is the anchor everything else reconciles against — both
+// resolveLocalSet's name cut and `pgroll rebaseline`'s in-place conversion
+// assume it sorts first — so a marker anywhere else in the directory is an
+// authoring error, not a preference. files is every migration file in
+// directory order; parsedFiles/parsedRaws are the subset that parsed, aligned
+// by index.
+func checkBaselineMarker(result *CheckResult, files, parsedFiles []string, parsedRaws []*migrations.RawMigration) {
+	var marked []string
+	for i, raw := range parsedRaws {
+		file := parsedFiles[i]
+		name := strings.ToLower(migrations.MigrationNameFromFile(file))
+		if !raw.Baseline {
+			if strings.Contains(name, "baseline") {
+				result.addWarning(file,
+					"filename suggests a baseline but the file does not declare `baseline: true`; "+
+						"pgroll identifies baselines by the marker, not the filename")
+			}
+			continue
+		}
+		marked = append(marked, file)
+
+		if len(files) > 0 && file != files[0] {
+			result.addError(file, fmt.Sprintf(
+				"declares `baseline: true` but is not the first migration in the directory (%q sorts before it); "+
+					"a baseline anchors the chain, so every other migration must sort after it", files[0],
+			))
+		}
+		if !raw.Irreversible {
+			result.addError(file,
+				"declares `baseline: true` but not `irreversible: true`; a baseline is a schema snapshot "+
+					"with nothing behind it to revert to, so it must be marked irreversible")
+		}
+	}
+
+	if len(marked) > 1 {
+		result.addError("", fmt.Sprintf(
+			"%d files declare `baseline: true` (%v); a directory has at most one baseline",
+			len(marked), marked,
+		))
+	}
 }
 
 // hasRawSQLOps checks if the operations JSON contains any raw SQL operations.

@@ -76,6 +76,20 @@ func runMigrationFromFile(ctx context.Context, m *roll.Roll, fileName string, co
 		return err
 	}
 
+	// Same guard as `pgroll migrate`: a `baseline: true` file is a schema
+	// snapshot, and executing it into a database with existing history is
+	// the truncated-history trap. A fresh database (no history) may
+	// bootstrap by executing it.
+	if migration.Baseline {
+		latest, err := m.State().LatestMigration(ctx, m.Schema())
+		if err != nil {
+			return fmt.Errorf("unable to determine latest migration: %w", err)
+		}
+		if latest != nil {
+			return roll.BaselineExecutionRefusedError(migration.Name)
+		}
+	}
+
 	return runMigration(ctx, m, migration, complete, c)
 }
 

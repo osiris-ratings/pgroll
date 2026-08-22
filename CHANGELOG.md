@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pgroll rebaseline`** — adopt a truncated migrations directory by
+  converting the directory's marked baseline **in place** on databases that
+  already applied it as an ordinary migration: `UPDATE migration_type =
+  'baseline'`, nothing else. The row keeps its original `created_at`, so the
+  baseline lands exactly where the migration was applied — history at or
+  before it is hidden, not deleted. This is the piece history truncation was
+  missing: a *fresh* baseline row (`pgroll baseline`, `pgroll stamp`) is
+  stamped `CURRENT_TIMESTAMP`, lands at the chain tip, and would hide the
+  entire history — making every retained migration look unapplied and
+  eligible for catastrophic re-application.
+
+  Idempotent and safe to run unconditionally before `pgroll plan` /
+  `pgroll migrate`: already-converted databases, databases whose baseline is
+  newer than the directory's (an old checkout), and databases with no history
+  at all are no-ops. A database missing the anchor row entirely is a hard
+  error (exit 2) with the remedy spelled out — catch up from a pre-truncation
+  checkout or rebuild. `--check` reports a pending conversion (exit 3)
+  without writing.
+
+  The conversion refuses unless history is safely shaped: the anchor is done,
+  sealed and contracted; nothing is in progress; nothing at or below the
+  anchor is unsealed or awaiting a deferred complete; no later baseline
+  exists; and **filename order agrees with apply order across the anchor
+  boundary** — the created_at cut (`SchemaHistory`) and the name cut
+  (`resolveLocalSet`) must select the same set, or migrate would re-apply
+  hidden migrations or fail on false-missing files. Inferred rows are exempt
+  from the order audit; they never correspond to files.
+
+- **`baseline: true` migration-file marker.** A directory's baseline is now
+  identified by the format, not by filename convention. `pgroll check`
+  enforces: at most one marked file, it must sort first in the directory, and
+  it must be `irreversible: true`; a filename containing "baseline" without
+  the marker draws an advisory. `pgroll rebaseline` discovers its anchor by
+  the marker, and `pgroll stamp` records a marked file as a baseline row
+  regardless of `--type` (keeping dump-restore recovery correct against a
+  truncated directory).
+
+- **Baseline execute-guard.** `pgroll migrate` and `pgroll start` refuse to
+  *execute* a marked baseline into a database that has migration history — a
+  baseline is a schema snapshot, and executing one replays the entire schema.
+  This closes the trap where a database missing the anchor row would treat
+  the baseline file as an ordinary unapplied migration. A completely fresh
+  database (no history) may still bootstrap by executing it.
+
 ## [0.16.2-baselayer.21] - 2026-08-09
 
 ### Fixed

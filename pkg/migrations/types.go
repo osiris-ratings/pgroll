@@ -483,6 +483,14 @@ type OpSetReplicaIdentity struct {
 
 // PgRoll migration definition
 type PgRollMigration struct {
+	// Marks this file as the directory's baseline: a schema snapshot that anchors the
+	// migration chain rather than a change to run. pgroll migrate/start refuse to
+	// execute a marked migration into a database with existing history; it is applied
+	// by baseline/stamp on fresh databases or adopted in place by pgroll rebaseline.
+	// Must be lexicographically first in the directory and declare irreversible:
+	// true.
+	Baseline bool `json:"baseline,omitempty"`
+
 	// List of migration names that must be applied before this migration. Creates
 	// explicit ordering constraints for migrations that are not commutative.
 	DependsOn []string `json:"depends_on,omitempty"`
