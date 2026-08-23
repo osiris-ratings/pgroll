@@ -153,6 +153,21 @@ func migrateCmd() *cobra.Command {
 				rawMigs = bounded
 			}
 
+			// A migration marked `baseline: true` is a schema snapshot, not a
+			// change to run. On a database with existing history it can only
+			// reach the apply list when its anchor row is missing or hidden —
+			// the truncated-history trap, where executing it would replay the
+			// entire schema — so refuse before doing any work. On a fresh
+			// database (no history at all) executing the baseline is a
+			// legitimate bootstrap and is allowed through.
+			if latest, err := m.State().LatestMigration(ctx, m.Schema()); err != nil {
+				return fmt.Errorf("unable to determine latest migration: %w", err)
+			} else if latest != nil {
+				if err := roll.RefuseBaselineExecution(rawMigs); err != nil {
+					return err
+				}
+			}
+
 			// Pre-flight summary: print the deployment state and the plan for
 			// this run before doing any work. This is the single point where
 			// operators can verify pgroll's state matches their understanding

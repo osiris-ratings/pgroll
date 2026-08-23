@@ -92,6 +92,10 @@ type (
 		DependsOn     []string       `json:"depends_on,omitempty"`
 		Preconditions []Precondition `json:"preconditions,omitempty"`
 		Irreversible  bool           `json:"irreversible,omitempty"`
+		// Baseline mirrors RawMigration.Baseline. It marshals so that the
+		// round-trip through ParseMigration and MigrationWriter preserves
+		// the marker, for the same reason Targets does.
+		Baseline bool `json:"baseline,omitempty"`
 		// Targets mirrors RawMigration.Targets. It marshals so that the
 		// round-trip through ParseMigration and MigrationWriter preserves
 		// routing — without it `pgroll update` would strip `targets` out of
@@ -112,6 +116,16 @@ type (
 		DependsOn     []string        `json:"depends_on,omitempty"`
 		Preconditions []Precondition  `json:"preconditions,omitempty"`
 		Irreversible  bool            `json:"irreversible,omitempty"`
+		// Baseline marks this file as the directory's baseline: a schema
+		// snapshot that anchors the migration chain rather than a change to
+		// run. `pgroll migrate` and `pgroll start` refuse to execute a marked
+		// migration into a database with existing history — a baseline is
+		// applied by `pgroll baseline`/`pgroll stamp` on fresh databases, or
+		// adopted in place by `pgroll rebaseline` on databases that already
+		// applied it as an ordinary migration before history was truncated.
+		// `pgroll check` requires a marked file to be lexicographically first
+		// in its directory and to declare `irreversible: true`.
+		Baseline bool `json:"baseline,omitempty"`
 		// Targets names the deployment targets this migration belongs to.
 		//
 		// Free-form by design: pgroll assigns no meaning to the values and

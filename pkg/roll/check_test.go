@@ -400,3 +400,76 @@ func TestCheckTargets(t *testing.T) {
 		require.True(t, found, "expected a case-variant warning, got %v", res.Warnings)
 	})
 }
+
+func TestCheckBaselineMarkerRules(t *testing.T) {
+	t.Parallel()
+
+	// A marked baseline as the truncation workflow writes it: first in the
+	// directory, irreversible, raw-SQL snapshot.
+	markedBaseline := []byte(`{"baseline": true, "irreversible": true, "operations": [{"sql": {"up": "SELECT 1"}}]}`)
+	// Marked but reversible: operations alone pass reversibility, so only the
+	// baseline-specific irreversible rule fires.
+	markedReversible := []byte(`{"baseline": true, "operations": [{"sql": {"up": "SELECT 1", "down": "SELECT 1"}}]}`)
+
+	t.Run("a first, irreversible marked baseline passes", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_base.json": &fstest.MapFile{Data: markedBaseline},
+			"02_next.json": &fstest.MapFile{Data: validMigrationJSON(t)},
+		}, false)
+		require.NoError(t, err)
+		assert.Empty(t, res.Errors)
+	})
+
+	t.Run("a marked baseline that is not first is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_first.json": &fstest.MapFile{Data: validMigrationJSON(t)},
+			"02_base.json":  &fstest.MapFile{Data: markedBaseline},
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		assert.Contains(t, res.Errors[0].Message, "not the first migration")
+		assert.Equal(t, "02_base.json", res.Errors[0].File)
+	})
+
+	t.Run("a marked baseline that is not irreversible is an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_base.json": &fstest.MapFile{Data: markedReversible},
+			"02_next.json": &fstest.MapFile{Data: validMigrationJSON(t)},
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		assert.Contains(t, res.Errors[0].Message, "irreversible")
+	})
+
+	t.Run("two marked baselines are an error", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_base.json":  &fstest.MapFile{Data: markedBaseline},
+			"02_other.json": &fstest.MapFile{Data: markedBaseline},
+		}, false)
+		require.NoError(t, err)
+		require.True(t, res.HasErrors())
+		var found bool
+		for _, e := range res.Errors {
+			if strings.Contains(e.Message, "at most one baseline") {
+				found = true
+			}
+		}
+		assert.True(t, found, "expected a multiple-baseline error, got %v", res.Errors)
+	})
+
+	t.Run("a baseline-named file without the marker is a warning", func(t *testing.T) {
+		res, err := CheckMigrationsDir(fstest.MapFS{
+			"01_baseline.json": &fstest.MapFile{Data: validMigrationJSON(t)},
+			"02_next.json":     &fstest.MapFile{Data: validMigrationJSON(t)},
+		}, false)
+		require.NoError(t, err)
+		assert.Empty(t, res.Errors)
+		var found bool
+		for _, w := range res.Warnings {
+			if strings.Contains(w.Message, "does not declare `baseline: true`") {
+				found = true
+			}
+		}
+		assert.True(t, found, "expected an unmarked-baseline warning, got %v", res.Warnings)
+	})
+}

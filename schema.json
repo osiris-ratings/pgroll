@@ -1356,6 +1356,11 @@
           "type": "boolean",
           "default": false
         },
+        "baseline": {
+          "description": "Marks this file as the directory's baseline: a schema snapshot that anchors the migration chain rather than a change to run. pgroll migrate/start refuse to execute a marked migration into a database with existing history; it is applied by baseline/stamp on fresh databases or adopted in place by pgroll rebaseline. Must be lexicographically first in the directory and declare irreversible: true.",
+          "type": "boolean",
+          "default": false
+        },
         "targets": {
           "description": "Deployment targets this migration belongs to. Free-form names, compared verbatim against pgroll's --target flag; pgroll assigns them no meaning of its own. When --target is not given the field is ignored and every migration applies, which is single-database mode. When --target is given, a migration that is still unapplied must declare this field.",
           "type": "array",
