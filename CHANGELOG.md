@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Inferred migrations.** `pgroll init` no longer installs the
+  `pg_roll_handle_ddl` / `pg_roll_handle_drop` event triggers or the
+  `raw_migration()` function behind them, and `init` drops all three from any
+  database that still carries them. DDL run outside of `pgroll` is no longer
+  recorded as a `migration_type='inferred'` row.
+
+  The feature's only opt-out was the session GUC
+  `pgroll.no_inferred_migrations`, read with `missing_ok` — so *unset meant
+  capture*, and suppressing it was a standing obligation on every connection
+  and every transaction (`SET LOCAL` is transaction-scoped) rather than a
+  one-time act. In exchange for a history nobody consulted, it charged every
+  client a schema-wide JSON encode per DDL statement, and a single captured
+  statement — a deploy wrapper's own `DROP INDEX`, say — wedged both `pgroll
+  migrate` planning and `pgroll revert` on a database that was otherwise
+  perfectly in sync.
+
+  `pgroll` no longer requires superuser on a fresh database: creating those
+  event triggers was the only operation that needed it. The one-time cleanup
+  of pre-existing triggers still needs their owner, and warns rather than
+  failing when the connected role is not it.
+
+### Changed
+
+- `State.SchemaHistory` now excludes `inferred` rows, so history captured by an
+  earlier `pgroll` stops wedging `migrate`, `plan`, `materialize` and `pull` as
+  soon as the binary is upgraded — no deletion, and the parent chain is left
+  intact. `State.SchemaHistoryWithInferred` is the unfiltered variant, used by
+  revert planning, which must be able to *see* an out-of-band schema change in
+  order to refuse to invert around it. `pgroll prune` still removes the rows
+  for real, and the `migration_type` CHECK constraint still accepts
+  `'inferred'` so existing rows stay valid.
+
+- `HasExistingSchemaWithoutHistory` no longer counts inferred rows. A schema
+  whose only history is captured DDL has never been through `pgroll` and still
+  needs `pgroll baseline`; previously a single stray row suppressed that
+  prompt. Note the consequence: starting a migration against a pre-existing
+  schema now correctly reports `baseline required` where DDL capture used to
+  mask it.
+
 ## [0.16.2-baselayer.22] - 2026-08-23
 
 ### Added

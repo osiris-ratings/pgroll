@@ -115,9 +115,8 @@ func TestLatestAndPreviousMigrationMethods(t *testing.T) {
 			err = m.Complete(ctx)
 			require.NoError(t, err)
 
-			// Execute a SQL DDL statement to generate an inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE table1(id int)")
-			require.NoError(t, err)
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, m.State(), "public", legacyInferredName, "CREATE TABLE table1(id int)")
 
 			// Get the latest migration name
 			latest, err := m.State().LatestMigration(ctx, "public")
@@ -127,9 +126,10 @@ func TestLatestAndPreviousMigrationMethods(t *testing.T) {
 			previous, err := m.State().PreviousMigration(ctx, "public")
 			require.NoError(t, err)
 
-			// We have latest and previous migration names
+			// We have latest and previous migration names. The inferred row is
+			// still a member of the parent chain, so it is still the leaf.
 			require.NotNil(t, latest)
-			require.Regexp(t, `01_initial_migration_\d{20}$`, *latest)
+			require.Equal(t, legacyInferredName, *latest)
 			require.NotNil(t, previous)
 			require.Equal(t, "01_initial_migration", *previous)
 		})
@@ -162,9 +162,8 @@ func TestLatestAndPreviousVersionMethods(t *testing.T) {
 		testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
 			ctx := context.Background()
 
-			// Apply an inferred migration
-			_, err := db.ExecContext(ctx, "CREATE TABLE apples(id int)")
-			require.NoError(t, err)
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, m.State(), "public", "00000_initial_20260101120000000001", "CREATE TABLE apples(id int)")
 
 			// Get the latest version schema name
 			latest, err := m.State().LatestVersion(ctx, "public")
@@ -302,9 +301,8 @@ func TestLatestAndPreviousVersionMethods(t *testing.T) {
 			err = m.Complete(ctx)
 			require.NoError(t, err)
 
-			// Execute a SQL DDL statement to generate an inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE table1(id int)")
-			require.NoError(t, err)
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, m.State(), "public", legacyInferredName, "CREATE TABLE table1(id int)")
 
 			// Get the latest version schema name
 			latest, err := m.State().LatestVersion(ctx, "public")
@@ -336,9 +334,8 @@ func TestLatestAndPreviousVersionMethods(t *testing.T) {
 			err = m.Complete(ctx)
 			require.NoError(t, err)
 
-			// Execute a SQL DDL statement to generate an inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE table1(id int)")
-			require.NoError(t, err)
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, m.State(), "public", legacyInferredName, "CREATE TABLE table1(id int)")
 
 			// Start but do not complete a pgroll migration
 			err = m.Start(ctx, &migrations.Migration{

@@ -9,15 +9,13 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xataio/pgroll/internal/testutils"
-	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/migrations"
-	"github.com/xataio/pgroll/pkg/roll"
 	"github.com/xataio/pgroll/pkg/schema"
 	"github.com/xataio/pgroll/pkg/state"
 )
@@ -61,323 +59,97 @@ func TestSchemaOptionIsRespected(t *testing.T) {
 	})
 }
 
-func TestInferredMigration(t *testing.T) {
+func TestInitDoesNotInstallDDLCaptureTriggers(t *testing.T) {
 	t.Parallel()
 
-	testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
+	testutils.WithStateAndConnectionToContainer(t, func(st *state.State, db *sql.DB) {
 		ctx := context.Background()
 
-		tests := []struct {
-			name           string
-			sqlStmts       []string
-			wantMigrations []migrations.Migration
-		}{
-			{
-				name:     "create table",
-				sqlStmts: []string{"CREATE TABLE public.table1 (id int)"},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE public.table1 (id int)"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop table",
-				sqlStmts: []string{
-					"CREATE TABLE table1 (id int)",
-					"DROP TABLE table1",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE table1 (id int)"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "DROP TABLE table1"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop column",
-				sqlStmts: []string{
-					"CREATE TABLE table1 (id int, b text)",
-					"ALTER TABLE table1 DROP COLUMN b",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE table1 (id int, b text)"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "ALTER TABLE table1 DROP COLUMN b"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop check constraint",
-				sqlStmts: []string{
-					"CREATE TABLE table1 (id int, age integer, CONSTRAINT check_age CHECK (age > 0))",
-					"ALTER TABLE table1 DROP CONSTRAINT check_age",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE table1 (id int, age integer, CONSTRAINT check_age CHECK (age > 0))"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "ALTER TABLE table1 DROP CONSTRAINT check_age"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop unique constraint",
-				sqlStmts: []string{
-					"CREATE TABLE table1 (id int, b text, CONSTRAINT unique_b UNIQUE(b))",
-					"ALTER TABLE table1 DROP CONSTRAINT unique_b",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE table1 (id int, b text, CONSTRAINT unique_b UNIQUE(b))"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "ALTER TABLE table1 DROP CONSTRAINT unique_b"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop index",
-				sqlStmts: []string{
-					"CREATE TABLE table1 (id int, b text)",
-					"CREATE INDEX idx_b ON table1(b)",
-					"DROP INDEX idx_b",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE TABLE table1 (id int, b text)"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE INDEX idx_b ON table1(b)"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "DROP INDEX idx_b"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop function",
-				sqlStmts: []string{
-					"CREATE FUNCTION foo() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql",
-					"DROP FUNCTION foo",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE FUNCTION foo() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "DROP FUNCTION foo"},
-						},
-					},
-				},
-			},
-			{
-				name: "create/drop schema",
-				sqlStmts: []string{
-					"CREATE SCHEMA foo",
-					"DROP SCHEMA foo",
-				},
-				wantMigrations: []migrations.Migration{
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "CREATE SCHEMA foo"},
-						},
-					},
-					{
-						Operations: migrations.Operations{
-							&migrations.OpRawSQL{Up: "DROP SCHEMA foo"},
-						},
-					},
-				},
-			},
-		}
+		var triggers int
+		err := db.QueryRowContext(ctx,
+			"SELECT count(*) FROM pg_catalog.pg_event_trigger WHERE evtname LIKE 'pg_roll_%'").
+			Scan(&triggers)
+		require.NoError(t, err)
+		assert.Equal(t, 0, triggers, "pgroll must not install DDL-capture event triggers")
 
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				if _, err := db.ExecContext(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
-					t.Fatal(err)
-				}
-
-				if _, err := db.ExecContext(ctx, fmt.Sprintf("TRUNCATE %s.migrations", state.Schema())); err != nil {
-					t.Fatal(err)
-				}
-
-				for _, stmt := range tt.sqlStmts {
-					if _, err := db.ExecContext(ctx, stmt); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				rows, err := db.QueryContext(ctx,
-					fmt.Sprintf("SELECT migration FROM %s.migrations ORDER BY created_at ASC", state.Schema()))
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				var gotMigrations []migrations.Migration
-				for rows.Next() {
-					var migrationStr []byte
-					if err := rows.Scan(&migrationStr); err != nil {
-						t.Fatal(err)
-					}
-					var gotMigration migrations.Migration
-					if err := json.Unmarshal(migrationStr, &gotMigration); err != nil {
-						t.Fatal(err)
-					}
-					gotMigrations = append(gotMigrations, gotMigration)
-				}
-				assert.NoError(t, rows.Err())
-
-				assert.Equal(t, len(tt.wantMigrations), len(gotMigrations), "unexpected number of migrations")
-
-				for i, wantMigration := range tt.wantMigrations {
-					gotMigration := gotMigrations[i]
-
-					// Ensure that the operations are equal; we don't care about the
-					// randomly generated `VersionSchema` field for the migration.
-					assert.Equal(t, wantMigration.Operations, gotMigration.Operations)
-				}
-			})
-		}
+		var fns int
+		err = db.QueryRowContext(ctx,
+			`SELECT count(*) FROM pg_catalog.pg_proc p
+			 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+			 WHERE n.nspname = $1 AND p.proname = 'raw_migration'`, st.Schema()).
+			Scan(&fns)
+		require.NoError(t, err)
+		assert.Equal(t, 0, fns, "the DDL-capture function must not exist")
 	})
 }
 
-func TestInferredMigrationsHaveExpectedNamesAndVersionSchema(t *testing.T) {
+func TestOutOfBandDDLIsNotRecordedInHistory(t *testing.T) {
 	t.Parallel()
 
-	t.Run("an inferred migration first in the history", func(t *testing.T) {
-		testutils.WithStateAndConnectionToContainer(t, func(st *state.State, db *sql.DB) {
-			ctx := context.Background()
+	testutils.WithStateAndConnectionToContainer(t, func(st *state.State, db *sql.DB) {
+		ctx := context.Background()
 
-			// Execute a SQL DDL statement
-			_, err := db.ExecContext(ctx, "CREATE TABLE table1(id int)")
-			require.NoError(t, err)
+		// DDL run outside pgroll, on a connection that sets no guard at all.
+		_, err := db.ExecContext(ctx, "CREATE TABLE public.table1 (id int)")
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, "DROP TABLE public.table1")
+		require.NoError(t, err)
 
-			// Get the migration history
-			history, err := st.SchemaHistory(ctx, "public")
-			require.NoError(t, err)
+		var rows int
+		err = db.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT count(*) FROM %s.migrations", pq.QuoteIdentifier(st.Schema()))).
+			Scan(&rows)
+		require.NoError(t, err)
+		assert.Equal(t, 0, rows, "out-of-band DDL must not be recorded as a migration")
 
-			// Assert that the history contains one migration with the expected name
-			require.Len(t, history, 1)
-			require.Regexp(t, `^00000_initial_\d{20}$`, history[0].Migration.Name)
-			// Assert that the VersionSchema field matches the expected format
-			require.Regexp(t, "^sql_[0-9a-f]{8}", history[0].Migration.VersionSchema)
-		})
-	})
-
-	t.Run("an inferred migration following a pgroll migration", func(t *testing.T) {
-		testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
-			ctx := context.Background()
-
-			// Execute a pgroll migration
-			err := m.Start(ctx, &migrations.Migration{
-				Name:       "01_initial_migration",
-				Operations: migrations.Operations{&migrations.OpRawSQL{Up: "SELECT 1"}},
-			}, backfill.NewConfig())
-			require.NoError(t, err)
-
-			// Complete the migration
-			err = m.Complete(ctx)
-			require.NoError(t, err)
-
-			// Execute a SQL DDL statement
-			_, err = db.ExecContext(ctx, "CREATE TABLE table1(id int)")
-			require.NoError(t, err)
-
-			// Get the migration history
-			history, err := m.State().SchemaHistory(ctx, "public")
-			require.NoError(t, err)
-
-			// Assert that the history contains two migrations with the expected
-			// names. The inferred migration should have a name that starts with
-			// the name of the preceding pgroll migration followed by a timestamp.
-			require.Len(t, history, 2)
-			require.Equal(t, "01_initial_migration", history[0].Migration.Name)
-			require.Regexp(t, `^01_initial_migration_\d{20}$`, history[1].Migration.Name)
-			// Assert that the VersionSchema field matches the expected format
-			require.Regexp(t, "^sql_[0-9a-f]{8}", history[1].Migration.VersionSchema)
-		})
+		history, err := st.SchemaHistory(ctx, "public")
+		require.NoError(t, err)
+		assert.Empty(t, history)
 	})
 }
 
-func TestInferredMigrationsInTransactionHaveDifferentTimestamps(t *testing.T) {
-	ctx := context.Background()
+// A database initialized by a pgroll old enough to install the capture
+// triggers must be cleaned up by the next Init, not left capturing forever.
+func TestInitRemovesLegacyDDLCaptureTriggers(t *testing.T) {
+	t.Parallel()
 
-	testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
-		// Start a transaction
-		tx, err := db.BeginTx(ctx, nil)
+	testutils.WithStateAndConnectionToContainer(t, func(st *state.State, db *sql.DB) {
+		ctx := context.Background()
+		schema := pq.QuoteIdentifier(st.Schema())
+
+		// Recreate the pre-removal shape by hand.
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`
+			CREATE FUNCTION %s.raw_migration() RETURNS event_trigger
+			LANGUAGE plpgsql AS $$ BEGIN RETURN; END; $$;
+			CREATE EVENT TRIGGER pg_roll_handle_ddl ON ddl_command_end
+				EXECUTE FUNCTION %s.raw_migration();
+			CREATE EVENT TRIGGER pg_roll_handle_drop ON sql_drop
+				EXECUTE FUNCTION %s.raw_migration();`, schema, schema, schema))
 		require.NoError(t, err)
-		defer tx.Rollback()
 
-		// Create two tables in the transaction
-		_, err = tx.ExecContext(ctx, "CREATE TABLE table1 (id int)")
-		require.NoError(t, err)
-
-		_, err = tx.ExecContext(ctx, "CREATE TABLE table2 (id int)")
-		require.NoError(t, err)
-
-		// Commit the transaction
-		tx.Commit()
-
-		// Read the migrations from the migrations table
-		rows, err := db.QueryContext(ctx,
-			fmt.Sprintf("SELECT name, created_at, updated_at FROM %s.migrations ORDER BY created_at ASC", state.Schema()))
-		if err != nil {
-			t.Fatal(err)
+		countObjects := func() (int, int) {
+			t.Helper()
+			var triggers, fns int
+			require.NoError(t, db.QueryRowContext(ctx,
+				"SELECT count(*) FROM pg_catalog.pg_event_trigger WHERE evtname LIKE 'pg_roll_%'").
+				Scan(&triggers))
+			require.NoError(t, db.QueryRowContext(ctx,
+				`SELECT count(*) FROM pg_catalog.pg_proc p
+				 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+				 WHERE n.nspname = $1 AND p.proname = 'raw_migration'`, st.Schema()).
+				Scan(&fns))
+			return triggers, fns
 		}
 
-		type m struct {
-			name      string
-			createdAt time.Time
-			updatedAt time.Time
-		}
-		var migrations []m
+		triggers, fns := countObjects()
+		require.Equal(t, 2, triggers)
+		require.Equal(t, 1, fns)
 
-		for rows.Next() {
-			var migration m
-			if err := rows.Scan(&migration.name, &migration.createdAt, &migration.updatedAt); err != nil {
-				t.Fatal(err)
-			}
+		require.NoError(t, st.Init(ctx))
 
-			migrations = append(migrations, migration)
-		}
-		assert.NoError(t, rows.Err())
-
-		// Ensure that the two inferred migrations have different timestamps
-		assert.Equal(t, 2, len(migrations), "unexpected number of migrations")
-		assert.NotEqual(t, migrations[0].createdAt, migrations[1].createdAt, "migrations have the same timestamp")
+		triggers, fns = countObjects()
+		assert.Equal(t, 0, triggers, "Init must drop the legacy capture triggers")
+		assert.Equal(t, 0, fns, "Init must drop the legacy capture function")
 	})
 }
 
@@ -1394,13 +1166,12 @@ func TestSchemaAfterMigration(t *testing.T) {
 		testutils.WithStateAndConnectionToContainer(t, func(st *state.State, db *sql.DB) {
 			ctx := context.Background()
 
-			// Run some SQL to generate a first migration
-			_, err := db.ExecContext(ctx, "CREATE TABLE items (id int NOT NULL)")
-			require.NoError(t, err)
-
-			// Run some more SQL to generate a second migration
-			_, err = db.ExecContext(ctx, "ALTER TABLE items ADD COLUMN name text NOT NULL")
-			require.NoError(t, err)
+			// Apply some SQL and record it, snapshotting the resulting schema
+			// the way State.Complete does
+			applyAndRecord(ctx, t, st, db, "01_add_items",
+				"CREATE TABLE items (id int NOT NULL)")
+			applyAndRecord(ctx, t, st, db, "02_add_items_name",
+				"ALTER TABLE items ADD COLUMN name text NOT NULL")
 
 			// Get the schema history
 			hist, err := st.SchemaHistory(ctx, "public")
@@ -1453,6 +1224,28 @@ func TestSchemaAfterMigration(t *testing.T) {
 			require.Equal(t, expectedTable, sc.Tables["items"])
 		})
 	})
+}
+
+// applyAndRecord runs DDL and records it as a history row carrying a snapshot
+// of the resulting schema — the pairing State.Complete performs, and the one
+// the removed DDL-capture trigger used to perform for out-of-band statements.
+func applyAndRecord(ctx context.Context, t *testing.T, st *state.State, db *sql.DB, name, ddl string) {
+	t.Helper()
+
+	_, err := db.ExecContext(ctx, ddl)
+	require.NoError(t, err)
+
+	sc, err := st.ReadSchema(ctx, "public")
+	require.NoError(t, err)
+	resulting, err := json.Marshal(sc)
+	require.NoError(t, err)
+
+	body, err := json.Marshal(map[string]any{
+		"operations": []any{map[string]any{"sql": map[string]any{"up": ddl}}},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, st.Stamp(ctx, "public", name, body, resulting, nil, ""))
 }
 
 func clearOIDS(s *schema.Schema) {

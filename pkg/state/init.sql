@@ -1,145 +1,34 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Guard this transaction against the pgroll DDL-capture event triggers.
--- State.New sets pgroll.no_inferred_migrations on one pooled connection,
--- but Init's transaction may run on a different (unguarded) connection —
--- under concurrent initialization, real DDL later in this script would
--- fire raw_migration() before the helper functions it calls exist.
+-- Belt-and-braces guard for the transaction below. pgroll no longer installs
+-- the DDL-capture event triggers, and the block after CREATE SCHEMA removes
+-- them from databases initialized by an older pgroll — but that removal needs
+-- ownership of the triggers, and this script runs real DDL before and after
+-- it. On a database where the drop could not run, this keeps Init itself from
+-- being captured.
 SET LOCAL pgroll.no_inferred_migrations TO 'TRUE';
 
 CREATE SCHEMA IF NOT EXISTS placeholder;
 
-CREATE OR REPLACE FUNCTION placeholder.raw_migration ()
-    RETURNS event_trigger
-    LANGUAGE plpgsql
-    SECURITY DEFINER
-    SET search_path = placeholder, pg_catalog, pg_temp
-    AS $$
-DECLARE
-    schemaname text;
-    migration_id text;
+-- pgroll does not record DDL run outside of its own migrations. Databases
+-- initialized by an older pgroll carry the capture triggers and the function
+-- they call; remove them here so an upgrade cleans up after itself.
+--
+-- Ordering is load-bearing: the function cannot be dropped while the triggers
+-- still depend on it. Dropping an event trigger requires ownership, so a
+-- non-owner role gets a warning rather than a failed init — capture keeps
+-- running on such a database, but SchemaHistory filters the rows it produces,
+-- so they stay inert.
+DO $$
 BEGIN
-    -- Ignore schema changes made by pgroll
-    IF (pg_catalog.current_setting('pgroll.no_inferred_migrations', TRUE) = 'TRUE') THEN
-        RETURN;
-    END IF;
-    IF tg_event = 'sql_drop' AND tg_tag = 'DROP SCHEMA' THEN
-        -- Take the schema name from the drop schema command
-        SELECT
-            object_identity
-        INTO
-            schemaname
-        FROM
-            pg_event_trigger_dropped_objects ();
-    ELSIF tg_event = 'sql_drop'
-            AND tg_tag != 'ALTER TABLE' THEN
-            -- Guess the schema from drop commands
-            SELECT
-                schema_name
-            INTO
-                schemaname
-            FROM
-                pg_catalog.pg_event_trigger_dropped_objects ()
-            WHERE
-                schema_name IS NOT NULL;
-    ELSIF tg_event = 'ddl_command_end' THEN
-        -- Guess the schema from ddl commands, ignore migrations that touch several schemas
-        IF (
-            SELECT
-                pg_catalog.count(DISTINCT schema_name)
-            FROM
-                pg_catalog.pg_event_trigger_ddl_commands ()
-            WHERE
-                schema_name IS NOT NULL) > 1 THEN
-            RETURN;
-        END IF;
-        IF tg_tag = 'CREATE SCHEMA' THEN
-            SELECT
-                object_identity
-            INTO
-                schemaname
-            FROM
-                pg_event_trigger_ddl_commands ();
-        ELSE
-            SELECT
-                schema_name
-            INTO
-                schemaname
-            FROM
-                pg_catalog.pg_event_trigger_ddl_commands ()
-            WHERE
-                schema_name IS NOT NULL;
-        END IF;
-    END IF;
-    IF schemaname IS NULL THEN
-        RETURN;
-    END IF;
-    -- Ignore migrations done during a migration period
-    IF placeholder.is_active_migration_period (schemaname) THEN
-        RETURN;
-    END IF;
-    -- Remove any duplicate inferred migrations with the same timestamp for this
-    -- schema. We assume such migrations are multi-statement batched migrations
-    -- and we are only interested in the last one in the batch.
-    DELETE FROM placeholder.migrations
-    WHERE SCHEMA = schemaname
-        AND created_at = CURRENT_TIMESTAMP
-        AND migration_type = 'inferred'
-        AND migration -> 'operations' -> 0 -> 'sql' ->> 'up' = current_query();
-    -- Someone did a schema change without pgroll, include it in the history
-    -- Get the latest non-inferred migration name with microsecond timestamp for ordering
-    WITH latest_non_inferred AS (
-        SELECT
-            name
-        FROM
-            placeholder.migrations
-        WHERE
-            SCHEMA = schemaname
-            AND migration_type != 'inferred'
-        ORDER BY
-            created_at DESC
-        LIMIT 1
-)
-SELECT
-INTO
-    migration_id CASE WHEN EXISTS (
-        SELECT
-            1
-        FROM
-            latest_non_inferred) THEN
-        pg_catalog.format('%s_%s', (
-                SELECT
-                    name
-                FROM latest_non_inferred), pg_catalog.to_char(pg_catalog.clock_timestamp(), 'YYYYMMDDHH24MISSUS'))
-    ELSE
-        pg_catalog.format('00000_initial_%s', pg_catalog.to_char(pg_catalog.clock_timestamp(), 'YYYYMMDDHH24MISSUS'))
-    END;
-    -- Inferred rows are sealed at insert: the captured DDL already ran
-    -- outside pgroll's expand/contract lifecycle, so there is no expand
-    -- state to revert to.
-    INSERT INTO placeholder.migrations (schema, name, migration, resulting_schema, done, sealed, parent, migration_type, created_at, updated_at)
-        VALUES (schemaname, migration_id, pg_catalog.json_build_object('version_schema', 'sql_' || substring(md5(random()::text), 1, 8), 'operations', (
-                SELECT
-                    pg_catalog.json_agg(pg_catalog.json_build_object('sql', pg_catalog.json_build_object('up', pg_catalog.current_query()))))),
-            placeholder.read_schema (schemaname),
-            TRUE,
-            TRUE,
-            placeholder.latest_migration (schemaname),
-            'inferred',
-            statement_timestamp(),
-            statement_timestamp());
-END;
+    DROP EVENT TRIGGER IF EXISTS pg_roll_handle_ddl;
+    DROP EVENT TRIGGER IF EXISTS pg_roll_handle_drop;
+    DROP FUNCTION IF EXISTS placeholder.raw_migration ();
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE WARNING 'pgroll: could not remove the legacy DDL-capture event triggers (pg_roll_handle_ddl, pg_roll_handle_drop); re-run `pgroll init` as their owner or a superuser';
+END
 $$;
-
-DROP EVENT TRIGGER IF EXISTS pg_roll_handle_ddl;
-
-CREATE EVENT TRIGGER pg_roll_handle_ddl ON ddl_command_end
-    EXECUTE FUNCTION placeholder.raw_migration ();
-
-DROP EVENT TRIGGER IF EXISTS pg_roll_handle_drop;
-
-CREATE EVENT TRIGGER pg_roll_handle_drop ON sql_drop
-    EXECUTE FUNCTION placeholder.raw_migration ();
 
 CREATE TABLE IF NOT EXISTS placeholder.migrations (
     schema NAME NOT NULL,

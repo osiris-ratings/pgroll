@@ -27,21 +27,33 @@ func rawMig(t *testing.T, name string, ops migrations.Operations) *migrations.Ra
 	return &migrations.RawMigration{Name: name, Operations: body}
 }
 
-// execNoInferred runs DDL on a pinned connection with pgroll's
-// no_inferred_migrations GUC set, so the inferred-migration event trigger
-// doesn't insert phantom rows that would confuse stamp test assertions.
-// Mirrors the GUC pgroll's own state connection sets in state.New.
-func execNoInferred(t *testing.T, ctx context.Context, db *sql.DB, ddls ...string) {
+// execDDL runs DDL outside of pgroll. Nothing records it: pgroll no longer
+// installs the DDL-capture event triggers.
+func execDDL(t *testing.T, ctx context.Context, db *sql.DB, ddls ...string) {
 	t.Helper()
-	conn, err := db.Conn(ctx)
-	require.NoError(t, err)
-	defer conn.Close()
-	_, err = conn.ExecContext(ctx, "SET pgroll.no_inferred_migrations TO 'TRUE'")
-	require.NoError(t, err)
 	for _, ddl := range ddls {
-		_, err = conn.ExecContext(ctx, ddl)
+		_, err := db.ExecContext(ctx, ddl)
 		require.NoError(t, err)
 	}
+}
+
+// legacyInferredName is the shape the removed DDL-capture trigger gave its
+// rows: the latest non-inferred migration name plus a microsecond timestamp.
+const legacyInferredName = "01_first_migration_20260101120000000001"
+
+// stampInferred records a row of the kind the removed DDL-capture trigger used
+// to insert. Databases initialized by an older pgroll still hold these, so the
+// behaviour they produce is still under test even though nothing creates them
+// any more.
+func stampInferred(ctx context.Context, t *testing.T, m *roll.Roll, schemaName, name, upSQL string) {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"version_schema": "sql_0a1b2c3d",
+		"operations":     []any{map[string]any{"sql": map[string]any{"up": upSQL}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, m.State().Stamp(ctx, schemaName, name, body, nil, nil, roll.MigrationTypeInferred))
 }
 
 func TestStampRecordsUnstampedMigrationsWithParentChain(t *testing.T) {
@@ -56,7 +68,7 @@ func TestStampRecordsUnstampedMigrationsWithParentChain(t *testing.T) {
 			rawMig(t, "03_create_doodads", migrations.Operations{createTableOp("doodads")}),
 		}
 		// Live tables already exist (simulating a SQL dump load).
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE widgets(id integer PRIMARY KEY, name varchar(255))",
 			"CREATE TABLE gadgets(id integer PRIMARY KEY, name varchar(255))",
@@ -119,7 +131,7 @@ func TestStampIsIdempotent(t *testing.T) {
 			rawMig(t, "01_a", migrations.Operations{createTableOp("a")}),
 			rawMig(t, "02_b", migrations.Operations{createTableOp("b")}),
 		}
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE a(id integer PRIMARY KEY, name varchar(255))",
 			"CREATE TABLE b(id integer PRIMARY KEY, name varchar(255))",
@@ -158,7 +170,7 @@ func TestStampPartialAppendsRespectsExistingChain(t *testing.T) {
 			rawMig(t, "01_seed", migrations.Operations{createTableOp("seed_table")}),
 			rawMig(t, "02_more", migrations.Operations{createTableOp("more")}),
 		}
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE more(id integer PRIMARY KEY, name varchar(255))",
 		)
@@ -205,7 +217,7 @@ func TestStampPreservesMigrationBody(t *testing.T) {
 
 		ops := migrations.Operations{createTableOp("widgets")}
 		raws := []*migrations.RawMigration{rawMig(t, "01_widgets", ops)}
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE widgets(id integer PRIMARY KEY, name varchar(255))",
 		)
@@ -232,7 +244,7 @@ func TestStampMigrationTypeFlag(t *testing.T) {
 		raws := []*migrations.RawMigration{
 			rawMig(t, "01_baseline_marker", migrations.Operations{createTableOp("a")}),
 		}
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE a(id integer PRIMARY KEY, name varchar(255))",
 		)
@@ -255,7 +267,7 @@ func TestStampThenMaterializeYieldsQueryableViews(t *testing.T) {
 		ctx := context.Background()
 		const leafName = "01_widgets"
 
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE widgets(id integer PRIMARY KEY, name varchar(255))",
 		)
@@ -293,7 +305,7 @@ func TestStampSingleMigrationViaSliceOfOne(t *testing.T) {
 		ctx := context.Background()
 		const name = "01_solo"
 
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE solo(id integer PRIMARY KEY, name varchar(255))",
 		)
@@ -354,7 +366,7 @@ func TestStampRecordsBaselineMarkedFileAsBaseline(t *testing.T) {
 		base.Baseline = true
 		next := rawMig(t, "02_next", migrations.Operations{createTableOp("gadgets")})
 
-		execNoInferred(
+		execDDL(
 			t, ctx, db,
 			"CREATE TABLE widgets(id integer PRIMARY KEY, name varchar(255))",
 			"CREATE TABLE gadgets(id integer PRIMARY KEY, name varchar(255))",

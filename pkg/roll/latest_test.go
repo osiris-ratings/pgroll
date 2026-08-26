@@ -93,9 +93,8 @@ func TestLatestVersionRemote(t *testing.T) {
 			err = m.Complete(ctx)
 			require.NoError(t, err)
 
-			// Run some DDL to generate an inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE apples(id int)")
-			require.NoError(t, err)
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, m, "public", legacyInferredName, "CREATE TABLE apples(id int)")
 
 			// Get the latest version in the target schema
 			latestVersion, err := m.LatestVersionRemote(ctx)

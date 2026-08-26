@@ -30,12 +30,41 @@ type BaselineMigration struct {
 }
 
 // SchemaHistory returns all migrations applied to a schema since the most
-// recent baseline in ascending timestamp order
+// recent baseline in ascending timestamp order, excluding inferred rows.
+//
+// Inferred rows are DDL captured out of band by a pgroll old enough to still
+// install the capture event triggers. They never correspond to a file in the
+// migrations directory, and every caller of this method is ultimately
+// comparing history against that directory — so left visible, a single stray
+// row wedges `migrate`, `plan` and `pull` on a database that is otherwise
+// perfectly in sync. Filtering here makes such rows inert on a binary upgrade
+// alone, without deleting anything; `pgroll prune` still removes them for
+// real. They remain members of the parent chain, so the chain stays linear.
 func (s *State) SchemaHistory(ctx context.Context, schema string) ([]HistoryEntry, error) {
+	return s.schemaHistory(ctx, schema, true)
+}
+
+// SchemaHistoryWithInferred is [State.SchemaHistory] including inferred rows.
+//
+// Revert planning uses it deliberately: DDL captured out of band is a real
+// schema change, and inverting the migrations around it as though it were not
+// there would land a schema that does not match the boundary snapshot. The row
+// has to be visible in order to be refused.
+func (s *State) SchemaHistoryWithInferred(ctx context.Context, schema string) ([]HistoryEntry, error) {
+	return s.schemaHistory(ctx, schema, false)
+}
+
+func (s *State) schemaHistory(ctx context.Context, schema string, excludeInferred bool) ([]HistoryEntry, error) {
+	inferredFilter := ""
+	if excludeInferred {
+		inferredFilter = "AND migration_type <> 'inferred'"
+	}
+
 	rows, err := s.pgConn.QueryContext(ctx,
 		fmt.Sprintf(`SELECT name, migration, created_at
 			FROM %[1]s.migrations
 			WHERE schema=$1
+			%[2]s
 			AND created_at > COALESCE(
 			(
 				SELECT MAX(created_at) FROM %[1]s.migrations
@@ -43,7 +72,7 @@ func (s *State) SchemaHistory(ctx context.Context, schema string) ([]HistoryEntr
 			),
 			'-infinity'::timestamptz
 			) ORDER BY created_at`,
-			pq.QuoteIdentifier(s.schema)), schema)
+			pq.QuoteIdentifier(s.schema), inferredFilter), schema)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +112,7 @@ func (s *State) SchemaHistory(ctx context.Context, schema string) ([]HistoryEntr
 func (s *State) LatestBaseline(ctx context.Context, schemaName string) (*BaselineMigration, error) {
 	// Construct the SQL query to get the latest baseline migration
 	query := fmt.Sprintf(`
-		SELECT name, created_at, resulting_schema 
+		SELECT name, created_at, resulting_schema
 		FROM %s.migrations
 		WHERE schema = $1
 		AND migration_type = 'baseline'

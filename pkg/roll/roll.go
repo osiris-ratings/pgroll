@@ -118,6 +118,11 @@ func setupConn(ctx context.Context, pgURL, schema string, options options) (*sql
 		return nil, err
 	}
 
+	// pgroll no longer installs the DDL-capture event triggers, and `Init`
+	// drops them from databases that still carry them. This remains as a guard
+	// for the one case that cleanup cannot reach: a database whose triggers are
+	// owned by a role pgroll does not connect as. Cheap, and it keeps pgroll's
+	// own DDL out of the capture path there.
 	_, err = conn.ExecContext(ctx, "SET pgroll.no_inferred_migrations TO 'TRUE'")
 	if err != nil {
 		return nil, fmt.Errorf("unable to set pgroll.no_inferred_migrations to true: %w", err)
