@@ -91,7 +91,10 @@ func (m *Roll) PlanRevertSealedBelowWindow(ctx context.Context, to, through stri
 // (to, through]; an empty `through` means the segment extends to the history
 // leaf.
 func (m *Roll) planSealedSegment(ctx context.Context, to, through string) (*SealedRevertPlan, error) {
-	history, err := m.state.SchemaHistory(ctx, m.schema)
+	// Inferred rows are included here, unlike everywhere else: out-of-band DDL
+	// inside the segment is a real schema change that inversion cannot honestly
+	// undo, and the refusal below can only fire on a row it can see.
+	history, err := m.state.SchemaHistoryWithInferred(ctx, m.schema)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read schema history: %w", err)
 	}
@@ -371,7 +374,7 @@ func (m *Roll) FinishPendingSealedRevert(ctx context.Context) (*SealedRevertPlan
 		return nil, nil
 	}
 
-	history, err := m.state.SchemaHistory(ctx, m.schema)
+	history, err := m.state.SchemaHistoryWithInferred(ctx, m.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +426,7 @@ func (m *Roll) finishSealedRevert(ctx context.Context, to string) (*SealedRevert
 		return nil, nil
 	}
 
-	history, err := m.state.SchemaHistory(ctx, m.schema)
+	history, err := m.state.SchemaHistoryWithInferred(ctx, m.schema)
 	if err != nil {
 		return nil, err
 	}

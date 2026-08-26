@@ -33,7 +33,6 @@ You should see a success message indicating that `pgroll` has been configured.
   `pgroll` stores its data in the `pgroll` schema. In this schema it creates:
   * A `migrations` table containing the version history for each schema in the database
   * Functions to capture the current database schema for a given schema name
-  * Triggers to capture DDL statements run outside of `pgroll` migrations
 </details>
 
 ### First migration

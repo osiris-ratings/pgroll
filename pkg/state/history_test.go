@@ -5,6 +5,7 @@ package state_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -103,12 +104,11 @@ func TestSchemaHistoryDoesNotReturnBaselineMigrations(t *testing.T) {
 		testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
 			ctx := context.Background()
 
-			// Execute DDL to create an inferred migration
-			_, err := db.ExecContext(ctx, "CREATE TABLE users (id int)")
-			require.NoError(t, err)
+			// Record a migration ahead of the baseline
+			stampHistory(ctx, t, state, "public", "00_add_users", "CREATE TABLE users (id int)")
 
 			// Create a baseline migration
-			err = state.CreateBaseline(ctx, "public", "01_initial_version")
+			err := state.CreateBaseline(ctx, "public", "01_initial_version")
 			require.NoError(t, err)
 
 			// Get the schema history
@@ -124,17 +124,15 @@ func TestSchemaHistoryDoesNotReturnBaselineMigrations(t *testing.T) {
 		testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
 			ctx := context.Background()
 
-			// Execute DDL to create an inferred migration
-			_, err := db.ExecContext(ctx, "CREATE TABLE users (id int)")
-			require.NoError(t, err)
+			// Record a migration ahead of the baseline
+			stampHistory(ctx, t, state, "public", "00_add_users", "CREATE TABLE users (id int)")
 
 			// Create a baseline migration
-			err = state.CreateBaseline(ctx, "public", "01_initial_version")
+			err := state.CreateBaseline(ctx, "public", "01_initial_version")
 			require.NoError(t, err)
 
-			// Execute DDL to create another inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE fruits (id int)")
-			require.NoError(t, err)
+			// Record a migration after the baseline
+			stampHistory(ctx, t, state, "public", "02_add_fruits", "CREATE TABLE fruits (id int)")
 
 			// Get the schema history
 			res, err := state.SchemaHistory(ctx, "public")
@@ -182,14 +180,12 @@ func TestLatestBaseline(t *testing.T) {
 		testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
 			ctx := context.Background()
 
-			// Execute DDL to create two inferred migrations
-			_, err := db.ExecContext(ctx, "CREATE TABLE users (id int)")
-			require.NoError(t, err)
-			_, err = db.ExecContext(ctx, "CREATE TABLE fruits (id int)")
-			require.NoError(t, err)
+			// Record two migrations ahead of the baseline
+			stampHistory(ctx, t, state, "public", "00_add_users", "CREATE TABLE users (id int)")
+			stampHistory(ctx, t, state, "public", "00_add_fruits", "CREATE TABLE fruits (id int)")
 
 			// Create a baseline migration
-			err = state.CreateBaseline(ctx, "public", "01_initial_version")
+			err := state.CreateBaseline(ctx, "public", "01_initial_version")
 			require.NoError(t, err)
 
 			// Get the latest baseline migration
@@ -205,19 +201,16 @@ func TestLatestBaseline(t *testing.T) {
 		testutils.WithStateAndConnectionToContainer(t, func(state *state.State, db *sql.DB) {
 			ctx := context.Background()
 
-			// Execute DDL to create two inferred migrations
-			_, err := db.ExecContext(ctx, "CREATE TABLE users (id int)")
-			require.NoError(t, err)
-			_, err = db.ExecContext(ctx, "CREATE TABLE fruits (id int)")
-			require.NoError(t, err)
+			// Record two migrations ahead of the baseline
+			stampHistory(ctx, t, state, "public", "00_add_users", "CREATE TABLE users (id int)")
+			stampHistory(ctx, t, state, "public", "00_add_fruits", "CREATE TABLE fruits (id int)")
 
 			// Create a baseline migration
-			err = state.CreateBaseline(ctx, "public", "01_initial_version")
+			err := state.CreateBaseline(ctx, "public", "01_initial_version")
 			require.NoError(t, err)
 
-			// Execute DDL to create another inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE people (id int)")
-			require.NoError(t, err)
+			// Record a migration after the baseline
+			stampHistory(ctx, t, state, "public", "02_add_people", "CREATE TABLE people (id int)")
 
 			// Get the latest baseline migration
 			baseline, err := state.LatestBaseline(ctx, "public")
@@ -236,19 +229,16 @@ func TestLatestBaseline(t *testing.T) {
 			err := state.CreateBaseline(ctx, "public", "01_initial_version")
 			require.NoError(t, err)
 
-			// Execute DDL to create two inferred migrations
-			_, err = db.ExecContext(ctx, "CREATE TABLE users (id int)")
-			require.NoError(t, err)
-			_, err = db.ExecContext(ctx, "CREATE TABLE fruits (id int)")
-			require.NoError(t, err)
+			// Record two migrations between the baselines
+			stampHistory(ctx, t, state, "public", "01_add_users", "CREATE TABLE users (id int)")
+			stampHistory(ctx, t, state, "public", "01_add_fruits", "CREATE TABLE fruits (id int)")
 
 			// Create a baseline migration
 			err = state.CreateBaseline(ctx, "public", "02_another_baseline")
 			require.NoError(t, err)
 
-			// Execute DDL to create another inferred migration
-			_, err = db.ExecContext(ctx, "CREATE TABLE people (id int)")
-			require.NoError(t, err)
+			// Record a migration after the second baseline
+			stampHistory(ctx, t, state, "public", "03_add_people", "CREATE TABLE people (id int)")
 
 			// Get the latest baseline migration
 			baseline, err := state.LatestBaseline(ctx, "public")
@@ -258,6 +248,40 @@ func TestLatestBaseline(t *testing.T) {
 			assert.Equal(t, "02_another_baseline", baseline.Name)
 		})
 	})
+}
+
+// stampHistory records an ordinary pgroll history row carrying a single raw
+// SQL operation. Tests below only need *a* history entry with a known body;
+// before the DDL-capture triggers were removed they got one by running the
+// statement out of band and letting the trigger record it.
+func stampHistory(ctx context.Context, t *testing.T, st *state.State, schemaName, name, upSQL string) {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"name":       name,
+		"operations": []any{map[string]any{"sql": map[string]any{"up": upSQL}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Stamp(ctx, schemaName, name, body, nil, nil, ""))
+}
+
+// legacyInferredName is the shape the removed DDL-capture trigger gave its
+// rows: the latest non-inferred migration name plus a microsecond timestamp.
+const legacyInferredName = "01_initial_migration_20260101120000000001"
+
+// stampInferred records a row of the kind the removed DDL-capture trigger used
+// to insert. Databases initialized by an older pgroll still hold these, so the
+// behaviour they produce is still under test even though nothing creates them
+// any more.
+func stampInferred(ctx context.Context, t *testing.T, st *state.State, schemaName, name, upSQL string) {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"version_schema": "sql_0a1b2c3d",
+		"operations":     []any{map[string]any{"sql": map[string]any{"up": upSQL}}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Stamp(ctx, schemaName, name, body, nil, nil, "inferred"))
 }
 
 func ptr[T any](v T) *T {

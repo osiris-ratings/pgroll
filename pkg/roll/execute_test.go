@@ -152,11 +152,9 @@ func TestPreviousVersionIsDroppedAfterMigrationCompletion(t *testing.T) {
 				t.Fatalf("Failed to complete first migration: %v", err)
 			}
 
-			// Run a manual DDL migration
-			_, err := db.ExecContext(ctx, "CREATE TABLE foo (id integer)")
-			if err != nil {
-				t.Fatalf("Failed to create table: %v", err)
-			}
+			// A legacy inferred row, as an older pgroll would have captured it
+			stampInferred(ctx, t, mig, cSchema, firstVersion+"_20260101120000000001",
+				"CREATE TABLE foo (id integer)")
 
 			// Run the second pgroll migration
 			if err := mig.Start(ctx, &migrations.Migration{Name: secondVersion, Operations: migrations.Operations{createTableOp("table2")}}, backfill.NewConfig()); err != nil {
@@ -417,6 +415,10 @@ func TestMigrationDDLIsRetriedOnLockTimeouts(t *testing.T) {
 		// Create a table
 		_, err := db.ExecContext(ctx, "CREATE TABLE table1 (id integer, name text)")
 		require.NoError(t, err)
+
+		// The fixture table was created outside pgroll, so the schema needs a
+		// baseline before a migration can start against it
+		require.NoError(t, mig.CreateBaseline(ctx, "00_baseline"))
 
 		// Start a goroutine which takes an ACCESS_EXCLUSIVE lock on the table for
 		// two seconds
@@ -758,6 +760,10 @@ func TestCallbacksAreInvokedOnMigrationStart(t *testing.T) {
 			"INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
 		require.NoError(t, err)
 
+		// The fixture table was created outside pgroll, so the schema needs a
+		// baseline before a migration can start against it
+		require.NoError(t, mig.CreateBaseline(ctx, "01_baseline"))
+
 		// Define a mock callback
 		invoked := false
 		cb := func(n, total int64) { invoked = true }
@@ -1064,37 +1070,6 @@ func TestStartAcceptsMigrationAtVersionSchemaNameLimit(t *testing.T) {
 		// And the version schema actually exists at the full computed name.
 		full := roll.VersionedSchemaName(cSchema, name)
 		assert.True(t, schemaExists(t, db, full))
-	})
-}
-
-func TestVersionSchemaCreationIsNotCapturedAsAnInferredMigration(t *testing.T) {
-	t.Parallel()
-
-	testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
-		ctx := context.Background()
-
-		// Apply a migration
-		err := m.Start(ctx, &migrations.Migration{
-			Name:       "01_create_table",
-			Operations: migrations.Operations{createTableOp("new_table")},
-		}, backfill.NewConfig())
-		require.NoError(t, err)
-		err = m.Complete(ctx)
-		require.NoError(t, err)
-
-		// Ensure that the version schema has been created
-		versionSchema := roll.VersionedSchemaName("public", "01_create_table")
-		require.True(t, schemaExists(t, db, versionSchema))
-
-		// Get the schema history **for the version schema**
-		hist, err := m.State().SchemaHistory(ctx, versionSchema)
-		require.NoError(t, err)
-
-		// Ensure that there are no inferred migrations recorded for the version
-		// schema; the DDL statements that `pgroll` executes to create the version
-		// schema and the views inside it should be ignored by the event trigger
-		// that captures inferred migrations.
-		require.Len(t, hist, 0)
 	})
 }
 

@@ -53,6 +53,11 @@ func New(ctx context.Context, pgURL, stateSchema string, opts ...StateOpt) (*Sta
 		return nil, err
 	}
 
+	// pgroll no longer installs the DDL-capture event triggers, and `Init`
+	// drops them from databases that still carry them. This remains as a guard
+	// for the one case that cleanup cannot reach: a database whose triggers are
+	// owned by a role pgroll does not connect as. Cheap, and it keeps pgroll's
+	// own DDL out of the capture path there.
 	_, err = conn.ExecContext(ctx, "SET pgroll.no_inferred_migrations TO 'TRUE'")
 	if err != nil {
 		return nil, fmt.Errorf("unable to set pgroll.no_inferred_migrations to true: %w", err)
@@ -178,10 +183,13 @@ func (s *State) HasExistingSchemaWithoutHistory(ctx context.Context, schemaName 
 		return false, nil
 	}
 
-	// Check if there's any migration history for this schema
+	// Check if there's any migration history for this schema. Inferred rows
+	// don't count: a schema whose only history is captured out-of-band DDL has
+	// never been through pgroll, and still needs the baseline prompt.
 	var migrationCount int
 	err = s.pgConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s.migrations WHERE schema=$1", pq.QuoteIdentifier(s.schema)),
+		fmt.Sprintf("SELECT COUNT(*) FROM %s.migrations WHERE schema=$1 AND migration_type <> 'inferred'",
+			pq.QuoteIdentifier(s.schema)),
 		schemaName).Scan(&migrationCount)
 	if err != nil {
 		return false, fmt.Errorf("failed to check migration history: %w", err)

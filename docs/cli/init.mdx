@@ -12,3 +12,8 @@ $ pgroll init
 This will create a new schema in the database called `pgroll` (or whatever value is specified with the `--pgroll-schema` switch).
 
 The tables and functions in this schema store `pgroll`'s internal state and are not intended to be modified outside of `pgroll` CLI.
+
+`pgroll` does not record DDL run outside of its own migrations. Earlier versions installed two database-wide event triggers (`pg_roll_handle_ddl` and
+`pg_roll_handle_drop`) that captured every out-of-band statement as an "inferred" migration; `init` now removes them from any database that still
+carries them. Because creating those triggers was the only operation that needed elevated rights, `init` no longer requires superuser on a fresh
+database — only the one-time cleanup does, and it warns rather than failing if the connected role does not own them.
