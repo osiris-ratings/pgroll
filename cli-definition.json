@@ -499,6 +499,11 @@
   ],
   "flags": [
     {
+      "name": "index-progress-interval",
+      "description": "How often a concurrent index build reports its phase, counters and the session it is waiting on (e.g. 10s, 1m); 0 disables",
+      "default": "10s"
+    },
+    {
       "name": "lock-retry-timeout",
       "description": "Total wall-clock budget for retrying lock_timeout errors before giving up (e.g. 5m, 30s); negative disables retries",
       "default": "5m0s"
