@@ -33,7 +33,7 @@ func (o *OpSetUnique) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 	}
 
 	dbActions := []DBAction{
-		NewCreateUniqueIndexConcurrentlyAction(conn, s.Name, o.Name, table.Name, column.Name),
+		NewCreateUniqueIndexAction(conn, s.Name, o.Name, table, column.Name),
 	}
 
 	// Register the constraint in the in-memory schema so a subsequent

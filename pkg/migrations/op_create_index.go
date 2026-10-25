@@ -33,9 +33,9 @@ func (o *OpCreateIndex) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 	}
 
 	dbActions := []DBAction{
-		NewCreateIndexConcurrentlyAction(
+		NewCreateIndexAction(
 			conn,
-			table.Name,
+			table,
 			o.Name,
 			string(o.Method),
 			o.Unique,

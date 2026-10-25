@@ -94,7 +94,7 @@ func (o *OpCreateConstraint) Start(ctx context.Context, l Logger, conn db.DB, s 
 	case OpCreateConstraintTypeUnique, OpCreateConstraintTypePrimaryKey:
 		dbActions = append(
 			dbActions,
-			NewCreateUniqueIndexConcurrentlyAction(conn, s.Name, o.Name, table.Name, temporaryNames(scope, o.Columns)...),
+			NewCreateUniqueIndexAction(conn, s.Name, o.Name, table, temporaryNames(scope, o.Columns)...),
 		)
 		return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 

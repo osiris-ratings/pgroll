@@ -36,6 +36,17 @@ func Role() string {
 
 func Verbose() bool { return viper.GetBool("VERBOSE") }
 
+// IndexProgressInterval is how often a concurrent index build reports
+// progress. The flag's 0 means "off", which the Roll option spells as a
+// negative duration (its zero means "default").
+func IndexProgressInterval() time.Duration {
+	d := viper.GetDuration("INDEX_PROGRESS_INTERVAL")
+	if d <= 0 {
+		return -1
+	}
+	return d
+}
+
 func UseVersionSchema() bool {
 	return viper.GetBool("USE_VERSION_SCHEMA")
 }

@@ -77,6 +77,13 @@ type Table struct {
 
 	// Whether or not the table has been deleted in the virtual schema
 	Deleted bool `json:"-"`
+
+	// CreatedInMigration marks a table the migration currently being started
+	// created itself. No transaction older than the CREATE TABLE can hold a
+	// row of it, so an index on it is built without CONCURRENTLY: there is no
+	// snapshot to out-wait and no reader to keep unlocked. Virtual only; a
+	// schema read back from the database never carries it.
+	CreatedInMigration bool `json:"-"`
 }
 
 // Column represents a column in a table
@@ -221,6 +228,18 @@ func (s *Schema) AddTable(name string, t *Table) {
 	}
 
 	s.Tables[name] = t
+}
+
+// ClearCreatedInMigration forgets which tables were created by a replayed
+// migration. Called after deferred migrations are replayed onto a schema read
+// from the database: those tables exist physically, so an index on them must
+// be built CONCURRENTLY like any other.
+func (s *Schema) ClearCreatedInMigration() {
+	for _, t := range s.Tables {
+		if t != nil {
+			t.CreatedInMigration = false
+		}
+	}
 }
 
 // RenameTable renames a table in the schema

@@ -139,7 +139,7 @@ func TestCoordinator(t *testing.T) {
 				NewCreateTableAction(nil, "test_table", "", ""),
 				NewAddColumnAction(nil, "column1", Column{}, false, ""),
 				NewAddColumnAction(nil, "column2", Column{}, false, ""),
-				NewCreateUniqueIndexConcurrentlyAction(nil, "public", "test_table", "my_idx", "column1"),
+				NewCreateUniqueIndexAction(nil, "public", "test_table", &schema.Table{Name: "my_idx"}, "column1"),
 				NewCreateFKConstraintAction(nil, "test_table", "column2", []string{"other_column"}, nil, false, false, false),
 				NewCreateCheckConstraintAction(nil, "", "test_table", "my_check", "column1 > 0", []string{"column1"}, false, false),
 			},

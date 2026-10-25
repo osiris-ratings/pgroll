@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/xataio/pgroll/cmd/flags"
+	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
 	"github.com/xataio/pgroll/pkg/state"
@@ -32,6 +33,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 	verbose := flags.Verbose()
 	useVersionSchema := flags.UseVersionSchema()
 	target := flags.Target()
+	indexProgressInterval := flags.IndexProgressInterval()
 
 	state, err := state.New(ctx, pgURL, stateSchema, state.WithPgrollVersion(Version))
 	if err != nil {
@@ -47,6 +49,7 @@ func NewRoll(ctx context.Context) (*roll.Roll, error) {
 		roll.WithLogging(verbose),
 		roll.WithVersionSchema(useVersionSchema),
 		roll.WithTarget(target),
+		roll.WithIndexProgressInterval(indexProgressInterval),
 		// Reversibility by construction: the CLI always requires migrations
 		// to be revertible (or explicitly marked `irreversible: true`) so
 		// `pgroll revert` can walk back out of any applied migration.
@@ -105,6 +108,7 @@ func Prepare() *cobra.Command {
 	rootCmd.PersistentFlags().Bool("use-version-schema", true, "Create version schemas for each migration")
 	rootCmd.PersistentFlags().String("target", "", "Only apply migrations whose `targets` include this name; unset applies every migration")
 	rootCmd.PersistentFlags().Bool("verbose", false, "Enable verbose logging")
+	rootCmd.PersistentFlags().Duration("index-progress-interval", db.DefaultIndexProgressInterval, "How often a concurrent index build reports its phase, counters and the session it is waiting on (e.g. 10s, 1m); 0 disables")
 
 	viper.BindPFlag("PG_URL", rootCmd.PersistentFlags().Lookup("postgres-url"))
 	viper.BindPFlag("SCHEMA", rootCmd.PersistentFlags().Lookup("schema"))
@@ -115,6 +119,7 @@ func Prepare() *cobra.Command {
 	viper.BindPFlag("USE_VERSION_SCHEMA", rootCmd.PersistentFlags().Lookup("use-version-schema"))
 	viper.BindPFlag("TARGET", rootCmd.PersistentFlags().Lookup("target"))
 	viper.BindPFlag("VERBOSE", rootCmd.PersistentFlags().Lookup("verbose"))
+	viper.BindPFlag("INDEX_PROGRESS_INTERVAL", rootCmd.PersistentFlags().Lookup("index-progress-interval"))
 
 	// register subcommands
 	rootCmd.AddCommand(startCmd())

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Indexes on tables created by the same migration are built without
+  `CONCURRENTLY`.** A concurrent build has to out-wait every transaction in
+  the database holding a snapshot older than the build, whatever table that
+  transaction reads, and nothing bounds that wait: `lock_timeout` governs lock
+  acquisition, not snapshot visibility. On a table the migration itself just
+  created the wait buys nothing, since no older transaction can hold a row of
+  it and no application session can be reading it. `create_index`, a
+  column-level `unique`, `create_constraint` of type `unique` / `primary_key`
+  and the duplicator's index copies now issue a plain `CREATE INDEX` when the
+  table was created earlier in the same migration, and keep the concurrent
+  build for every pre-existing table. A ten-index migration against five new
+  tables that previously stalled behind a 30-minute export now completes in
+  milliseconds.
+
+### Added
+
+- **Concurrent index builds report their progress.** While a `CREATE INDEX
+  CONCURRENTLY` runs, pgroll samples `pg_stat_progress_create_index` from a
+  second connection and logs the phase, block/tuple counters and, when the
+  build is waiting, the session it is waiting on: pid, `application_name`,
+  state, transaction age and query. Phase changes are logged as they happen,
+  a steady phase once per `--index-progress-interval` (default `10s`; `0`
+  disables). An operator watching a deploy no longer has to query
+  `pg_stat_activity` by hand to learn that the build is stuck behind
+  someone's snapshot.
+
 ## [0.16.2-baselayer.23] - 2026-08-26
 
 ### Removed
