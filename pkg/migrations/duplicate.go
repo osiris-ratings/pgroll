@@ -192,7 +192,7 @@ func (d *duplicator) Execute(ctx context.Context) error {
 			continue
 		}
 		if duplicatedMember, constraintColumns := d.stmtBuilder.allConstraintColumns(uc.Columns, colNames...); duplicatedMember {
-			action := NewCreateUniqueIndexConcurrentlyAction(d.conn, "", DuplicationName(d.scope, uc.Name), d.stmtBuilder.table.Name, constraintColumns...)
+			action := NewCreateUniqueIndexAction(d.conn, "", DuplicationName(d.scope, uc.Name), d.stmtBuilder.table, constraintColumns...)
 			if err := action.Execute(ctx); err != nil {
 				return err
 			}
@@ -273,11 +273,11 @@ func (d *duplicatorStmtBuilder) duplicateIndexes(withoutConstraint []string, col
 		}
 
 		if duplicatedMember, columns := d.allConstraintColumns(idx.Columns, colNames...); duplicatedMember {
-			stmtFmt := "CREATE INDEX CONCURRENTLY %s ON %s"
-			if idx.Unique {
-				stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY %s ON %s"
-			}
-			stmt := fmt.Sprintf(stmtFmt, pq.QuoteIdentifier(DuplicationName(d.scope, idx.Name)), pq.QuoteIdentifier(d.table.Name))
+			stmt := fmt.Sprintf("CREATE %sINDEX %s%s ON %s",
+				uniqueKeyword(idx.Unique),
+				concurrentlyKeyword(indexBuildConcurrently(d.table)),
+				pq.QuoteIdentifier(DuplicationName(d.scope, idx.Name)),
+				pq.QuoteIdentifier(d.table.Name))
 			if idx.Method != "" {
 				stmt += fmt.Sprintf(" USING %s", string(idx.Method))
 			}

@@ -12,6 +12,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/xataio/pgroll/pkg/db"
+	"github.com/xataio/pgroll/pkg/schema"
 )
 
 // DBAction is an interface for common database actions
@@ -329,7 +330,12 @@ func (a *dropFunctionAction) Execute(ctx context.Context) error {
 	return err
 }
 
-type createIndexConcurrentlyAction struct {
+// createIndexAction builds an index. On a table that existed before the
+// migration the build is CONCURRENT, so readers and writers of the table are
+// never locked out; on a table the same migration created there is nothing
+// to protect, and a plain build skips the concurrent build's waits on every
+// older transaction in the database (see buildIndexConcurrently).
+type createIndexAction struct {
 	conn              db.DB
 	id                string
 	table             string
@@ -339,26 +345,59 @@ type createIndexConcurrentlyAction struct {
 	columns           []IndexField
 	storageParameters string
 	predicate         string
+	concurrently      bool
 }
 
-func NewCreateIndexConcurrentlyAction(conn db.DB, table, name, method string, unique bool, columns []IndexField, storageParameters, predicate string) *createIndexConcurrentlyAction {
-	return &createIndexConcurrentlyAction{
+func NewCreateIndexAction(conn db.DB, table *schema.Table, name, method string, unique bool, columns []IndexField, storageParameters, predicate string) *createIndexAction {
+	concurrently := indexBuildConcurrently(table)
+	id := fmt.Sprintf("create_index_%s_%s", table.Name, name)
+	if concurrently {
+		id = fmt.Sprintf("create_index_concurrently_%s_%s", table.Name, name)
+	}
+	return &createIndexAction{
 		conn:              conn,
-		id:                fmt.Sprintf("create_index_concurrently_%s_%s", table, name),
-		table:             table,
+		id:                id,
+		table:             table.Name,
 		name:              name,
 		method:            method,
 		unique:            unique,
 		columns:           columns,
 		storageParameters: storageParameters,
 		predicate:         predicate,
+		concurrently:      concurrently,
 	}
 }
 
-func (a *createIndexConcurrentlyAction) ID() string { return a.id }
+func (a *createIndexAction) ID() string { return a.id }
 
-func (a *createIndexConcurrentlyAction) Execute(ctx context.Context) error {
+func (a *createIndexAction) Execute(ctx context.Context) error {
+	if !a.concurrently {
+		return buildIndexPlain(ctx, a.conn, a.name, pq.QuoteIdentifier(a.name), a.buildCreateIndexSQL())
+	}
 	return buildIndexConcurrently(ctx, a.conn, a.name, pq.QuoteIdentifier(a.name), a.buildCreateIndexSQL())
+}
+
+// indexBuildConcurrently decides how an index on table is built. A table the
+// current migration created is invisible to every transaction older than its
+// CREATE, so no snapshot can be entitled to rows the index lacks and no
+// application session can be reading it: a plain CREATE INDEX is instant and
+// safe. Any other table gets the concurrent build.
+func indexBuildConcurrently(table *schema.Table) bool {
+	return !table.CreatedInMigration
+}
+
+// buildIndexPlain runs a non-concurrent CREATE [UNIQUE] INDEX IF NOT EXISTS.
+// Only for tables created by the migration being started. An INVALID leftover
+// of an earlier concurrent attempt under the same name is dropped first so IF
+// NOT EXISTS cannot report success against it.
+func buildIndexPlain(ctx context.Context, conn db.DB, indexName, quotedQualifiedIndexName, createSQL string) error {
+	if err := dropIndexIfInvalid(ctx, conn, quotedQualifiedIndexName); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, createSQL); err != nil {
+		return fmt.Errorf("failed to create index %q: %w", indexName, err)
+	}
+	return nil
 }
 
 // buildIndexConcurrently runs a CREATE [UNIQUE] INDEX CONCURRENTLY ... IF NOT
@@ -396,7 +435,10 @@ func buildIndexConcurrently(ctx context.Context, conn db.DB, indexName, quotedQu
 	}
 
 	for attempt := 1; ; attempt++ {
-		if _, err := conn.ExecContext(ctx, createSQL); err != nil {
+		stopProgress := startIndexBuildProgress(ctx, conn, indexName)
+		_, err := conn.ExecContext(ctx, createSQL)
+		stopProgress()
+		if err != nil {
 			return fmt.Errorf("failed to create index %q: %w%s",
 				indexName, err, snapshotHolderDiagnostics(ctx, conn))
 		}
@@ -560,12 +602,10 @@ func snapshotHolderDiagnostics(ctx context.Context, conn db.DB) string {
 	return "\nconcurrent index builds must out-wait every transaction holding an older snapshot (any table); oldest snapshot holders:" + sb.String()
 }
 
-func (a *createIndexConcurrentlyAction) buildCreateIndexSQL() string {
-	stmtFmt := "CREATE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
-	if a.unique {
-		stmtFmt = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s"
-	}
-	stmt := fmt.Sprintf(stmtFmt,
+func (a *createIndexAction) buildCreateIndexSQL() string {
+	stmt := fmt.Sprintf("CREATE %sINDEX %sIF NOT EXISTS %s ON %s",
+		uniqueKeyword(a.unique),
+		concurrentlyKeyword(a.concurrently),
 		pq.QuoteIdentifier(a.name),
 		pq.QuoteIdentifier(a.table))
 
@@ -672,51 +712,79 @@ func commentToSQL(comment *string) string {
 	return pq.QuoteLiteral(*comment)
 }
 
-type createUniqueIndexConcurrentlyAction struct {
-	conn        db.DB
-	id          string
-	schemaName  string
-	indexName   string
-	tableName   string
-	columnNames []string
+// createUniqueIndexAction builds the unique index behind a unique or primary
+// key constraint. Concurrent on a pre-existing table, plain on one the same
+// migration created (see createIndexAction).
+type createUniqueIndexAction struct {
+	conn         db.DB
+	id           string
+	schemaName   string
+	indexName    string
+	tableName    string
+	columnNames  []string
+	concurrently bool
 }
 
-func NewCreateUniqueIndexConcurrentlyAction(conn db.DB, schemaName, indexName, tableName string, columnNames ...string) *createUniqueIndexConcurrentlyAction {
-	return &createUniqueIndexConcurrentlyAction{
-		conn:        conn,
-		id:          fmt.Sprintf("create_unique_index_concurrently_%s_%s", indexName, tableName),
-		schemaName:  schemaName,
-		indexName:   indexName,
-		tableName:   tableName,
-		columnNames: columnNames,
+func NewCreateUniqueIndexAction(conn db.DB, schemaName, indexName string, table *schema.Table, columnNames ...string) *createUniqueIndexAction {
+	concurrently := indexBuildConcurrently(table)
+	id := fmt.Sprintf("create_unique_index_%s_%s", indexName, table.Name)
+	if concurrently {
+		id = fmt.Sprintf("create_unique_index_concurrently_%s_%s", indexName, table.Name)
+	}
+	return &createUniqueIndexAction{
+		conn:         conn,
+		id:           id,
+		schemaName:   schemaName,
+		indexName:    indexName,
+		tableName:    table.Name,
+		columnNames:  columnNames,
+		concurrently: concurrently,
 	}
 }
 
-func (a *createUniqueIndexConcurrentlyAction) ID() string { return a.id }
+func (a *createUniqueIndexAction) ID() string { return a.id }
 
-func (a *createUniqueIndexConcurrentlyAction) Execute(ctx context.Context) error {
+func (a *createUniqueIndexAction) Execute(ctx context.Context) error {
 	quotedQualifiedIndexName := pq.QuoteIdentifier(a.indexName)
 	if a.schemaName != "" {
 		quotedQualifiedIndexName = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(a.schemaName), pq.QuoteIdentifier(a.indexName))
 	}
-	return buildIndexConcurrently(ctx, a.conn, a.indexName, quotedQualifiedIndexName, a.getCreateUniqueIndexConcurrentlySQL())
+	if !a.concurrently {
+		return buildIndexPlain(ctx, a.conn, a.indexName, quotedQualifiedIndexName, a.getCreateUniqueIndexSQL())
+	}
+	return buildIndexConcurrently(ctx, a.conn, a.indexName, quotedQualifiedIndexName, a.getCreateUniqueIndexSQL())
 }
 
-func (a *createUniqueIndexConcurrentlyAction) getCreateUniqueIndexConcurrentlySQL() string {
-	// create unique index concurrently
+func (a *createUniqueIndexAction) getCreateUniqueIndexSQL() string {
 	qualifiedTableName := pq.QuoteIdentifier(a.tableName)
 	if a.schemaName != "" {
 		qualifiedTableName = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(a.schemaName), pq.QuoteIdentifier(a.tableName))
 	}
 
-	indexQuery := fmt.Sprintf(
-		"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (%s)",
+	return fmt.Sprintf(
+		"CREATE UNIQUE INDEX %sIF NOT EXISTS %s ON %s (%s)",
+		concurrentlyKeyword(a.concurrently),
 		pq.QuoteIdentifier(a.indexName),
 		qualifiedTableName,
 		strings.Join(quoteColumnNames(a.columnNames), ", "),
 	)
+}
 
-	return indexQuery
+// concurrentlyKeyword is "CONCURRENTLY " or "", for splicing into a CREATE
+// INDEX statement.
+func concurrentlyKeyword(concurrently bool) string {
+	if concurrently {
+		return "CONCURRENTLY "
+	}
+	return ""
+}
+
+// uniqueKeyword is "UNIQUE " or "", for splicing into a CREATE INDEX statement.
+func uniqueKeyword(unique bool) string {
+	if unique {
+		return "UNIQUE "
+	}
+	return ""
 }
 
 // isIndexInProgress checks whether a concurrent index creation is still running.

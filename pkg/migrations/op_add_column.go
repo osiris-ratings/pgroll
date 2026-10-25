@@ -85,11 +85,11 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 
 	if o.Column.Unique {
 		dbActions = append(dbActions,
-			NewCreateUniqueIndexConcurrentlyAction(
+			NewCreateUniqueIndexAction(
 				conn,
 				s.Name,
 				UniqueIndexName(o.Column.Name),
-				table.Name,
+				table,
 				TemporaryName(scope, o.Column.Name),
 			))
 	}

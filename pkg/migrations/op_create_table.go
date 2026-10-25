@@ -255,6 +255,7 @@ func (o *OpCreateTable) updateSchema(s *schema.Schema) *schema.Schema {
 
 	s.AddTable(o.Name, &schema.Table{
 		Name:               o.Name,
+		CreatedInMigration: true,
 		Columns:            columns,
 		UniqueConstraints:  uniqueConstraints,
 		CheckConstraints:   checkConstraints,

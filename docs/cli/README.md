@@ -7,6 +7,7 @@ The `pgroll` CLI has the following top-level flags:
 - `--pgroll-schema`: The Postgres schema in which `pgroll` will store its internal state (default: `"pgroll"`). One `--pgroll-schema` may be used safely with multiple `--schema`s.
 - `--lock-timeout`: The Postgres `lock_timeout` value to use for all `pgroll` DDL operations, specified in milliseconds (default `500`).
 - `--role`: The Postgres role to use for all `pgroll` DDL operations (default: `""`, which doesn't set any role).
+- `--index-progress-interval`: How often a running `CREATE INDEX CONCURRENTLY` logs its phase, counters and the session it is waiting on (default `10s`; `0` disables).
 
 Each of these flags can also be set via an environment variable:
 
@@ -15,5 +16,6 @@ Each of these flags can also be set via an environment variable:
 - `PGROLL_STATE_SCHEMA`
 - `PGROLL_LOCK_TIMEOUT`
 - `PGROLL_ROLE`
+- `PGROLL_INDEX_PROGRESS_INTERVAL`
 
 The CLI flag takes precedence if a flag is set via both an environment variable and a CLI flag.

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/pterm/pterm"
+
+	"github.com/xataio/pgroll/pkg/db"
 )
 
 // Logger is responsible for logging all migration steps.
@@ -30,6 +32,7 @@ type Logger interface {
 	LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration)
 	LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)
 	LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)
+	LogIndexBuildProgress(index string, progress db.IndexBuildProgress)
 
 	LogRollbackOnFailure(reason string)
 
@@ -127,6 +130,15 @@ func (l *migrationLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.D
 		"attempts", attempts,
 		"elapsed", elapsed.Round(time.Millisecond).String(),
 	))
+}
+
+func (l *migrationLogger) LogIndexBuildProgress(index string, progress db.IndexBuildProgress) {
+	args := l.logger.Args(indexBuildProgressArgs(index, progress)...)
+	if progress.Blocker != nil {
+		l.logger.Warn("index build waiting", args)
+		return
+	}
+	l.logger.Info("index build progress", args)
 }
 
 func (l *migrationLogger) LogRollbackOnFailure(reason string) {
@@ -354,11 +366,12 @@ func (l *noopLogger) LogOperationComplete(op Operation)          {}
 func (l *noopLogger) LogOperationRollback(op Operation)          {}
 func (l *noopLogger) LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration) {
 }
-func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)      {}
-func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration) {}
-func (l *noopLogger) LogRollbackOnFailure(reason string)                            {}
-func (l *noopLogger) Info(msg string, args ...any)                                  {}
-func (l *noopLogger) Warn(msg string, args ...any)                                  {}
+func (l *noopLogger) LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)           {}
+func (l *noopLogger) LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)      {}
+func (l *noopLogger) LogIndexBuildProgress(index string, progress db.IndexBuildProgress) {}
+func (l *noopLogger) LogRollbackOnFailure(reason string)                                 {}
+func (l *noopLogger) Info(msg string, args ...any)                                       {}
+func (l *noopLogger) Warn(msg string, args ...any)                                       {}
 
 // truncateQuery returns a single-line, length-bounded form of a SQL query
 // suitable for logging without flooding the terminal.

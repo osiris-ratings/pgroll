@@ -33,6 +33,10 @@ var (
 type Roll struct {
 	pgConn db.DB
 
+	// monitor observes pgConn's session while it is busy; nil when
+	// unavailable. Owned here so Close can release it.
+	monitor *sql.DB
+
 	logger migrations.Logger
 
 	// schema we are acting on
@@ -67,7 +71,20 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 	// lock_timeout/retry events without needing to opt in. The --verbose flag
 	// is reserved for future debug-level output and currently has no effect.
 	_ = rollOpts.verbose
-	logger := migrations.NewLogger()
+	logger := rollOpts.logger
+	if logger == nil {
+		logger = migrations.NewLogger()
+	}
+
+	// A second pool observes the migration session while it is busy (index
+	// build progress). Never drawn from conn: that pool carries session-level
+	// SETs and is used as one session. Observation is best effort, so a
+	// failure here only disables it.
+	monitor, err := setupMonitorConn(ctx, pgURL, schema)
+	if err != nil {
+		logger.Warn("index build progress reporting disabled", "error", err.Error())
+		monitor = nil
+	}
 
 	var pgMajorVersion PGVersion
 	err = conn.QueryRowContext(ctx, "SELECT substring(split_part(version(), ' ', 2) from '^[0-9]+')").Scan(&pgMajorVersion)
@@ -77,10 +94,13 @@ func New(ctx context.Context, pgURL, schema string, state *state.State, opts ...
 
 	return &Roll{
 		pgConn: &db.RDB{
-			DB:               conn,
-			LockRetryTimeout: rollOpts.lockRetryTimeout,
-			Logger:           logger,
+			DB:                    conn,
+			LockRetryTimeout:      rollOpts.lockRetryTimeout,
+			Logger:                logger,
+			Monitor:               monitor,
+			IndexProgressInterval: rollOpts.indexProgressInterval,
 		},
+		monitor:               monitor,
 		logger:                logger,
 		schema:                schema,
 		state:                 state,
@@ -145,6 +165,31 @@ func setupConn(ctx context.Context, pgURL, schema string, options options) (*sql
 	return conn, nil
 }
 
+// setupMonitorConn opens the one-connection pool that observes the migration
+// session. It reads only pg_stat views, so it needs none of the session SETs
+// setupConn applies; it does carry its own application_name so the extra
+// backend is attributable in pg_stat_activity.
+func setupMonitorConn(ctx context.Context, pgURL, schema string) (*sql.DB, error) {
+	//nolint:staticcheck // SA1019: see setupConn.
+	dsn, err := pq.ParseURL(pgURL)
+	if err != nil {
+		dsn = pgURL
+	}
+	dsn += fmt.Sprintf(" search_path=%s application_name=%s-monitor", schema, applicationName)
+
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
 // Init initializes the Roll instance
 func (m *Roll) Init(ctx context.Context) error {
 	return m.state.Init(ctx)
@@ -206,6 +251,12 @@ func (m *Roll) Close() error {
 	err := m.state.Close()
 	if err != nil {
 		return err
+	}
+
+	if m.monitor != nil {
+		if err := m.monitor.Close(); err != nil {
+			return err
+		}
 	}
 
 	return m.pgConn.Close()

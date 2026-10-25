@@ -22,6 +22,10 @@ const (
 	// lock_timeout errors before giving up. Used when RDB.LockRetryTimeout is
 	// zero so library callers get sensible behavior without configuration.
 	DefaultLockRetryTimeout = 5 * time.Minute
+
+	// DefaultIndexProgressInterval is how often a concurrent index build
+	// reports its progress when RDB.IndexProgressInterval is zero.
+	DefaultIndexProgressInterval = 10 * time.Second
 )
 
 type DB interface {
@@ -38,6 +42,32 @@ type Logger interface {
 	LogLockTimeoutRetry(query string, attempt int, sleep, elapsed, budget time.Duration)
 	LogLockTimeoutGiveUp(attempts int, elapsed time.Duration)
 	LogLockTimeoutInterrupted(attempts int, elapsed time.Duration)
+	LogIndexBuildProgress(index string, progress IndexBuildProgress)
+}
+
+// IndexBuildProgress is one sample of pg_stat_progress_create_index for a
+// build pgroll is running, joined with the session it is currently waiting
+// on, if any.
+type IndexBuildProgress struct {
+	Phase   string
+	Elapsed time.Duration
+
+	BlocksDone, BlocksTotal   int64
+	TuplesDone, TuplesTotal   int64
+	LockersDone, LockersTotal int64
+
+	// Blocker is the session the build is waiting on right now, when the
+	// phase is a wait and pg_stat_activity still knows the pid.
+	Blocker *Blocker
+}
+
+// Blocker describes a session an index build is waiting on.
+type Blocker struct {
+	PID             int
+	ApplicationName string
+	State           string
+	TransactionAge  string
+	Query           string
 }
 
 // noopLogger is used when no logger is configured on RDB.
@@ -45,8 +75,9 @@ type noopLogger struct{}
 
 func (noopLogger) LogLockTimeoutRetry(string, int, time.Duration, time.Duration, time.Duration) {
 }
-func (noopLogger) LogLockTimeoutGiveUp(int, time.Duration)      {}
-func (noopLogger) LogLockTimeoutInterrupted(int, time.Duration) {}
+func (noopLogger) LogLockTimeoutGiveUp(int, time.Duration)          {}
+func (noopLogger) LogLockTimeoutInterrupted(int, time.Duration)     {}
+func (noopLogger) LogIndexBuildProgress(string, IndexBuildProgress) {}
 
 // RDB wraps a *sql.DB and retries queries using an exponential backoff (with
 // jitter) on lock_timeout errors, up to a configurable wall-clock budget.
@@ -60,6 +91,27 @@ type RDB struct {
 
 	// Logger receives lock_timeout retry events. May be nil.
 	Logger Logger
+
+	// Monitor is a second, independent pool used to observe the migration
+	// session while it is busy (progress views, blocker lookups). It must
+	// not be DB: that pool is treated as one session carrying session-level
+	// SETs, and a second connection drawn from it would be handed back to the
+	// next statement without them. May be nil, which disables observation.
+	Monitor *sql.DB
+
+	// IndexProgressInterval is how often a concurrent index build reports
+	// progress through Logger. Zero uses DefaultIndexProgressInterval;
+	// negative disables reporting.
+	IndexProgressInterval time.Duration
+}
+
+// IndexProgressInterval returns the effective progress-reporting interval, or
+// a value <= 0 when reporting is disabled.
+func (db *RDB) EffectiveIndexProgressInterval() time.Duration {
+	if db.IndexProgressInterval == 0 {
+		return DefaultIndexProgressInterval
+	}
+	return db.IndexProgressInterval
 }
 
 func (db *RDB) logger() Logger {
@@ -68,6 +120,9 @@ func (db *RDB) logger() Logger {
 	}
 	return db.Logger
 }
+
+// EffectiveLogger returns the configured Logger, or a no-op one.
+func (db *RDB) EffectiveLogger() Logger { return db.logger() }
 
 func (db *RDB) retryBudget() time.Duration {
 	if db.LockRetryTimeout == 0 {

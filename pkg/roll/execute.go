@@ -173,6 +173,12 @@ func (m *Roll) readSchemaWithDeferredExcluding(ctx context.Context, excludeMigra
 	// processed before invoking ops on the returned schema.
 	s.MigrationScope = ""
 
+	// The replay marks every table a deferred migration created as
+	// CreatedInMigration, but those tables exist physically by now. Only the
+	// migration being started may claim that, so an index on a table from an
+	// earlier migration in the train is still built CONCURRENTLY.
+	s.ClearCreatedInMigration()
+
 	// Don't clean up physical-name-keyed Column entries even when a
 	// virtual-keyed entry now references the same physical column. The
 	// view-projection filter (skip `_pgroll_*` virtual keys in

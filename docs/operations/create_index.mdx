@@ -58,6 +58,19 @@ create_index:
 * You can also specify storage parameters for the index in `storage_parameters`.
 * To create a unique index set `unique` to `true`.
 
+## How the index is built
+
+On a pre-existing table the index is built with `CREATE INDEX CONCURRENTLY`,
+so the table stays readable and writable throughout. A concurrent build must
+wait for every transaction in the database whose snapshot is older than the
+build, whatever table that transaction reads; while it waits, pgroll logs the
+build's phase and the session it is waiting on at `--index-progress-interval`.
+
+On a table created earlier in the same migration the index is built with a
+plain `CREATE INDEX`. No transaction older than the table can hold a row of
+it and no application session can be reading it yet, so the concurrent
+build's waits would protect nothing.
+
 ## Examples
 
 ### Create a `btree` index

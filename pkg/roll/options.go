@@ -2,7 +2,11 @@
 
 package roll
 
-import "time"
+import (
+	"time"
+
+	"github.com/xataio/pgroll/pkg/migrations"
+)
 
 type options struct {
 	// lock timeout in milliseconds for pgroll DDL operations
@@ -33,6 +37,13 @@ type options struct {
 	migrationHooks MigrationHooks
 
 	verbose bool
+
+	// how often a concurrent index build reports progress; zero means the
+	// default, negative disables reporting
+	indexProgressInterval time.Duration
+
+	// logger to use instead of the default one (tests)
+	logger migrations.Logger
 }
 
 // MigrationHooks defines hooks that can be set to be called at various points
@@ -138,6 +149,23 @@ func WithSkipValidation(skip bool) Option {
 func WithRequireReversible() Option {
 	return func(o *options) {
 		o.requireReversible = true
+	}
+}
+
+// WithIndexProgressInterval sets how often a concurrent index build reports
+// its phase, counters and the session it is waiting on. Zero keeps the
+// default; a negative value disables the reports.
+func WithIndexProgressInterval(d time.Duration) Option {
+	return func(o *options) {
+		o.indexProgressInterval = d
+	}
+}
+
+// WithLogger replaces the Roll instance's logger. Intended for tests that need
+// to observe what a migration reports.
+func WithLogger(l migrations.Logger) Option {
+	return func(o *options) {
+		o.logger = l
 	}
 }
 
