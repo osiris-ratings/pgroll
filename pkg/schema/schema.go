@@ -41,6 +41,10 @@ type Schema struct {
 	// the parent migration's scope through its own pre-call setup).
 	// Excluded from JSON so it doesn't leak into resulting_schema.
 	MigrationScope string `json:"-"`
+
+	// shadowed holds soft-deleted tables whose virtual name a RenameTable
+	// took over, so the name's rollback can restore them.
+	shadowed map[string][]*Table
 }
 
 // Table represents a table in the schema
@@ -251,9 +255,21 @@ func (s *Schema) RenameTable(from, to string) error {
 		return fmt.Errorf("table %q already exists", to)
 	}
 
+	if existing, ok := s.Tables[to]; ok && existing.Deleted {
+		if s.shadowed == nil {
+			s.shadowed = make(map[string][]*Table)
+		}
+		s.shadowed[to] = append(s.shadowed[to], existing)
+	}
+
 	t := s.Tables[from]
 	s.Tables[to] = t
 	delete(s.Tables, from)
+
+	if stack := s.shadowed[from]; len(stack) > 0 {
+		s.Tables[from] = stack[len(stack)-1]
+		s.shadowed[from] = stack[:len(stack)-1]
+	}
 	return nil
 }
 

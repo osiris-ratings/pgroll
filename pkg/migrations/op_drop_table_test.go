@@ -319,6 +319,89 @@ func TestDropTableInMultiOperationMigrations(t *testing.T) {
 				})
 			},
 		},
+		{
+			name: "drop table, rename another table into its name",
+			migrations: []migrations.Migration{
+				{
+					Name: "01_create_tables",
+					Operations: migrations.Operations{
+						&migrations.OpCreateTable{
+							Name: "items",
+							Columns: []migrations.Column{
+								{Name: "id", Type: "serial", Pk: true},
+								{Name: "name", Type: "varchar(255)"},
+							},
+						},
+						&migrations.OpCreateTable{
+							Name: "new_items",
+							Columns: []migrations.Column{
+								{Name: "id", Type: "serial", Pk: true},
+								{Name: "name", Type: "varchar(255)"},
+								{Name: "description", Type: "varchar(255)"},
+							},
+						},
+					},
+				},
+				{
+					Name: "02_multi_operation",
+					Operations: migrations.Operations{
+						&migrations.OpDropTable{
+							Name: "items",
+						},
+						&migrations.OpRenameTable{
+							From: "new_items",
+							To:   "items",
+						},
+					},
+				},
+			},
+			afterStart: func(t *testing.T, db *sql.DB, schema string) {
+				// The new version's items table is the renamed one
+				MustInsert(t, db, schema, "02_multi_operation", "items", map[string]string{
+					"name":        "apples",
+					"description": "amazing",
+				})
+
+				// The old version still sees both tables under their own names
+				MustInsert(t, db, schema, "01_create_tables", "items", map[string]string{
+					"name": "apples",
+				})
+				MustInsert(t, db, schema, "01_create_tables", "new_items", map[string]string{
+					"name":        "apples",
+					"description": "amazing",
+				})
+			},
+			afterRollback: func(t *testing.T, db *sql.DB, schema string) {
+				// The dropped items table is back (the one without the
+				// description column)
+				MustNotInsert(t, db, schema, "01_create_tables", "items", map[string]string{
+					"name":        "apples",
+					"description": "amazing",
+				}, testutils.UndefinedColumnErrorCode)
+				MustInsert(t, db, schema, "01_create_tables", "items", map[string]string{
+					"name": "apples",
+				})
+
+				// The renamed table has its original name back
+				MustInsert(t, db, schema, "01_create_tables", "new_items", map[string]string{
+					"name":        "apples",
+					"description": "amazing",
+				})
+
+				// There is no soft-deleted version of the items table
+				TableMustNotExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("02_multi_operation"), "items"))
+			},
+			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
+				// items is the renamed table, with its description column
+				MustInsert(t, db, schema, "02_multi_operation", "items", map[string]string{
+					"name":        "bananas",
+					"description": "brilliant",
+				})
+
+				// The original items table is gone
+				TableMustNotExist(t, db, schema, migrations.DeletionName(migrations.MigrationScopeFor("02_multi_operation"), "items"))
+			},
+		},
 	})
 }
 
