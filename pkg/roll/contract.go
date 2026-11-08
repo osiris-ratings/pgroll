@@ -5,6 +5,8 @@ package roll
 import (
 	"context"
 	"fmt"
+
+	"github.com/xataio/pgroll/pkg/schema"
 )
 
 // FinishContraction contracts whatever the current deployment left pending
@@ -70,6 +72,11 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 					return 0, 0, err
 				}
 				if ok {
+					if err := m.requireLiveViews(ctx, live.VersionSchemaName(), func() (*schema.Schema, error) {
+						return m.readSchemaWithDeferred(ctx)
+					}); err != nil {
+						return 0, stamped, err
+					}
 					if err := m.DropVersionSchemasExcept(ctx, live.VersionSchemaName()); err != nil {
 						return 0, stamped, fmt.Errorf("unable to drop old version schemas: %w", err)
 					}
@@ -160,6 +167,11 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 					"resume it by re-running `pgroll migrate`, or abort it with `pgroll revert`. If apps are "+
 					"pinned to %q, restore it with `pgroll materialize` first", live.Name, versionSchema, versionSchema,
 			)
+		}
+		if err := m.requireLiveViews(ctx, live.VersionSchemaName(), func() (*schema.Schema, error) {
+			return m.readSchemaWithDeferred(ctx)
+		}); err != nil {
+			return 0, 0, err
 		}
 	}
 

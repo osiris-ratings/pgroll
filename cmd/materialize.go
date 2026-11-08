@@ -168,7 +168,7 @@ func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, version
 // Precedence:
 //  1. --version override, if set.
 //  2. Final unapplied migration's VersionSchemaName, if --migrations resolved any.
-//  3. state.LatestMigration, if non-nil and non-empty.
+//  3. The VersionSchemaName of state.LatestMigration, if there is one.
 //  4. Error — caller must pass --version or --migrations.
 func resolveMaterializeVersion(ctx context.Context, m *roll.Roll, parsedMigs []*migrations.Migration, override string) (string, error) {
 	if override != "" {
@@ -182,7 +182,11 @@ func resolveMaterializeVersion(ctx context.Context, m *roll.Roll, parsedMigs []*
 		return "", fmt.Errorf("reading latest migration from state: %w", err)
 	}
 	if latest != nil && *latest != "" {
-		return *latest, nil
+		mig, err := m.State().GetMigration(ctx, m.Schema(), *latest)
+		if err != nil {
+			return "", fmt.Errorf("reading latest migration %q from state: %w", *latest, err)
+		}
+		return mig.VersionSchemaName(), nil
 	}
 	return "", fmt.Errorf("no version name could be derived: pass --version or --migrations <dir>")
 }

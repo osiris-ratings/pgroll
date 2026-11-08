@@ -54,7 +54,7 @@ func TestOnCompleteSQLMigrationsAreNotIsolated(t *testing.T) {
 		Name: "sql",
 		Operations: migrations.Operations{
 			&migrations.OpRawSQL{
-				Up:         `foo`,
+				Up:         `SELECT 1`,
 				OnComplete: true,
 			},
 			&migrations.OpCreateTable{Name: "foo"},

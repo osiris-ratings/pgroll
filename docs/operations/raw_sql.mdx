@@ -34,7 +34,7 @@ The `onComplete` flag will make this operation run the `up` expression on the co
 
 `onComplete` flag is incompatible with `down` expression, as `pgroll` does not support running rollback after complete was executed.
 
-An `onComplete` statement runs in a transaction while apps still read the version schema of the migration being completed, and `pgroll` never drops or rebuilds that schema's views. A statement that one of its views depends on (for example dropping or retyping a column the view reads) fails `pgroll complete` and changes nothing, as does one that would drop such a view with `CASCADE` while its table remains. A table or column the statement adds is not in that version schema; the next migration's version schema shows it.
+An `onComplete` statement runs in a transaction while apps still read the version schema of the migration being completed, and `pgroll` never drops or rebuilds that schema's views. A statement that one of its views depends on (for example dropping or retyping a column the view reads) fails `pgroll complete` and changes nothing, as does one that would drop such a view with `CASCADE` while its table remains. A table or column the statement adds is not in that version schema; the next migration's version schema shows it. The statement must not control transactions (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`): such a migration fails validation. A statement that cannot run in a transaction, such as `CREATE INDEX CONCURRENTLY`, runs outside one and runs again if `pgroll complete` is retried, so write it to be re-runnable (`IF NOT EXISTS`).
 
 <YamlJsonTabs>
 ```yaml

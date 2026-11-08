@@ -242,8 +242,9 @@ func contractionCorpus() []contractionCase {
 		},
 		{
 			// A statement Postgres refuses inside a transaction runs outside
-			// the one that guards the live views.
-			name: "raw_sql_create_index_concurrently",
+			// the one that guards the live views, so nothing rolls it back:
+			// a retry runs it again, and only IF NOT EXISTS makes that safe.
+			name: "raw_sql_create_index_concurrently_if_not_exists",
 			train: []*migrations.Migration{rawOnComplete("01_raw_index",
 				"CREATE INDEX CONCURRENTLY IF NOT EXISTS t_value_cidx ON t (value)")},
 			leaf: events(),

@@ -247,7 +247,7 @@ func (db *RDB) WithRetryableTransaction(ctx context.Context, f func(context.Cont
 		}
 
 		if errRollback := tx.Rollback(); errRollback != nil {
-			return errRollback
+			return errors.Join(err, errRollback)
 		}
 
 		if !isLockNotAvailable(err) {

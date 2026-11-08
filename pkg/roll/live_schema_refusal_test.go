@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 	"github.com/xataio/pgroll/internal/testutils"
 	"github.com/xataio/pgroll/pkg/backfill"
+	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
 )
@@ -219,5 +221,179 @@ func TestTailLocksTableBeforeSequence(t *testing.T) {
 			require.NoError(t, err, "the app must not deadlock with the tail")
 			require.NoError(t, app.Commit())
 			require.NoError(t, <-done)
+		})
+}
+
+// transactionControlCases are onComplete statements that end the transaction
+// contraction runs them in, as an independent review of #68 reproduced:
+// contracting the first three times applied the UPDATE three times and never
+// finished; the second left the live view dropped and every retry failing.
+var transactionControlCases = map[string]string{
+	"update":  "BEGIN; UPDATE t SET value = value || 'x'; COMMIT;",
+	"cascade": "BEGIN; ALTER TABLE t DROP COLUMN value CASCADE; COMMIT;",
+}
+
+// TestOnCompleteRawSQLWithTransactionControlIsInvalid: such a statement fails
+// validation, so the train fails before anything is applied.
+func TestOnCompleteRawSQLWithTransactionControlIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	for name, stmt := range transactionControlCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+				ctx := context.Background()
+				createBase(t, mig, db)
+
+				err := mig.Start(ctx, rawOnComplete("01_raw", stmt), backfill.NewConfig())
+				require.ErrorContains(t, err, "must not control transactions")
+
+				active, err := mig.State().IsActiveMigrationPeriod(ctx, cSchema)
+				require.NoError(t, err)
+				assert.False(t, active, "nothing was started")
+			})
+		})
+	}
+}
+
+// TestContractionRefusesRawSQLWithTransactionControl: such a statement that
+// is already queued (applied by an older pgroll) is refused before it runs,
+// every time, with the data and the live view as they were.
+func TestContractionRefusesRawSQLWithTransactionControl(t *testing.T) {
+	t.Parallel()
+
+	for name, stmt := range transactionControlCases {
+		for _, p := range contractionPaths {
+			t.Run(name+"/"+p.name, func(t *testing.T) {
+				t.Parallel()
+				testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, cSchema,
+					[]roll.Option{roll.WithSkipValidation(true)},
+					func(mig *roll.Roll, db *sql.DB) {
+						ctx := context.Background()
+						createBase(t, mig, db)
+						p.apply(t, mig, []*migrations.Migration{rawOnComplete("01_raw", stmt), leafCreatingEvents("02_leaf")})
+
+						for range 3 {
+							require.ErrorContains(t, pgrollComplete(ctx, mig), "must not control transactions")
+						}
+						var value string
+						require.NoError(t, db.QueryRow("SELECT value FROM t WHERE id = 1").Scan(&value))
+						assert.Equal(t, "a", value, "the statement must not have run")
+						assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
+						assert.True(t, viewHasColumn(t, db, roll.VersionedSchemaName(cSchema, "02_leaf"), "t", "value"))
+					})
+			})
+		}
+	}
+}
+
+// TestContractionRefusesWhenLiveViewMissing: a live view is gone before
+// `pgroll complete` runs. Contracting would finish with apps still unable to
+// read that table, so it refuses, naming the view. Tables created after the
+// live schema (a partition pg_partman adds, a table added by hand) were never
+// projected and are not missing. Once materialize creates the view, it
+// contracts.
+func TestContractionRefusesWhenLiveViewMissing(t *testing.T) {
+	t.Parallel()
+
+	for _, p := range contractionPaths {
+		t.Run(p.name, func(t *testing.T) {
+			t.Parallel()
+			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+				ctx := context.Background()
+				createBase(t, mig, db)
+				_, err := db.ExecContext(ctx, `CREATE TABLE pt (id integer, at date) PARTITION BY RANGE (at);
+					CREATE TABLE pt_2026 PARTITION OF pt FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+				require.NoError(t, err)
+				p.apply(t, mig, []*migrations.Migration{
+					{Name: "01_drop_value", Operations: migrations.Operations{
+						&migrations.OpDropColumn{Table: "t", Column: "value", Down: "''"},
+					}},
+					leafCreatingEvents("02_leaf"),
+				})
+				live := roll.VersionedSchemaName(cSchema, "02_leaf")
+				_, err = db.ExecContext(ctx, fmt.Sprintf(`
+					CREATE TABLE pt_2027 PARTITION OF pt FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+					CREATE TABLE added_later (id integer);
+					DROP VIEW %s.hot`, live))
+				require.NoError(t, err)
+
+				err = pgrollComplete(ctx, mig)
+				require.ErrorContains(t, err, "missing view "+liveView("02_leaf", "hot")+",")
+				assert.NotContains(t, err.Error(), "pt_2027")
+				assert.NotContains(t, err.Error(), "added_later")
+				assert.Equal(t, []string{roll.VersionedSchemaName(cSchema, "00_base"), live}, versionSchemas(t, db),
+					"no version schema is dropped")
+				assert.True(t, columnExists(t, db, cSchema, "t", "value"), "nothing is contracted")
+
+				sc, err := mig.ReadSchemaWithDeferred(ctx)
+				require.NoError(t, err)
+				require.NoError(t, mig.Materialize(ctx, "02_leaf", sc))
+				require.NoError(t, pgrollComplete(ctx, mig))
+				assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
+			})
+		})
+	}
+}
+
+// failMatching fails every statement run on pgroll's DDL connection whose
+// text contains match.
+type failMatching struct {
+	db.DB
+	match string
+}
+
+func (f *failMatching) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	if strings.Contains(query, f.match) {
+		return nil, fmt.Errorf("injected failure: %s", query)
+	}
+	return f.DB.ExecContext(ctx, query, args...)
+}
+
+// TestTailRetryDoesNotLockTable: the duplicator tail committed and the
+// contraction then failed. Its retry has nothing left to do to the table, so
+// it must not wait for an ACCESS EXCLUSIVE lock on it for the tail.
+func TestTailRetryDoesNotLockTable(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, cSchema,
+		[]roll.Option{roll.WithLockTimeoutMs(10000)},
+		func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+			createBase(t, mig, db)
+			applyAdditiveTrain(t, mig, []*migrations.Migration{
+				{Name: "01_value_to_text", Operations: migrations.Operations{
+					&migrations.OpAlterColumn{Table: "t", Column: "value", Type: ptr("text"), Up: "value", Down: "value"},
+				}},
+				leafCreatingEvents("02_leaf"),
+			})
+
+			// The tail commits; dropping the backfill marker after it fails.
+			fc := &failMatching{match: "_pgroll_needs_backfill"}
+			fc.DB = roll.SwapConnForTest(mig, fc)
+			require.Error(t, mig.Complete(ctx))
+			roll.SwapConnForTest(mig, fc.DB)
+			require.Equal(t, "text", columnType(t, db, "t", "value"), "the tail committed")
+
+			app, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			defer func() { _ = app.Rollback() }()
+			_, err = app.ExecContext(ctx, "SELECT 1 FROM t LIMIT 1")
+			require.NoError(t, err)
+
+			done := make(chan error, 1)
+			go func() { done <- mig.Complete(ctx) }()
+
+			var waiting string
+			require.Eventually(t, func() bool {
+				return db.QueryRow(`SELECT a.query FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+					WHERE NOT l.granted AND a.application_name = 'pgroll' AND l.relation = 't'::regclass`).
+					Scan(&waiting) == nil
+			}, 20*time.Second, 50*time.Millisecond)
+			assert.NotContains(t, waiting, "LOCK TABLE", "the retry's tail must not lock the table")
+
+			require.NoError(t, app.Commit())
+			require.NoError(t, <-done)
+			assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
 		})
 }

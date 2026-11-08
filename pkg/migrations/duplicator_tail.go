@@ -78,10 +78,13 @@ func (a *duplicatorTail) Execute(ctx context.Context) error {
 		}
 		// The table first: moving sequence ownership locks the sequence, and
 		// taken before the table it deadlocks with an app transaction that
-		// holds a row lock on the table and then calls nextval.
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE",
-			pq.QuoteIdentifier(table.Name))); err != nil {
-			return err
+		// holds a row lock on the table and then calls nextval. A retry after
+		// the tail committed has nothing left to do to the table.
+		if slices.ContainsFunc(a.columns, duplicatedColumn.pending) {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE",
+				pq.QuoteIdentifier(table.Name))); err != nil {
+				return err
+			}
 		}
 		for _, c := range a.columns {
 			temp := TemporaryName(a.scope, c.name)

@@ -34,6 +34,60 @@ func (m *Roll) hasVersionSchema(ctx context.Context, mig *migrations.Migration) 
 	return slices.Contains(existing, VersionedSchemaName(m.schema, mig.VersionSchemaName())), nil
 }
 
+// requireLiveViews refuses a contraction when the version schema of `version`
+// is missing a view of a table project returns. Only a table that already
+// existed when that schema was created counts: one created after it, such as a
+// partition pg_partman adds or a table onComplete SQL creates, was never
+// projected. When the projection cannot be rebuilt (a Complete that ran part
+// way), there is nothing to compare against and the check is skipped.
+func (m *Roll) requireLiveViews(ctx context.Context, version string, project func() (*schema.Schema, error)) error {
+	projection, err := project()
+	if err != nil {
+		m.logger.Info("not checking the live views: their projection cannot be rebuilt", "error", err.Error())
+		return nil
+	}
+	versionSchema := VersionedSchemaName(m.schema, version)
+	views, err := liveViewReads(ctx, m.pgConn, versionSchema)
+	if err != nil {
+		return err
+	}
+	rows, err := m.pgConn.QueryContext(ctx, `SELECT c.relname FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
+			AND c.oid < (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $2)`, m.schema, versionSchema)
+	if err != nil {
+		return fmt.Errorf("unable to list the tables %q projects: %w", versionSchema, err)
+	}
+	defer rows.Close()
+	older := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("unable to scan table name: %w", err)
+		}
+		older[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	var missing []string
+	for name, table := range projection.Tables {
+		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") || !older[table.Name] ||
+			slices.ContainsFunc(views, func(r liveViewRead) bool { return r.view == name }) {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("cannot contract: the live version schema is missing %s, which apps read, and "+
+		"contraction would finish without it. Restore it with `pgroll materialize`, then run `pgroll complete` "+
+		"again", qualifiedViews(versionSchema, missing))
+}
+
 // guardLiveViews runs every onComplete raw SQL action among a contraction's
 // actions as a liveSQLAction against the live version schema of `live`. The
 // actions are `completing`'s; pendingLeaf is the active migration when its
@@ -96,6 +150,10 @@ type liveSQLAction struct {
 func (a *liveSQLAction) ID() string { return a.raw.ID() }
 
 func (a *liveSQLAction) Execute(ctx context.Context) error {
+	if err := migrations.CheckNoTransactionControl(a.raw.SQL()); err != nil {
+		return fmt.Errorf("%w. It was not run, the contraction stopped and the live schema is unchanged; the "+
+			"deployment stays uncontracted until the statement is changed by hand", err)
+	}
 	err := a.m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		before, err := liveViewReads(ctx, tx, a.schema)
 		if err != nil {

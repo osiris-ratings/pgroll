@@ -495,6 +495,11 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 				"interrupted, resume it by re-running `pgroll migrate`. If apps are pinned to %q, restore it with "+
 				"`pgroll materialize`, then run `pgroll complete` again", migration.Name, versionSchema, versionSchema)
 		}
+		if err := m.requireLiveViews(ctx, migration.VersionSchemaName(), func() (*schema.Schema, error) {
+			return m.readSchemaReplaying(ctx, "", migration)
+		}); err != nil {
+			return err
+		}
 		live = migration
 	}
 

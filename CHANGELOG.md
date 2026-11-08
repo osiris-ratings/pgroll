@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`onComplete` raw SQL that a live view blocks, or that would remove one,
+  now stops the contraction.** Dropping or retyping a column a live view
+  reads, or a `CASCADE` that would take a live view with it while its table
+  remains, fails `pgroll complete` and changes nothing. The deployment
+  stays uncontracted until the statement is changed by hand, in the
+  migration and in pgroll's migrations table. Run such SQL at Start, in a
+  migration of its own.
+- **`onComplete` raw SQL may not control transactions.** `BEGIN`, `COMMIT`,
+  `ROLLBACK`, `SAVEPOINT` and the like are rejected when the migration is
+  validated, before anything is applied, and so is `onComplete` SQL pgroll
+  cannot parse, since it cannot tell. One already queued by an older pgroll
+  is refused at contraction, before it runs, and the deployment stays
+  uncontracted until it is changed by hand.
+- **What `onComplete` raw SQL adds is not in the live version schema.** A
+  table or column it creates appears in the next migration's version
+  schema, not the one apps read when it runs.
+- **A statement that cannot run in a transaction runs again on retry.**
+  `onComplete` SQL such as `CREATE INDEX CONCURRENTLY` runs outside the
+  contraction's transaction, so nothing rolls it back; write it to be
+  re-runnable (`IF NOT EXISTS`).
+- **`pgroll complete` refuses to contract without the live version
+  schema, or with a view missing from it.** Restore what is missing with
+  `pgroll materialize`, then run `pgroll complete` again.
+
 ### Fixed
 
 - **Contraction never drops or rebuilds the live version schema, and
@@ -25,37 +51,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `pgroll complete` refuses when the version schema it would keep does
     not exist, with a migration active or contraction queued, resumed or
     not. Contraction drops every other version schema, so it would leave
-    apps none. Restore it with `pgroll materialize`.
+    apps none.
+  - It also refuses when that schema is missing a view of a table that
+    existed when the schema was created. A table created after it, such as
+    a partition pg_partman adds, was never projected and does not count.
   - With nothing queued and a leaf that has no version schema, contraction
     drops nothing, as in 0.16.2-baselayer.25.
   - Each `onComplete` raw SQL statement runs in a transaction that records
-    the live views first. A statement a live view blocks (2BP01, 0A000)
-    fails the contraction, naming the view, with the live schema unchanged.
-    One that drops a live view while its table remains (a `CASCADE`) is
-    rolled back and fails the same way. A statement that cannot run in a
-    transaction (`CONCURRENTLY`) runs outside one and is checked after.
+    the live views first and rolls back if one is gone while its table
+    remains. A statement a live view blocks (2BP01, 0A000) fails, naming the
+    view.
   - The one exception is a sealed revert's inverse of a raw SQL migration,
     which runs that migration's `down`: inside the same transaction it may
     drop the live views the `down` blocks and recreate those whose table
     remains, so `pgroll revert` still works across raw SQL.
-  - What `onComplete` raw SQL adds (a table, a column) is not in the live
-    version schema; the next migration's version schema shows it.
 - **A duplicator tail an older pgroll interrupted is refused, not
   guessed.** When the original column is gone and its duplicate was never
   renamed into place, the table's primary key and constraints on that
   column went with it. The contraction now fails naming the table and
   column instead of finishing without them.
-- **The duplicator tail locks its table first.** Moving sequence ownership
-  before taking the table deadlocked with an app transaction that held a
-  row lock on the table and then called `nextval`.
+- **The duplicator tail locks its table first,** and only when it has work
+  left. Moving sequence ownership before taking the table deadlocked with
+  an app transaction that held a row lock on the table and then called
+  `nextval`.
+- **A failed transaction whose rollback also fails returns both errors,**
+  not only the rollback's.
 
 ### Changed
 
 - **`pgroll materialize` only creates what is missing.** It never drops or
   rebuilds a view that exists. With a migration in progress it projects that
   migration's Start, and creates nothing when the Start cannot be replayed
-  over the tables. With contraction queued and nothing active, it projects
-  the queued Starts rather than the bare tables.
+  over the tables. With nothing in progress it targets the latest
+  migration's version schema, by its `versionSchema` name when it has one,
+  and with contraction queued projects the queued Starts rather than the
+  bare tables.
 
 ## [0.16.2-baselayer.26] - 2026-11-08
 

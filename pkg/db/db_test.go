@@ -5,6 +5,7 @@ package db_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -173,6 +174,27 @@ func TestWithRetryableTransaction(t *testing.T) {
 			return tx.QueryRowContext(ctx, "SELECT 1 FROM test").Err()
 		})
 		require.NoError(t, err)
+	})
+}
+
+// TestWithRetryableTransactionKeepsErrorWhenRollbackFails: when the rollback
+// after a failure fails too (here because the transaction was already
+// committed), the failure is still returned, not only the rollback's error.
+func TestWithRetryableTransactionKeepsErrorWhenRollbackFails(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithConnectionToContainer(t, func(conn *sql.DB, _ string) {
+		ctx := context.Background()
+		failure := errors.New("the statement failed")
+
+		rdb := &db.RDB{DB: conn}
+		err := rdb.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, "COMMIT"); err != nil {
+				return err
+			}
+			return failure
+		})
+		require.ErrorIs(t, err, failure)
 	})
 }
 

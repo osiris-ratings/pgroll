@@ -4,6 +4,10 @@ package migrations
 
 import (
 	"context"
+	"fmt"
+	"strings"
+
+	pgq "github.com/xataio/pg_query_go/v6"
 
 	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/schema"
@@ -56,6 +60,39 @@ func (o *OpRawSQL) Validate(ctx context.Context, s *schema.Schema) error {
 		return InvalidMigrationError{Reason: "down is not allowed with onComplete"}
 	}
 
+	if o.OnComplete {
+		if err := CheckNoTransactionControl(o.Up); err != nil {
+			return InvalidMigrationError{Reason: err.Error()}
+		}
+	}
+
+	return nil
+}
+
+// CheckNoTransactionControl fails when sql holds a top-level transaction
+// control statement (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, ...), or cannot be
+// parsed to tell. Contraction runs onComplete SQL inside a transaction of its
+// own, and such a statement would end it early.
+func CheckNoTransactionControl(sql string) error {
+	tree, err := pgq.Parse(sql)
+	if err != nil {
+		return fmt.Errorf("onComplete SQL could not be parsed, so pgroll cannot tell whether it controls "+
+			"transactions: %w", err)
+	}
+	for _, raw := range tree.GetStmts() {
+		if raw.GetStmt().GetTransactionStmt() == nil {
+			continue
+		}
+		stmt := sql
+		if start, n := int(raw.GetStmtLocation()), int(raw.GetStmtLen()); start >= 0 && start < len(sql) {
+			stmt = sql[start:]
+			if n > 0 && start+n <= len(sql) {
+				stmt = sql[start : start+n]
+			}
+		}
+		return fmt.Errorf("onComplete SQL must not control transactions, and %q does: pgroll runs it inside a "+
+			"transaction of its own to keep the live version schema whole", strings.TrimSpace(stmt))
+	}
 	return nil
 }
 
