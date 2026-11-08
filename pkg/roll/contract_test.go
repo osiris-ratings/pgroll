@@ -157,20 +157,18 @@ func TestContractionKeepsLiveSchemaForAdditiveDrain(t *testing.T) {
 		})
 }
 
-// TestContractionLiveSchemaHandlingPerOp is the empirical gate for skipping
-// the live-schema drop. Each case applies a deferred batch that contracts
+// TestContractionLiveSchemaHandlingPerOp is the empirical gate for keeping
+// the live schema in place. Each case applies a deferred batch that contracts
 // table `t`, while a backend holds the live view of an UNRELATED table `hot`
-// (which the migration never touches) with retries disabled. For every typed
-// contraction the drain must succeed WITHOUT dropping the live schema — so
-// the held `hot` view never blocks it. Only opaque onComplete raw SQL forces
-// the whole-schema drop, which the held view then blocks.
+// (which the migration never touches) with retries disabled. Every
+// contraction, onComplete raw SQL included, must drain WITHOUT dropping the
+// live schema — so the held `hot` view never blocks it.
 func TestContractionLiveSchemaHandlingPerOp(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name      string
 		op        migrations.Operation
-		wantErr   bool // opaque raw SQL: full-schema drop blocked by the held view
 		tViewGone bool // drop_table removes t's own view
 	}{
 		{
@@ -202,9 +200,8 @@ func TestContractionLiveSchemaHandlingPerOp(t *testing.T) {
 			tViewGone: true,
 		},
 		{
-			name:    "opaque_oncomplete_raw_sql",
-			op:      &migrations.OpRawSQL{Up: "SELECT 1", OnComplete: true},
-			wantErr: true,
+			name: "opaque_oncomplete_raw_sql",
+			op:   &migrations.OpRawSQL{Up: "SELECT 1", OnComplete: true},
 		},
 	}
 
@@ -246,13 +243,8 @@ func TestContractionLiveSchemaHandlingPerOp(t *testing.T) {
 					defer release()
 
 					_, _, err := mig.FinishContraction(ctx)
-					if tc.wantErr {
-						require.Error(t, err,
-							"opaque drain must take the full-schema drop, which the held view blocks")
-						return
-					}
 					require.NoError(t, err,
-						"a typed contraction must drain without dropping the live schema")
+						"a contraction must drain without dropping the live schema")
 
 					assert.True(t, schemaExists(t, db, live), "live schema must remain")
 					assert.True(t, viewExists(t, db, live, "hot"),

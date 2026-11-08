@@ -35,12 +35,24 @@ func NewCoordinator(actions []DBAction) *Coordinator {
 
 // Execute runs all actions in the order they were added to the coordinator.
 func (c *Coordinator) Execute(ctx context.Context) error {
+	return c.ExecuteWithRecovery(ctx, nil)
+}
+
+// ExecuteWithRecovery is Execute with a second chance: an action that fails
+// is handed to recover with its error, and recover either runs it another way
+// (returning nil) or returns the error to fail with. A nil recover is plain
+// Execute.
+func (c *Coordinator) ExecuteWithRecovery(ctx context.Context, recover func(context.Context, DBAction, error) error) error {
 	for _, id := range c.orderedActions {
 		action, exists := c.actions[id]
 		if !exists {
 			return fmt.Errorf("action %s not found", id)
 		}
-		if err := action.Execute(ctx); err != nil {
+		err := action.Execute(ctx)
+		if err != nil && recover != nil {
+			err = recover(ctx, action, err)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to execute action %s: %w", id, err)
 		}
 	}

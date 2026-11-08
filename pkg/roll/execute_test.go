@@ -1934,6 +1934,12 @@ func TestDeferCompleteDrainFailureIsResumable(t *testing.T) {
 		assert.Contains(t, err.Error(), "nonexistent",
 			"error must identify the failing column reference")
 
+		// The live version schema apps are pinned to survives the failed
+		// drain: the onComplete raw SQL ran with its views in place.
+		live := roll.VersionedSchemaName(cSchema, "02_create_events")
+		assert.True(t, schemaExists(t, db, live), "a failed drain must not leave the live schema dropped")
+		MustSelect(t, db, cSchema, "02_create_events", "users")
+
 		// All drained migrations remain in the deferred queue. The clear
 		// happens only after the merged Coordinator succeeds end-to-end,
 		// so a partial failure leaves the queue intact for resumable
@@ -1955,6 +1961,8 @@ func TestDeferCompleteDrainFailureIsResumable(t *testing.T) {
 
 		// events table exists from V2's drained operations.
 		assert.True(t, tableExists(t, db, cSchema, "events"))
+		assert.True(t, schemaExists(t, db, live), "the live schema must exist after the retry")
+		MustSelect(t, db, cSchema, "02_create_events", "events")
 	})
 }
 

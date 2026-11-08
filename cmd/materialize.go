@@ -33,7 +33,11 @@ func materializeCmd() *cobra.Command {
 			"NOT execute migration operations against user tables.\n\n" +
 			"Pass --migrations <dir> to fast-forward through unapplied migration files in\n" +
 			"memory before projecting views; this lets the projected views match what apps\n" +
-			"will see after those migrations land, even though the live tables haven't yet.",
+			"will see after those migrations land, even though the live tables haven't yet.\n\n" +
+			"While a migration is in progress, materialize re-projects that migration's\n" +
+			"version schema, the one apps are pinned to, as its Start projected it: the\n" +
+			"recovery for a contraction that left it missing. --migrations and --version\n" +
+			"do not apply then.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -49,11 +53,7 @@ func materializeCmd() *cobra.Command {
 				return fmt.Errorf("unable to determine active migration period: %w", err)
 			}
 			if active {
-				return fmt.Errorf(
-					"a migration is currently in progress on schema %q; "+
-						"run `pgroll rollback` (or wait for the active run to finish) before materializing",
-					m.Schema(),
-				)
+				return materializeActive(ctx, m, migrationsDir, versionOverride, yes)
 			}
 
 			sc, err := m.State().ReadSchema(ctx, m.Schema())
@@ -116,6 +116,46 @@ func materializeCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 
 	return cmd
+}
+
+// materializeActive re-projects the active migration's version schema. It
+// never suggests `pgroll rollback`: rolling back the active migration would
+// undo its expand under the code that is already reading it.
+func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, versionOverride string, yes bool) error {
+	if migrationsDir != "" || versionOverride != "" {
+		return fmt.Errorf("a migration is in progress on schema %q: materialize re-projects its version "+
+			"schema as its Start did, so --migrations and --version do not apply", m.Schema())
+	}
+	active, err := m.State().GetActiveMigration(ctx, m.Schema())
+	if err != nil {
+		return fmt.Errorf("unable to get active migration: %w", err)
+	}
+	target := roll.VersionedSchemaName(m.Schema(), active.VersionSchemaName())
+
+	title := pterm.NewStyle(pterm.FgWhite, pterm.Bold).Sprint("▶ pgroll materialize")
+	fmt.Fprintf(os.Stdout, "\n%s   %s\n\n", title, pterm.FgGray.Sprintf("%s · migration %s in progress", m.Schema(), active.Name))
+	fmt.Fprintf(os.Stdout, "  %s %s  re-project the live version schema %s from the tables\n\n",
+		pterm.FgCyan.Sprint("●"), pterm.NewStyle(pterm.FgCyan, pterm.Bold).Sprint("RESTORE"), target)
+
+	if !yes {
+		ok, _ := pterm.DefaultInteractiveConfirm.Show(fmt.Sprintf("Restore version schema %q?", target))
+		if !ok {
+			return nil
+		}
+	}
+
+	sp, _ := pterm.DefaultSpinner.WithText(fmt.Sprintf("Restoring %q...", target)).Start()
+	_, n, err := m.RestoreActiveVersionSchema(ctx)
+	if err != nil {
+		sp.Fail(fmt.Sprintf("Failed to restore %q: %s", target, err))
+		return err
+	}
+	if n == 0 {
+		sp.Success(fmt.Sprintf("Version schema %q is complete; nothing to restore", target))
+	} else {
+		sp.Success(fmt.Sprintf("Version schema %q restored: %d view(s) created or rebuilt", target, n))
+	}
+	return nil
 }
 
 // resolveMaterializeVersion picks the version name to materialize.

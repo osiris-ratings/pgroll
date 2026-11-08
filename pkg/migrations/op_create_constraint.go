@@ -4,6 +4,7 @@ package migrations
 
 import (
 	"context"
+	"slices"
 
 	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/db"
@@ -131,9 +132,15 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
+	columns := duplicatedColumns(table, scope, o.Columns...)
+	resuming := slices.ContainsFunc(columns, func(c duplicatedColumn) bool { return !c.pending() })
+
 	dbActions := make([]DBAction, 0)
-	switch o.Type {
-	case OpCreateConstraintTypeUnique:
+	// The constraint steps run before the tail; resuming one an older pgroll
+	// interrupted, or retrying one that committed, they already ran.
+	switch {
+	case resuming:
+	case o.Type == OpCreateConstraintTypeUnique:
 		uniqueOp := &OpSetUnique{
 			Table: o.Table,
 			Name:  o.Name,
@@ -143,7 +150,7 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 			return nil, err
 		}
 		dbActions = append(dbActions, actions...)
-	case OpCreateConstraintTypeCheck:
+	case o.Type == OpCreateConstraintTypeCheck:
 		checkOp := &OpSetCheckConstraint{
 			Table: o.Table,
 			Check: CheckConstraint{
@@ -155,7 +162,7 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 			return nil, err
 		}
 		dbActions = append(dbActions, actions...)
-	case OpCreateConstraintTypeForeignKey:
+	case o.Type == OpCreateConstraintTypeForeignKey:
 		fkOp := &OpSetForeignKey{
 			Table: o.Table,
 			References: ForeignKeyReference{
@@ -167,29 +174,16 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 			return nil, err
 		}
 		dbActions = append(dbActions, actions...)
-	case OpCreateConstraintTypePrimaryKey:
+	case o.Type == OpCreateConstraintTypePrimaryKey:
 		dbActions = append(dbActions, NewAddPrimaryKeyAction(conn, table.Name, o.Name))
 	}
 
-	for _, col := range o.Columns {
-		dbActions = append(dbActions, NewAlterSequenceOwnerAction(conn, table.Name, col, TemporaryName(scope, col)))
-	}
-
-	dbActions = append(dbActions, NewDropColumnAction(conn, table.Name, o.Columns...))
-
-	// rename new columns to old name
-	for _, col := range o.Columns {
-		column := table.GetColumn(col)
-		if column == nil {
-			return nil, ColumnDoesNotExistError{Table: o.Table, Name: col}
+	for _, c := range columns {
+		if c.pending() && table.GetColumn(c.name) == nil {
+			return nil, ColumnDoesNotExistError{Table: o.Table, Name: c.name}
 		}
-		dbActions = append(dbActions, NewRenameDuplicatedColumnAction(conn, scope, table, col))
 	}
-	dbActions = append(
-		dbActions,
-		o.removeTriggers(conn, scope),
-		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-	)
+	dbActions = append(dbActions, duplicatorTailActions(conn, scope, table, o.Table, columns)...)
 
 	return dbActions, nil
 }

@@ -132,13 +132,13 @@ func TestCompleteMustBeDeferred(t *testing.T) {
 	}
 }
 
-func TestCompleteRequiresLiveSchemaDrop(t *testing.T) {
+func TestCompleteRunsRawSQL(t *testing.T) {
 	t.Parallel()
 
-	// Only onComplete raw SQL (opaque) forces the live-schema drop. Every typed
-	// contraction leaves the live views valid (Postgres auto-follows the
-	// underlying renames; the view never references dropped originals), so the
-	// drop is unnecessary — proven per op by the seal tests.
+	// Only onComplete raw SQL runs at Complete. Every typed contraction leaves
+	// the live views valid (Postgres auto-follows the underlying renames; the
+	// view never references dropped originals) — proven per op by the seal
+	// tests.
 	cases := map[string]struct {
 		ops    migrations.Operations
 		expect bool
@@ -199,7 +199,7 @@ func TestCompleteRequiresLiveSchemaDrop(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			m := &migrations.Migration{Name: "x", Operations: tc.ops}
-			assert.Equal(t, tc.expect, m.CompleteRequiresLiveSchemaDrop())
+			assert.Equal(t, tc.expect, m.CompleteRunsRawSQL())
 		})
 	}
 }

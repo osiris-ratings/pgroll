@@ -103,23 +103,33 @@ func (m *Roll) readSchemaWithDeferred(ctx context.Context) (*schema.Schema, erro
 // (not the temp this migration installed). All *other* still-deferred
 // migrations are replayed normally.
 func (m *Roll) readSchemaWithDeferredExcluding(ctx context.Context, excludeMigration string) (*schema.Schema, error) {
+	return m.readSchemaReplaying(ctx, excludeMigration, nil)
+}
+
+// readSchemaReplaying is readSchemaWithDeferredExcluding that also replays
+// `leaf` after the deferred queue: the active migration, whose Start has run
+// physically and whose Complete has not. That reproduces the schema the
+// leaf's Start projected its version schema from (see liveProjection).
+func (m *Roll) readSchemaReplaying(ctx context.Context, excludeMigration string, leaf *migrations.Migration) (*schema.Schema, error) {
 	s, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return nil, err
 	}
+	return m.replayPending(ctx, s, []string{excludeMigration}, leaf)
+}
 
+// replayPending replays, over the physical schema s, every still-deferred
+// Start except the excluded ones, then leaf's (see readSchemaReplaying).
+func (m *Roll) replayPending(ctx context.Context, s *schema.Schema, exclude []string, leaf *migrations.Migration) (*schema.Schema, error) {
 	deferred, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return nil, fmt.Errorf("unable to query deferred completes: %w", err)
 	}
-	if excludeMigration != "" {
-		filtered := deferred[:0]
-		for _, dm := range deferred {
-			if dm.Name != excludeMigration {
-				filtered = append(filtered, dm)
-			}
-		}
-		deferred = filtered
+	deferred = slices.DeleteFunc(deferred, func(dm *migrations.Migration) bool {
+		return slices.Contains(exclude, dm.Name)
+	})
+	if leaf != nil && !slices.ContainsFunc(deferred, func(dm *migrations.Migration) bool { return dm.Name == leaf.Name }) {
+		deferred = append(deferred, leaf)
 	}
 	if len(deferred) == 0 {
 		return s, nil
@@ -439,7 +449,7 @@ func WithDeferComplete() CompleteOption {
 }
 
 // Complete will update the database schema to match the current version
-func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
+func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error) {
 	var o completeOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -466,6 +476,26 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 		}
 		m.logger.Info("complete deferred — operations will replay at next non-deferred Complete", "migration", migration.Name)
 		return nil
+	}
+
+	// The live version schema is the active migration's: apps are pinned to
+	// it. Contraction keeps it whole, whatever happens below. A contraction
+	// an older binary, a crash or a kill left part-way may already have
+	// dropped it, so put it back before anything else: apps recover now, not
+	// after the drain. Then put back whatever a failure or cancel leaves
+	// missing on the way out.
+	var guard *liveGuard
+	if !o.skipSchemaDrop && !m.disableVersionSchemas {
+		guard = &liveGuard{live: migration, pendingLeaf: true}
+		if _, err := m.restoreLiveViews(ctx, guard, false); err != nil {
+			return fmt.Errorf("the live version schema %q is incomplete and could not be restored; "+
+				"nothing was contracted: %w", guard.versionSchema(m), err)
+		}
+		defer func() {
+			if err != nil {
+				err = m.restoreAfterFailure(ctx, guard, err)
+			}
+		}()
 	}
 
 	// Drop every other version schema, keeping only the version being
@@ -511,28 +541,15 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	// the prev-production schema around, which would block destructive
 	// drained DDL with the same dependency error the deferral was set up
 	// to avoid. Leave the queue for the next non-deferred Complete.
-	// The active version schema only needs to be dropped before the drain for
-	// an onComplete raw SQL Complete, whose arbitrary statements may drop or
-	// rename an object its views project. Typed contractions never invalidate
-	// the live views (renames auto-follow; drops/duplicators don't touch the
-	// projected names; dropped tables are filtered out of the view), so the
-	// drop — and the matching recreate below — are skipped, leaving the views
-	// (and any apps reading them) untouched. See FinishContraction for the
-	// same reasoning; per-op tests prove the typed ops drain safely in place.
-	needsLiveDrop := migration.CompleteRequiresLiveSchemaDrop()
+	// The live views stay in place through the drain: typed contractions
+	// never touch what they reference, and onComplete raw SQL runs in place,
+	// with the views checked and rebuilt after it (see drainDeferredMigration).
 	if !o.skipSchemaDrop {
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
 		}
 		if len(queued) > 0 {
-			for _, dm := range queued {
-				if dm.CompleteRequiresLiveSchemaDrop() {
-					needsLiveDrop = true
-					break
-				}
-			}
-
 			m.logger.Info("draining deferred completes", "count", len(queued))
 
 			// Seal at intent: stamp every done row sealed BEFORE the drain's
@@ -543,21 +560,8 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 				return err
 			}
 
-			if needsLiveDrop && !m.disableVersionSchemas {
-				// onComplete raw SQL only: drop the active version schema so
-				// the opaque DDL can't be blocked by a view's deptype=n
-				// dependency. Recreated from the post-drain physical state
-				// below.
-				versionSchema := VersionedSchemaName(m.schema, migration.VersionSchemaName())
-				_, err := m.pgConn.ExecContext(ctx,
-					fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema)))
-				if err != nil {
-					return fmt.Errorf("unable to drop active version schema before drain: %w", err)
-				}
-			}
-
 			for _, dm := range queued {
-				if err := m.drainDeferredMigration(ctx, dm); err != nil {
+				if err := m.drainDeferredMigration(ctx, dm, guard); err != nil {
 					return err
 				}
 			}
@@ -579,6 +583,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	currentSchema, err := m.readSchemaWithDeferred(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
+	}
+	if err := m.reviveFromSnapshot(ctx, migration, currentSchema, false); err != nil {
+		return err
 	}
 	// Set the active migration's scope so its op.Complete naming helpers
 	// match the identifiers installed by its earlier Start.
@@ -612,24 +619,21 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) error {
 	}
 
 	coordinator := migrations.NewCoordinator(actions)
-	if err := coordinator.Execute(ctx); err != nil {
+	if err := coordinator.ExecuteWithRecovery(ctx, m.viewConflictRecovery(guard, migration)); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
 	}
 
-	// Recreate the active migration's version schema only when something
-	// actually changed its views: the drain dropped it (needsLiveDrop, the
-	// onComplete raw SQL case), or an op requires a schema refresh. A typed
-	// contraction leaves the views valid — Postgres auto-follows the underlying
-	// renames and never references the dropped originals — so recreating would
-	// needlessly churn and re-lock views apps are actively reading.
-	if !o.skipSchemaDrop && !m.disableVersionSchemas && (needsLiveDrop || refreshViews) {
-		currentSchema, err = m.state.ReadSchema(ctx, m.schema)
-		if err != nil {
-			return fmt.Errorf("unable to read schema: %w", err)
-		}
-
-		if err := m.ensureViews(ctx, currentSchema, migration); err != nil {
-			return err
+	// Check the live views against the schema they now project, before the
+	// migration is marked done, so a failure here leaves it active for a
+	// retry. Missing views are always created; when raw SQL ran, views whose
+	// columns changed under them are rebuilt too. A typed contraction leaves
+	// the views valid (Postgres auto-follows the renames and never references
+	// the dropped originals), so nothing is re-locked.
+	if guard != nil {
+		guard.pendingLeaf = false
+		guard.rawRan = guard.rawRan || migration.CompleteRunsRawSQL()
+		if _, err := m.restoreLiveViews(ctx, guard, refreshViews || guard.rawRan); err != nil {
+			return fmt.Errorf("unable to restore live version schema: %w", err)
 		}
 	}
 
@@ -810,6 +814,21 @@ func (m *Roll) rollbackOperations(ctx context.Context, migration *migrations.Mig
 
 // create view creates a view for the new version of the schema
 func (m *Roll) ensureView(ctx context.Context, version, name string, table *schema.Table) error {
+	stmts := m.viewStatements(version, name, table)
+	return m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		for _, stmt := range stmts {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// viewStatements returns the statements that (re)create one table's view in
+// a version schema: drop, create, then each column default. Run them in one
+// transaction.
+func (m *Roll) viewStatements(version, name string, table *schema.Table) []string {
 	columns := make([]string, 0, len(table.Columns))
 	defaults := make(map[string]string, len(table.Columns))
 	for k, v := range table.Columns {
@@ -861,7 +880,7 @@ func (m *Roll) ensureView(ctx context.Context, version, name string, table *sche
 	dropViewSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s",
 		pq.QuoteIdentifier(schemaName),
 		pq.QuoteIdentifier(name))
-	//nolint:gosec // G201: identifiers are pq.QuoteIdentifier'd; withOptions is a fixed string; columns is built from `"<phys>" AS "<virt>"` pairs whose components are already QuoteIdentifier'd above.
+
 	createViewSQL := fmt.Sprintf("CREATE VIEW %s.%s %s AS SELECT %s FROM %s",
 		pq.QuoteIdentifier(schemaName),
 		pq.QuoteIdentifier(name),
@@ -880,20 +899,7 @@ func (m *Roll) ensureView(ctx context.Context, version, name string, table *sche
 		))
 	}
 
-	return m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, dropViewSQL); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, createViewSQL); err != nil {
-			return err
-		}
-		for _, stmt := range setDefaultSQLs {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return append([]string{dropViewSQL, createViewSQL}, setDefaultSQLs...)
 }
 
 func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *backfill.Config) error {
@@ -903,7 +909,15 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 
 	bf := backfill.New(m.pgConn, cfg, job.MigrationScope())
 
-	bf.CreateTriggers(ctx, job)
+	// A trigger that fails to install would leave the duplicate unsynced with
+	// the column apps write, and contraction would then swap stale data in.
+	if err := bf.CreateTriggers(ctx, job); err != nil {
+		m.logger.LogRollbackOnFailure(fmt.Sprintf("creating backfill triggers failed: %v", err))
+		cleanupCtx, cancel := m.rollbackContext(ctx)
+		errRollback := m.Rollback(cleanupCtx)
+		cancel()
+		return errors.Join(fmt.Errorf("unable to create backfill triggers: %w", err), errRollback)
+	}
 
 	for _, table := range job.Tables {
 		m.logger.LogBackfillStart(table.Name)
@@ -950,8 +964,12 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 // `op.Complete` produce identifiers that match what's physically present
 // (the temp/trigger/marker names installed by the same migration's
 // earlier Start).
-func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migration) error {
-	if err := m.applyDeferredComplete(ctx, dm); err != nil {
+//
+// With a guard, the live views are checked once a migration with raw SQL has
+// drained: missing views are created and views whose columns changed under
+// it are rebuilt.
+func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migration, guard *liveGuard) error {
+	if err := m.applyDeferredComplete(ctx, dm, guard); err != nil {
 		return err
 	}
 
@@ -959,6 +977,12 @@ func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migrat
 		return fmt.Errorf("unable to clear complete_deferred for %q: %w", dm.Name, err)
 	}
 	m.logger.Info("drained deferred complete", "migration", dm.Name)
+
+	if guard != nil && dm.CompleteRunsRawSQL() {
+		if _, err := m.restoreLiveViews(ctx, guard, true); err != nil {
+			return fmt.Errorf("unable to restore live version schema after %q: %w", dm.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -966,11 +990,16 @@ func (m *Roll) drainDeferredMigration(ctx context.Context, dm *migrations.Migrat
 // Complete actions against the current physical schema, without clearing
 // its complete_deferred flag. Callers that need to order other durable
 // steps before the flag clears (see FinishContraction) use this
-// directly; everyone else uses drainDeferredMigration.
-func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migration) error {
+// directly; everyone else uses drainDeferredMigration. With a guard, raw SQL a
+// live view blocks runs in a transaction around the blocking views (see
+// viewConflictRecovery).
+func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migration, guard *liveGuard) error {
 	drainSchema, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
+	}
+	if err := m.reviveFromSnapshot(ctx, dm, drainSchema, false); err != nil {
+		return err
 	}
 	drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 
@@ -984,7 +1013,10 @@ func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migrati
 	}
 
 	coord := migrations.NewCoordinator(actions)
-	if err := coord.Execute(ctx); err != nil {
+	if guard != nil && dm.CompleteRunsRawSQL() {
+		guard.rawRan = true
+	}
+	if err := coord.ExecuteWithRecovery(ctx, m.viewConflictRecovery(guard, dm)); err != nil {
 		return fmt.Errorf("unable to execute deferred complete %q: %w", dm.Name, err)
 	}
 
