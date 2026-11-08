@@ -18,11 +18,10 @@ import (
 	"github.com/xataio/pgroll/pkg/roll"
 )
 
-// These tests hold contraction to one invariant: the live version schema,
-// the one apps are pinned to, is never left missing views — not when a
-// drain fails, not when it is cancelled, and not when an earlier binary left
-// it dropped. All but the fallback cases fail on the drop-then-drain
-// contraction this replaced. live_schema_invariant_test.go walks every
+// These tests hold contraction to one invariant: it never drops or rebuilds
+// the live version schema, the one apps are pinned to — not when a drain
+// fails, not when it is cancelled — and it refuses, leaving the schema as it
+// was, whatever would break that. live_schema_invariant_test.go walks every
 // statement boundary and probes for read gaps.
 
 // applyAdditiveTrain applies a train the way `pgroll migrate` does on a
@@ -146,44 +145,17 @@ func TestContractionKeepsLiveSchemaWhenCancelled(t *testing.T) {
 	})
 }
 
-// TestContractionKeepsLiveSchemaWhenFallbackCancelled: a raw statement live
-// views block takes the fallback (one transaction that drops the blocking
-// views, runs it and recreates them), and that transaction is cancelled. It
-// rolls back, so the live views are as they were.
-func TestContractionKeepsLiveSchemaWhenFallbackCancelled(t *testing.T) {
+// TestContractionRefusesRawSQLBlockedByLiveView: raw SQL that a live view
+// depends on (2BP01, 0A000) fails the contraction with the view named. The
+// view and the table stay as they were, and a retry fails the same way.
+func TestContractionRefusesRawSQLBlockedByLiveView(t *testing.T) {
 	t.Parallel()
 
-	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-		createBase(t, mig, db)
-
-		applyAdditiveTrain(t, mig, []*migrations.Migration{
-			rawOnComplete("01_drop_then_sleep", "ALTER TABLE t DROP COLUMN value; SELECT pg_sleep(30)"),
-			leafCreatingEvents("02_leaf"),
-		})
-
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		require.Error(t, mig.Complete(ctx), "the cancelled drain must fail")
-		assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
-		// The cancel rolled the statement back, so the view still has value.
-		assert.True(t, viewHasColumn(t, db, roll.VersionedSchemaName(cSchema, "02_leaf"), "t", "value"))
-	})
-}
-
-// TestContractionFallsBackWhenLiveViewBlocks: raw SQL that a live view
-// depends on (2BP01, 0A000) runs in one transaction that drops the blocking
-// views and recreates them from what the statement leaves.
-func TestContractionFallsBackWhenLiveViewBlocks(t *testing.T) {
-	t.Parallel()
-
-	cases := map[string]struct {
-		sql        string
-		valueAfter bool
-	}{
-		"drop_projected_column":   {sql: "ALTER TABLE t DROP COLUMN value", valueAfter: false},
-		"alter_type_of_projected": {sql: "ALTER TABLE t ALTER COLUMN value TYPE text", valueAfter: true},
+	cases := map[string]string{
+		"drop_projected_column":   "ALTER TABLE t DROP COLUMN value",
+		"alter_type_of_projected": "ALTER TABLE t ALTER COLUMN value TYPE text",
 	}
-	for name, tc := range cases {
+	for name, stmt := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
@@ -191,14 +163,16 @@ func TestContractionFallsBackWhenLiveViewBlocks(t *testing.T) {
 				createBase(t, mig, db)
 
 				applyAdditiveTrain(t, mig, []*migrations.Migration{
-					rawOnComplete("01_raw", tc.sql),
+					rawOnComplete("01_raw", stmt),
 					leafCreatingEvents("02_leaf"),
 				})
 
-				require.NoError(t, mig.Complete(ctx))
+				for range 2 {
+					require.ErrorContains(t, mig.Complete(ctx), "conflicts with view "+liveView("02_leaf", "t"))
+				}
 				assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
-				assert.Equal(t, tc.valueAfter,
-					viewHasColumn(t, db, roll.VersionedSchemaName(cSchema, "02_leaf"), "t", "value"))
+				assert.True(t, viewHasColumn(t, db, roll.VersionedSchemaName(cSchema, "02_leaf"), "t", "value"))
+				assert.Equal(t, "character varying", columnType(t, db, "t", "value"))
 			})
 		})
 	}
@@ -239,109 +213,75 @@ func TestContractionRunsConstraintDrainInPlace(t *testing.T) {
 		})
 }
 
-// TestContractionRestoresLiveSchemaLeftDropped: an older binary's
-// contraction dropped the live schema, drained the raw SQL and stopped. What
-// is left to drain is typed, so nothing in it asks for a rebuild; the
-// contraction must still put the live schema back, in each shape it can be
-// resumed from.
-func TestContractionRestoresLiveSchemaLeftDropped(t *testing.T) {
+// TestRestoreActiveVersionSchema is the recovery `pgroll materialize` runs
+// while a migration is in progress: what is missing from the active
+// migration's version schema is created as its Start projected it. A view
+// that exists is never rebuilt, and nothing is created when that Start
+// cannot be replayed over the tables.
+func TestRestoreActiveVersionSchema(t *testing.T) {
 	t.Parallel()
 
-	train := func() []*migrations.Migration {
-		return []*migrations.Migration{
-			rawOnComplete("01_raw", "SELECT 1"),
-			{Name: "02_drop_value", Operations: migrations.Operations{
-				&migrations.OpDropColumn{Table: "t", Column: "value", Down: "''"},
-			}},
-			leafCreatingEvents("03_leaf"),
-		}
-	}
-	live := roll.VersionedSchemaName(cSchema, "03_leaf")
-
-	// leaveDropped reproduces what the old contraction left: the deployment
-	// sealed, the raw SQL drained, the live schema gone.
-	leaveDropped := func(t *testing.T, mig *roll.Roll, db *sql.DB) {
-		ctx := context.Background()
-		_, err := mig.State().MarkSealed(ctx, cSchema)
-		require.NoError(t, err)
-		require.NoError(t, mig.State().ClearCompleteDeferred(ctx, cSchema, "01_raw"))
-		_, err = db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", live))
-		require.NoError(t, err)
-	}
-
-	t.Run("active_leaf", func(t *testing.T) {
-		t.Parallel()
-		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-			createBase(t, mig, db)
-			applyAdditiveTrain(t, mig, train())
-			leaveDropped(t, mig, db)
-
-			require.NoError(t, mig.Complete(context.Background()))
-			assertLiveSchemaServes(t, db, "03_leaf", "t", "hot", "events")
-		})
-	})
-
-	t.Run("queued_leaf", func(t *testing.T) {
-		t.Parallel()
-		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-			createBase(t, mig, db)
-			applyDelayedContractionTrain(t, mig, train())
-			leaveDropped(t, mig, db)
-
-			_, _, err := mig.FinishContraction(context.Background())
-			require.NoError(t, err)
-			assertLiveSchemaServes(t, db, "03_leaf", "t", "hot", "events")
-		})
-	})
-
-	t.Run("contracted_leaf", func(t *testing.T) {
+	t.Run("creates what is missing, never rebuilds", func(t *testing.T) {
 		t.Parallel()
 		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
 			ctx := context.Background()
 			createBase(t, mig, db)
-			applyAdditiveTrain(t, mig, train())
-			require.NoError(t, mig.Complete(ctx))
-			// An older binary's retry finished the contraction without
-			// rebuilding the schema it had dropped.
+			applyAdditiveTrain(t, mig, []*migrations.Migration{
+				{Name: "01_add_label", Operations: migrations.Operations{
+					&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "label", Type: "text", Nullable: true}},
+				}},
+			})
+			live := roll.VersionedSchemaName(cSchema, "01_add_label")
 			_, err := db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", live))
 			require.NoError(t, err)
 
-			_, _, err = mig.FinishContraction(ctx)
+			got, n, err := mig.RestoreActiveVersionSchema(ctx)
 			require.NoError(t, err)
-			assertLiveSchemaServes(t, db, "03_leaf", "t", "hot", "events")
+			assert.Equal(t, live, got)
+			assert.Equal(t, 2, n, "views for t and hot")
+			assertLiveSchemaServes(t, db, "01_add_label", "t", "hot")
+			assert.True(t, viewHasColumn(t, db, live, "t", "label"),
+				"the in-flight add_column must project under its real name, as Start projected it")
+
+			_, n, err = mig.RestoreActiveVersionSchema(ctx)
+			require.NoError(t, err)
+			assert.Zero(t, n, "a complete live schema is left alone")
+
+			// A view that exists is left as it is, even one that no longer
+			// matches the projection: rebuilding it would re-lock what apps read.
+			_, err = db.ExecContext(ctx, fmt.Sprintf("DROP VIEW %[1]s.t; CREATE VIEW %[1]s.t AS SELECT id FROM %[2]s.t",
+				live, cSchema))
+			require.NoError(t, err)
+			_, n, err = mig.RestoreActiveVersionSchema(ctx)
+			require.NoError(t, err)
+			assert.Zero(t, n)
+			assert.False(t, viewHasColumn(t, db, live, "t", "label"), "an existing view is never rebuilt")
 		})
 	})
-}
 
-// TestRestoreActiveVersionSchema is the recovery `pgroll materialize` runs
-// while a migration is in progress: the active migration's version schema
-// is re-projected as its Start projected it.
-func TestRestoreActiveVersionSchema(t *testing.T) {
-	t.Parallel()
+	t.Run("creates nothing when the Start cannot be replayed", func(t *testing.T) {
+		t.Parallel()
+		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+			createBase(t, mig, db)
+			applyAdditiveTrain(t, mig, []*migrations.Migration{
+				{Name: "01_rename_value", Operations: migrations.Operations{
+					&migrations.OpRenameColumn{Table: "t", From: "value", To: "label"},
+				}},
+			})
+			live := roll.VersionedSchemaName(cSchema, "01_rename_value")
+			_, err := db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", live))
+			require.NoError(t, err)
+			// The rename ran physically, as a Complete cut short leaves it, so
+			// the Start no longer replays: there is no `value` to rename.
+			_, err = db.ExecContext(ctx, "ALTER TABLE t RENAME COLUMN value TO label")
+			require.NoError(t, err)
 
-	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-		ctx := context.Background()
-		createBase(t, mig, db)
-		applyAdditiveTrain(t, mig, []*migrations.Migration{
-			{Name: "01_add_label", Operations: migrations.Operations{
-				&migrations.OpAddColumn{Table: "t", Column: migrations.Column{Name: "label", Type: "text", Nullable: true}},
-			}},
+			_, n, err := mig.RestoreActiveVersionSchema(ctx)
+			require.Error(t, err, "a projection the Start cannot reproduce must not be guessed from the tables")
+			assert.Zero(t, n)
+			assert.False(t, schemaExists(t, db, live), "nothing is created")
 		})
-		live := roll.VersionedSchemaName(cSchema, "01_add_label")
-		_, err := db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", live))
-		require.NoError(t, err)
-
-		got, n, err := mig.RestoreActiveVersionSchema(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, live, got)
-		assert.Equal(t, 2, n, "views for t and hot")
-		assertLiveSchemaServes(t, db, "01_add_label", "t", "hot")
-		assert.True(t, viewHasColumn(t, db, live, "t", "label"),
-			"the in-flight add_column must project under its real name, as Start projected it")
-
-		_, n, err = mig.RestoreActiveVersionSchema(ctx)
-		require.NoError(t, err)
-		assert.Zero(t, n, "a complete live schema is left alone")
 	})
 }
 
@@ -358,78 +298,48 @@ func viewHasColumn(t *testing.T, db *sql.DB, schemaName, view, column string) bo
 
 // orphanPrimaryKeyDuplicate leaves the state an older pgroll's interrupted
 // alter_column contraction left on a primary key column: the deployment
-// sealed, the original `id` dropped (and the primary key with it), the
-// duplicate not yet renamed, and, as that pgroll dropped it before draining,
-// the live schema gone. Returns the live schema.
-func orphanPrimaryKeyDuplicate(t *testing.T, mig *roll.Roll, db *sql.DB) string {
+// sealed, the previous deployment's schema dropped, the original `id`
+// dropped (and the primary key with it), and the duplicate not yet renamed.
+func orphanPrimaryKeyDuplicate(t *testing.T, mig *roll.Roll, db *sql.DB, p contractionPath) {
 	t.Helper()
 	ctx := context.Background()
 	createBase(t, mig, db)
-	applyAdditiveTrain(t, mig, []*migrations.Migration{
+	p.apply(t, mig, []*migrations.Migration{
 		{Name: "01_id_to_bigint", Operations: migrations.Operations{
 			&migrations.OpAlterColumn{Table: "t", Column: "id", Type: ptr("bigint"), Up: "id", Down: "id"},
 		}},
 		leafCreatingEvents("02_leaf"),
 	})
-	live := roll.VersionedSchemaName(cSchema, "02_leaf")
 
 	_, err := mig.State().MarkSealed(ctx, cSchema)
 	require.NoError(t, err)
-	// That pgroll dropped the previous deployment's schema and the live one
-	// before draining.
-	for _, version := range []string{"00_base", "02_leaf"} {
-		_, err = db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", roll.VersionedSchemaName(cSchema, version)))
-		require.NoError(t, err)
-	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", roll.VersionedSchemaName(cSchema, "00_base")))
+	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "ALTER TABLE t DROP COLUMN id")
 	require.NoError(t, err)
-	return live
 }
 
-// TestResumedDuplicatorKeepsPrimaryKey: the resume takes the primary key from
-// pgroll's schema snapshot. The catalog lost it with the dropped column, and
-// resuming from the catalog finished with the table's primary key gone.
-func TestResumedDuplicatorKeepsPrimaryKey(t *testing.T) {
+// TestOrphanedDuplicateRefusesContraction: an older pgroll's contraction
+// dropped a primary key column and stopped before renaming its duplicate into
+// place. The primary key went with the column and the catalog cannot say what
+// it was, so the contraction refuses, naming the table and column, rather than
+// finish without it. The live schema is left as it was.
+func TestOrphanedDuplicateRefusesContraction(t *testing.T) {
 	t.Parallel()
 
-	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-		orphanPrimaryKeyDuplicate(t, mig, db)
+	for _, p := range contractionPaths {
+		t.Run(p.name, func(t *testing.T) {
+			t.Parallel()
+			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+				orphanPrimaryKeyDuplicate(t, mig, db, p)
 
-		require.NoError(t, pgrollComplete(context.Background(), mig))
-
-		var name, columns string
-		require.NoError(t, db.QueryRow(`
-			SELECT c.conname, string_agg(a.attname, ',' ORDER BY a.attnum)
-			FROM pg_constraint c
-			JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
-			WHERE c.conrelid = 'public.t'::regclass AND c.contype = 'p'
-			GROUP BY c.conname`).Scan(&name, &columns), "t must still have a primary key")
-		assert.Equal(t, "t_pkey", name)
-		assert.Equal(t, "id", columns)
-		assert.Equal(t, "bigint", columnType(t, db, "t", "id"))
-	})
-}
-
-// TestRestoredLiveViewExposesOrphanedDuplicate: with the original dropped
-// and the duplicate not yet renamed, the live view is rebuilt from the
-// snapshot's column mapping, so it exposes `id` with the duplicate's data.
-// Projecting from the catalog alone dropped `id` from the view.
-func TestRestoredLiveViewExposesOrphanedDuplicate(t *testing.T) {
-	t.Parallel()
-
-	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
-		live := orphanPrimaryKeyDuplicate(t, mig, db)
-
-		_, _, err := mig.RestoreActiveVersionSchema(context.Background())
-		require.NoError(t, err)
-
-		require.True(t, viewHasColumn(t, db, live, "t", "id"), "the live view must expose the user's column")
-		var id int64
-		var value string
-		require.NoError(t, db.QueryRow(fmt.Sprintf("SELECT id, value FROM %s.t", live)).Scan(&id, &value))
-		assert.Equal(t, int64(1), id, "with the duplicate's data")
-		assert.Equal(t, "a", value)
-	})
+				err := pgrollComplete(context.Background(), mig)
+				require.ErrorContains(t, err, `column "id" of table "t" is gone and its duplicate`)
+				assert.Len(t, orphanedDuplicates(t, db), 1, "the duplicate is left for the operator")
+				assertLiveSchemaServes(t, db, "02_leaf", "t", "hot", "events")
+			})
+		})
+	}
 }
 
 // TestChainedDuplicatorsOnOneColumn: two duplicators on one column in a

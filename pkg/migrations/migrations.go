@@ -323,26 +323,6 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
-// CompleteRunsRawSQL reports whether this migration's Complete runs
-// onComplete raw SQL.
-//
-// Contraction keeps the live version schema in place for every Complete:
-// typed contracting operations never touch what the live views reference
-// (renames auto-follow, dropped columns and tables were never projected,
-// duplicators project the temporary column). Raw SQL is the one Complete
-// pgroll cannot reason about, so after it runs the contraction checks the
-// live views against the projection and rebuilds any it dropped or renamed
-// under them, and a statement live views block runs again in one transaction
-// that drops those views and recreates them.
-func (m *Migration) CompleteRunsRawSQL() bool {
-	for _, op := range m.Operations {
-		if raw, ok := op.(*OpRawSQL); ok && raw.OnComplete {
-			return true
-		}
-	}
-	return false
-}
-
 // UpdateVirtualSchema updates the in-memory schema representation with the changes
 // made by the migration. No changes are made to the physical database.
 func (m *Migration) UpdateVirtualSchema(ctx context.Context, s *schema.Schema) error {

@@ -116,13 +116,21 @@ func (o *OpDropMultiColumnConstraint) Complete(l Logger, conn db.DB, s *schema.S
 	if len(constraintColumns) == 0 {
 		// Retrying a Complete whose tail committed: the constraint went with
 		// the original column, the trigger functions with the tail.
-		if tailCommitted(table, scope) {
+		committed, duplicate := tailCommitted(table, scope)
+		if committed {
 			return []DBAction{NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope))}, nil
 		}
-		return nil, fmt.Errorf("constraint %q is not on table %q, and pgroll's schema snapshot did not "+
-			"restore it, so the columns it was on are unknown", o.Name, o.Table)
+		return nil, fmt.Errorf("constraint %q is not on table %q, but duplicate column %q is: an older "+
+			"pgroll's contraction dropped the original column, and the constraint with it, and stopped before "+
+			"renaming the duplicate into place. pgroll cannot tell from the catalog what the table lost: restore "+
+			"it by hand from the migration's stored schema (resulting_schema in pgroll's migrations table), then "+
+			"run `pgroll complete` again", o.Name, o.Table, duplicate)
 	}
-	return duplicatorTailActions(conn, scope, table, o.Table, duplicatedColumns(table, scope, constraintColumns...)), nil
+	columns, err := duplicatedColumns(table, scope, constraintColumns...)
+	if err != nil {
+		return nil, err
+	}
+	return duplicatorTailActions(conn, scope, table, o.Table, columns), nil
 }
 
 func (o *OpDropMultiColumnConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {

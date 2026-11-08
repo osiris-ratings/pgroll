@@ -120,7 +120,10 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 	if table == nil {
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
-	columns := duplicatedColumns(table, scope, o.Column)
+	columns, err := duplicatedColumns(table, scope, o.Column)
+	if err != nil {
+		return nil, err
+	}
 
 	dbActions := make([]DBAction, 0)
 	// The sub-operations run before the tail; resuming one an older pgroll
