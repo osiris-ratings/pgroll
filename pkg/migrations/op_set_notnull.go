@@ -63,11 +63,19 @@ func (o *OpSetNotNull) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAct
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
 	}
 
+	// The steps below end by dropping the NOT NULL check. If it is already
+	// gone, a Complete interrupted later on has run them all: running them
+	// again would fail to validate a check that no longer exists.
+	_, pending := table.CheckConstraints[NotNullConstraintName(o.Column)]
+
 	// Ensure the column is not nullable
 	column.Nullable = false
 	// Remove the NOT NULL constraint
 	delete(table.CheckConstraints, NotNullConstraintName(o.Column))
 
+	if !pending {
+		return nil, nil
+	}
 	return []DBAction{
 		// Validate the NOT NULL constraint on the old column.
 		// The constraint must be valid because:

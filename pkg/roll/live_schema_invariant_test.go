@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -51,7 +52,13 @@ type contractionCase struct {
 	check func(t *testing.T, db *sql.DB)
 	// exhaustive: inject a fault at every statement; otherwise sample.
 	exhaustive bool
+	// examples: the train is every migration in examples/ (what `make
+	// examples` applies), in place of base, setup, train and leaf.
+	examples bool
 }
+
+// examplesDir is the repository's examples, relative to this package.
+const examplesDir = "../../examples"
 
 func contractionCorpus() []contractionCase {
 	events := func() *migrations.Migration { return leafCreatingEvents("09_leaf") }
@@ -149,6 +156,66 @@ func contractionCorpus() []contractionCase {
 			},
 		},
 		{
+			// A duplicator on the primary key column: the tail drops the
+			// original, primary key with it, and re-adds the key.
+			name: "alter_column_primary_key",
+			train: []*migrations.Migration{{Name: "01_id_to_bigint", Operations: migrations.Operations{
+				&migrations.OpAlterColumn{Table: "t", Column: "id", Type: ptr("bigint"), Up: "id", Down: "id"},
+			}}},
+			leaf: events(),
+			check: func(t *testing.T, db *sql.DB) {
+				assert.Equal(t, "bigint", columnType(t, db, "t", "id"))
+				assert.Equal(t, "id", primaryKeyColumns(t, db, "t"))
+			},
+		},
+		{
+			name:  "drop_multicolumn_constraint",
+			setup: "ALTER TABLE t ADD CONSTRAINT t_id_value_check CHECK (id > 0 AND length(value) < 100)",
+			train: []*migrations.Migration{{Name: "01_drop_pair_check", Operations: migrations.Operations{
+				&migrations.OpDropMultiColumnConstraint{
+					Table: "t", Name: "t_id_value_check",
+					Up:   migrations.MultiColumnUpSQL{"id": "id", "value": "value"},
+					Down: migrations.MultiColumnDownSQL{"id": "id", "value": "value"},
+				},
+			}}},
+			leaf: events(),
+			check: func(t *testing.T, db *sql.DB) {
+				assert.False(t, constraintExists(t, db, "t_id_value_check"))
+				assert.Equal(t, "id", primaryKeyColumns(t, db, "t"))
+			},
+		},
+		{
+			// create_constraint completes inline mid-train, so it is the
+			// leaf here: its tail runs at contraction.
+			name: "create_constraint_leaf",
+			leaf: &migrations.Migration{Name: "09_leaf", Operations: migrations.Operations{
+				&migrations.OpCreateConstraint{
+					Table: "t", Name: "t_value_unique", Type: migrations.OpCreateConstraintTypeUnique,
+					Columns: []string{"value"},
+					Up:      migrations.MultiColumnUpSQL{"value": "value"},
+					Down:    migrations.MultiColumnDownSQL{"value": "value"},
+				},
+			}},
+			check: func(t *testing.T, db *sql.DB) {
+				assert.True(t, constraintExists(t, db, "t_value_unique"))
+			},
+		},
+		{
+			// Every example, one train, as `make examples` applies it. It
+			// holds chained duplicators on one column (posts.user_id gets a
+			// foreign key, then loses it), which must not bind the live view
+			// to a duplicate the contraction renames away.
+			name:     "examples",
+			examples: true,
+			check: func(t *testing.T, db *sql.DB) {
+				var fks int
+				require.NoError(t, db.QueryRow(`SELECT count(*) FROM pg_constraint
+					WHERE conrelid = 'public.posts'::regclass AND contype = 'f'`).Scan(&fks))
+				assert.Zero(t, fks, "24 dropped posts' foreign key")
+				assert.True(t, columnExists(t, db, cSchema, "posts", "user_id"))
+			},
+		},
+		{
 			// Raw SQL a live view really depends on: it takes the
 			// transactional fallback.
 			name:  "raw_sql_conflicting_with_view",
@@ -200,14 +267,25 @@ func pgrollComplete(ctx context.Context, mig *roll.Roll) error {
 // contract. Returns the live schema and the views it holds.
 func applyCase(t *testing.T, mig *roll.Roll, db *sql.DB, c contractionCase, p contractionPath) (string, []string) {
 	t.Helper()
-	createBase(t, mig, db)
-	if c.setup != "" {
-		_, err := db.Exec(c.setup)
+	var train []*migrations.Migration
+	if c.examples {
+		raw, err := mig.UnappliedMigrations(context.Background(), os.DirFS(examplesDir))
 		require.NoError(t, err)
+		for _, r := range raw {
+			m, err := migrations.ParseMigration(r)
+			require.NoError(t, err)
+			train = append(train, m)
+		}
+	} else {
+		createBase(t, mig, db)
+		if c.setup != "" {
+			_, err := db.Exec(c.setup)
+			require.NoError(t, err)
+		}
+		train = append(append([]*migrations.Migration{}, c.train...), c.leaf)
 	}
-	train := append(append([]*migrations.Migration{}, c.train...), c.leaf)
 	p.apply(t, mig, train)
-	live := roll.VersionedSchemaName(cSchema, c.leaf.Name)
+	live := roll.VersionedSchemaName(cSchema, train[len(train)-1].VersionSchemaName())
 	views := liveViews(t, db, live)
 	require.NotEmpty(t, views)
 	return live, views
@@ -289,9 +367,10 @@ func countContractionCalls(t *testing.T, c contractionCase, p contractionPath) i
 }
 
 // faultPoints is every statement for an exhaustive case, else a sample that
-// keeps both ends and a spread between them.
+// keeps both ends and a spread between them. PGROLL_EXHAUSTIVE_FAULTS=1 walks
+// every statement of every case, the large ones included.
 func faultPoints(k int, exhaustive bool) []int {
-	if exhaustive || k <= 12 {
+	if exhaustive || k <= 12 || os.Getenv("PGROLL_EXHAUSTIVE_FAULTS") == "1" {
 		points := make([]int, k)
 		for i := range points {
 			points[i] = i + 1
@@ -352,6 +431,8 @@ func TestContractionLiveSchemaSurvivesEveryFault(t *testing.T) {
 									"after a fault at statement %d of %d (%s); contraction returned %v",
 									n, k, fc.fired, faultErr,
 								))
+								assert.Empty(t, orphanedDuplicates(t, db), "a duplicator tail left half done "+
+									"after a fault at statement %d of %d (%s)", n, k, fc.fired)
 
 								require.NoError(t, pgrollComplete(context.Background(), mig),
 									"the fault-free retry must contract (fault was at %d: %s)", n, fc.fired)
@@ -540,4 +621,42 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 	var exists bool
 	require.NoError(t, db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, cSchema+"."+name).Scan(&exists))
 	return exists
+}
+
+// orphanedDuplicates lists duplicate columns whose original is gone while the
+// duplicate has not been renamed into its place: the state between a
+// duplicator tail's drop and its rename.
+func orphanedDuplicates(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT c.table_name || '.' || c.column_name
+		FROM information_schema.columns c
+		WHERE c.table_schema = $1
+		  AND c.column_name ~ '^_pgroll_new_.+_[0-9a-f]{8}$'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM information_schema.columns o
+		    WHERE o.table_schema = c.table_schema AND o.table_name = c.table_name
+		      AND o.column_name = regexp_replace(c.column_name, '^_pgroll_new_(.+)_[0-9a-f]{8}$', '\1'))`,
+		cSchema)
+	require.NoError(t, err)
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		require.NoError(t, rows.Scan(&c))
+		out = append(out, c)
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+func primaryKeyColumns(t *testing.T, db *sql.DB, table string) string {
+	t.Helper()
+	var columns sql.NullString
+	require.NoError(t, db.QueryRow(`
+		SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+		FROM pg_constraint c
+		JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+		WHERE c.conrelid = to_regclass($1) AND c.contype = 'p'`, cSchema+"."+table).Scan(&columns))
+	return columns.String
 }

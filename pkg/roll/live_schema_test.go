@@ -355,3 +355,128 @@ func viewHasColumn(t *testing.T, db *sql.DB, schemaName, view, column string) bo
 		)`, schemaName, view, column).Scan(&exists))
 	return exists
 }
+
+// orphanPrimaryKeyDuplicate leaves the state an older pgroll's interrupted
+// alter_column contraction left on a primary key column: the deployment
+// sealed, the original `id` dropped (and the primary key with it), the
+// duplicate not yet renamed, and, as that pgroll dropped it before draining,
+// the live schema gone. Returns the live schema.
+func orphanPrimaryKeyDuplicate(t *testing.T, mig *roll.Roll, db *sql.DB) string {
+	t.Helper()
+	ctx := context.Background()
+	createBase(t, mig, db)
+	applyAdditiveTrain(t, mig, []*migrations.Migration{
+		{Name: "01_id_to_bigint", Operations: migrations.Operations{
+			&migrations.OpAlterColumn{Table: "t", Column: "id", Type: ptr("bigint"), Up: "id", Down: "id"},
+		}},
+		leafCreatingEvents("02_leaf"),
+	})
+	live := roll.VersionedSchemaName(cSchema, "02_leaf")
+
+	_, err := mig.State().MarkSealed(ctx, cSchema)
+	require.NoError(t, err)
+	// That pgroll dropped the previous deployment's schema and the live one
+	// before draining.
+	for _, version := range []string{"00_base", "02_leaf"} {
+		_, err = db.ExecContext(ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", roll.VersionedSchemaName(cSchema, version)))
+		require.NoError(t, err)
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE t DROP COLUMN id")
+	require.NoError(t, err)
+	return live
+}
+
+// TestResumedDuplicatorKeepsPrimaryKey: the resume takes the primary key from
+// pgroll's schema snapshot. The catalog lost it with the dropped column, and
+// resuming from the catalog finished with the table's primary key gone.
+func TestResumedDuplicatorKeepsPrimaryKey(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		orphanPrimaryKeyDuplicate(t, mig, db)
+
+		require.NoError(t, pgrollComplete(context.Background(), mig))
+
+		var name, columns string
+		require.NoError(t, db.QueryRow(`
+			SELECT c.conname, string_agg(a.attname, ',' ORDER BY a.attnum)
+			FROM pg_constraint c
+			JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+			WHERE c.conrelid = 'public.t'::regclass AND c.contype = 'p'
+			GROUP BY c.conname`).Scan(&name, &columns), "t must still have a primary key")
+		assert.Equal(t, "t_pkey", name)
+		assert.Equal(t, "id", columns)
+		assert.Equal(t, "bigint", columnType(t, db, "t", "id"))
+	})
+}
+
+// TestRestoredLiveViewExposesOrphanedDuplicate: with the original dropped
+// and the duplicate not yet renamed, the live view is rebuilt from the
+// snapshot's column mapping, so it exposes `id` with the duplicate's data.
+// Projecting from the catalog alone dropped `id` from the view.
+func TestRestoredLiveViewExposesOrphanedDuplicate(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		live := orphanPrimaryKeyDuplicate(t, mig, db)
+
+		_, _, err := mig.RestoreActiveVersionSchema(context.Background())
+		require.NoError(t, err)
+
+		require.True(t, viewHasColumn(t, db, live, "t", "id"), "the live view must expose the user's column")
+		var id int64
+		var value string
+		require.NoError(t, db.QueryRow(fmt.Sprintf("SELECT id, value FROM %s.t", live)).Scan(&id, &value))
+		assert.Equal(t, int64(1), id, "with the duplicate's data")
+		assert.Equal(t, "a", value)
+	})
+}
+
+// TestChainedDuplicatorsOnOneColumn: two duplicators on one column in a
+// train (a CHECK added, then dropped), the examples' posts.user_id shape.
+// The second must name its duplicate, triggers and schema entry after the
+// logical column: its triggers write columns that exist, so a write through
+// the live view does not fail, the live view reads the second duplicate,
+// and contraction does not drop the column the live view reads.
+//
+// The written value is not asserted: an intermediate migration's triggers
+// treat every write through the leaf's schema as an old-version write and
+// recompute the duplicate from the original, a separate, pre-existing issue.
+func TestChainedDuplicatorsOnOneColumn(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		createBase(t, mig, db)
+		applyAdditiveTrain(t, mig, []*migrations.Migration{
+			{Name: "01_add_check", Operations: migrations.Operations{
+				&migrations.OpAlterColumn{
+					Table: "t", Column: "value",
+					Check: &migrations.CheckConstraint{Name: "t_value_short", Constraint: "length(value) < 100"},
+					Up:    "value", Down: "value",
+				},
+			}},
+			{Name: "02_drop_check", Operations: migrations.Operations{
+				&migrations.OpDropConstraint{Table: "t", Name: "t_value_short", Up: "value", Down: "value"},
+			}},
+			leafCreatingEvents("03_leaf"),
+		})
+		live := roll.VersionedSchemaName(cSchema, "03_leaf")
+
+		var def string
+		require.NoError(t, db.QueryRow(fmt.Sprintf("SELECT pg_get_viewdef('%s.t'::regclass)", live)).Scan(&def))
+		assert.Contains(t, def, migrations.TemporaryName(migrations.MigrationScopeFor("02_drop_check"), "value"),
+			"the live view must read the last duplicate")
+
+		_, err := db.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s.t (id, value) VALUES (2, 'b')", live))
+		require.NoError(t, err, "a write through the live view must work while the train is expanded")
+
+		require.NoError(t, mig.Complete(ctx))
+		assertLiveSchemaServes(t, db, "03_leaf", "t", "hot", "events")
+		var rows int
+		require.NoError(t, db.QueryRow("SELECT count(*) FROM public.t WHERE id = 2").Scan(&rows))
+		assert.Equal(t, 1, rows)
+		assert.False(t, constraintExists(t, db, "t_value_short"))
+		assert.Empty(t, orphanedDuplicates(t, db))
+	})
+}

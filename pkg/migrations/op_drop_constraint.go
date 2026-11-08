@@ -37,14 +37,23 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	if len(constraintColumns) == 0 {
 		return nil, nil
 	}
-	column := table.GetColumn(constraintColumns[0])
+	// Everything is keyed by the column's logical name, as the other
+	// duplicators do: when an earlier migration in the train duplicated the
+	// same column, column.Name is that migration's duplicate, and naming from
+	// it registered the new duplicate under the wrong key, gave its trigger a
+	// column that does not exist, and bound the live view to the earlier
+	// duplicate, which that migration's contraction then renames away.
+	columnName := constraintColumns[0]
+	column := table.GetColumn(columnName)
 	if column == nil {
-		return nil, ColumnDoesNotExistError{Table: o.Table, Name: constraintColumns[0]}
+		return nil, ColumnDoesNotExistError{Table: o.Table, Name: columnName}
 	}
 
 	// Create a copy of the column on the underlying table.
 	dbActions := []DBAction{
-		NewColumnDuplicator(conn, scope, table, column).WithoutConstraint(o.Name),
+		NewColumnDuplicator(conn, scope, table, column).
+			WithoutConstraint(o.Name).
+			WithName(column.Name, TemporaryName(scope, columnName)),
 	}
 
 	// Copy the columns from table columns, so we can use it later
@@ -59,12 +68,12 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(scope, o.Table, column.Name),
+			Name:           backfill.TriggerName(scope, o.Table, columnName),
 			Direction:      backfill.TriggerDirectionUp,
 			Columns:        upColumns,
-			TableName:      o.Table,
-			PhysicalColumn: TemporaryName(scope, column.Name),
-			SQL:            o.upSQL(column.Name),
+			TableName:      table.Name,
+			PhysicalColumn: TemporaryName(scope, columnName),
+			SQL:            o.upSQL(columnName),
 		},
 	)
 
@@ -73,19 +82,20 @@ func (o *OpDropConstraint) Start(ctx context.Context, l Logger, conn db.DB, s *s
 	// a variable for the new column. Preserve the original column's metadata
 	// (Type, Nullable, Default, etc.) so replays across deferred migrations
 	// don't strip fields that downstream Validate steps depend on.
+	oldPhysicalColumn := column.Name
 	newCol := *column
-	newCol.Name = TemporaryName(scope, column.Name)
-	table.AddColumn(column.Name, &newCol)
+	newCol.Name = TemporaryName(scope, columnName)
+	table.AddColumn(columnName, &newCol)
 
 	// Add a trigger to copy values from the new column to the old, rewriting values using the `down` SQL.
 	triggers = append(
 		triggers,
 		backfill.OperationTrigger{
-			Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, column.Name)),
+			Name:           backfill.TriggerName(scope, o.Table, TemporaryName(scope, columnName)),
 			Direction:      backfill.TriggerDirectionDown,
 			Columns:        table.Columns,
-			TableName:      o.Table,
-			PhysicalColumn: column.Name,
+			TableName:      table.Name,
+			PhysicalColumn: oldPhysicalColumn,
 			SQL:            o.Down,
 		},
 	)
@@ -103,35 +113,23 @@ func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]D
 	}
 	constraintColumns := table.GetConstraintColumns(o.Name)
 	if len(constraintColumns) == 0 {
-		// Resuming a Complete interrupted after it dropped the original
-		// column, and the constraint with it: finish from the duplicate.
-		name, ok := duplicatedColumnName(table, scope)
-		if !ok || !duplicateOnly(table, scope, name) {
-			return nil, fmt.Errorf("constraint %q no longer exists on table %q and the column it was on "+
-				"cannot be identified from its duplicate", o.Name, o.Table)
+		// Retrying a Complete whose tail committed: the constraint went with
+		// the original column, the trigger functions with the tail.
+		if tailCommitted(table, scope) {
+			return []DBAction{NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope))}, nil
 		}
-		return []DBAction{
-			NewDropFunctionAction(conn,
-				backfill.TriggerFunctionName(scope, o.Table, name),
-				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, name))),
-			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-			NewRenameDuplicatedColumnAction(conn, scope, table, name),
-		}, nil
+		return nil, fmt.Errorf("constraint %q is not on table %q, and pgroll's schema snapshot did not "+
+			"restore it, so the column it was on is unknown", o.Name, o.Table)
 	}
-	column := table.GetColumn(constraintColumns[0])
+	columns := duplicatedColumns(table, scope, constraintColumns[0])
+	if columns[0].pending() && table.GetColumn(constraintColumns[0]) == nil {
+		return nil, ColumnDoesNotExistError{Table: o.Table, Name: constraintColumns[0]}
+	}
 
 	// Target the physical base relation (table.Name); under a deferred in-train
 	// rename it differs from the logical o.Table. Trigger-function identifiers
 	// stay keyed by o.Table to match what Start installed.
-	return []DBAction{
-		NewDropFunctionAction(conn,
-			backfill.TriggerFunctionName(scope, o.Table, column.Name),
-			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, column.Name))),
-		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(scope, column.Name)),
-		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-		NewDropColumnAction(conn, table.Name, column.Name),
-		NewRenameDuplicatedColumnAction(conn, scope, table, column.Name),
-	}, nil
+	return duplicatorTailActions(conn, scope, table, o.Table, columns), nil
 }
 
 func (o *OpDropConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {

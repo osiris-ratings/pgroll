@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/lib/pq"
 
@@ -152,29 +151,4 @@ func (a *renameDuplicatedColumnAction) Execute(ctx context.Context) error {
 
 func primaryKeyName(tableName string) string {
 	return fmt.Sprintf("%s_pkey", tableName)
-}
-
-// duplicateOnly reports whether a duplicator's Complete was interrupted after
-// it dropped the original column: the original is gone and its duplicate is
-// still there. What is left is idempotent (drop the trigger function and the
-// backfill marker, rename the duplicate), so the Complete resumes with that.
-func duplicateOnly(table *schema.Table, scope, column string) bool {
-	return table.GetColumn(column) == nil && table.GetColumn(TemporaryName(scope, column)) != nil
-}
-
-// duplicatedColumnName returns the original name of the one column of table
-// duplicated under scope, for a Complete that can no longer read it from the
-// constraint it dropped with the original column.
-func duplicatedColumnName(table *schema.Table, scope string) (string, bool) {
-	prefix, suffix := temporaryPrefix, scopeSuffix(scope)
-	var found []string
-	for name := range table.Columns {
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) && len(name) > len(prefix)+len(suffix) {
-			found = append(found, name[len(prefix):len(name)-len(suffix)])
-		}
-	}
-	if len(found) != 1 {
-		return "", false
-	}
-	return found[0], true
 }

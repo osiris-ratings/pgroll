@@ -61,6 +61,9 @@ func (m *Roll) liveProjection(ctx context.Context, g *liveGuard) (*schema.Schema
 	if err != nil {
 		return nil, err
 	}
+	if err := m.reviveForProjection(ctx, s, []string{g.completed}, leaf); err != nil {
+		return nil, err
+	}
 	return m.replayPending(ctx, s, []string{g.completed}, leaf)
 }
 
@@ -337,6 +340,9 @@ func (m *Roll) liveProjectionTx(ctx context.Context, tx *sql.Tx, g *liveGuard, c
 	if g.pendingLeaf && (completing == nil || completing.Name != g.live.Name) {
 		leaf = g.live
 	}
+	if err := m.reviveForProjection(ctx, &s, exclude, leaf); err != nil {
+		return nil, err
+	}
 	return m.replayPending(ctx, &s, exclude, leaf)
 }
 
@@ -407,4 +413,209 @@ func (m *Roll) RestoreActiveVersionSchema(ctx context.Context) (string, int, err
 	g := &liveGuard{live: active, pendingLeaf: true}
 	n, err := m.restoreLiveViews(ctx, g, true)
 	return g.versionSchema(m), n, err
+}
+
+// reviveFromSnapshot puts back, in s, what an older pgroll's interrupted
+// duplicator contraction took from the catalog when it dropped an original
+// column before renaming its duplicate: the primary key and the constraints
+// that went with the column, read from pgroll's stored schema snapshot
+// (duplicatorSnapshot), never from the catalog, which no longer has them. With project, the duplicate is also keyed under the
+// column's logical name, so the live views keep exposing the user's column
+// with the duplicate's data. The atomic duplicator tail never leaves this
+// state; this exists for state an older binary left.
+func (m *Roll) reviveFromSnapshot(ctx context.Context, mig *migrations.Migration, s *schema.Schema, project bool) error {
+	scope := migrations.MigrationScopeFor(mig.Name)
+	dropped := droppedConstraints(mig, s)
+	if len(dropped) == 0 && !hasOrphanDuplicate(s, scope) {
+		return nil
+	}
+	snapshot, err := m.duplicatorSnapshot(ctx, mig)
+	if err != nil {
+		return err
+	}
+
+	// A constraint-dropping duplicator whose constraint is gone (its tail
+	// committed, or an older pgroll dropped the column it was on) finds the
+	// column it was on from the snapshot.
+	for _, d := range dropped {
+		if before := snapshot.GetTable(d.table); before != nil {
+			reviveConstraint(s.GetTable(d.table), before, d.name)
+		}
+	}
+
+	for tableName, columns := range migrations.DuplicatedColumnsOf(mig, snapshot) {
+		table := s.GetTable(tableName)
+		if table == nil {
+			continue
+		}
+		before := snapshot.GetTable(tableName)
+		if before == nil {
+			before = snapshot.GetTable(table.Name)
+		}
+		for _, column := range columns {
+			if !migrations.ResumesDuplicate(table, scope, column) {
+				continue
+			}
+			m.logger.Info("reviving an interrupted duplicator contraction from the schema snapshot",
+				"migration", mig.Name, "table", tableName, "column", column)
+			if before != nil {
+				reviveConstraints(table, before, column)
+			}
+			if project {
+				revived := *table.GetColumn(migrations.TemporaryName(scope, column))
+				table.AddColumn(column, &revived)
+			}
+		}
+	}
+	return nil
+}
+
+type tableConstraint struct{ table, name string }
+
+// droppedConstraints lists the constraints mig's constraint-dropping
+// duplicators name that s no longer has.
+func droppedConstraints(mig *migrations.Migration, s *schema.Schema) []tableConstraint {
+	var out []tableConstraint
+	for _, op := range mig.Operations {
+		var c tableConstraint
+		switch o := op.(type) {
+		case *migrations.OpDropConstraint:
+			c = tableConstraint{o.Table, o.Name}
+		case *migrations.OpDropMultiColumnConstraint:
+			c = tableConstraint{o.Table, o.Name}
+		default:
+			continue
+		}
+		if t := s.GetTable(c.table); t != nil && !t.ConstraintExists(c.name) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// reviveConstraint copies the named constraint's metadata from the snapshot
+// table, whatever its kind, with its columns under their logical names.
+func reviveConstraint(table, before *schema.Table, name string) {
+	if c, ok := before.CheckConstraints[name]; ok {
+		if table.CheckConstraints == nil {
+			table.CheckConstraints = map[string]*schema.CheckConstraint{}
+		}
+		revived := *c
+		revived.Columns = logicalColumns(c.Columns)
+		table.CheckConstraints[name] = &revived
+	}
+	if c, ok := before.UniqueConstraints[name]; ok {
+		if table.UniqueConstraints == nil {
+			table.UniqueConstraints = map[string]*schema.UniqueConstraint{}
+		}
+		revived := *c
+		revived.Columns = logicalColumns(c.Columns)
+		table.UniqueConstraints[name] = &revived
+	}
+	if c, ok := before.ForeignKeys[name]; ok {
+		if table.ForeignKeys == nil {
+			table.ForeignKeys = map[string]*schema.ForeignKey{}
+		}
+		revived := *c
+		revived.Columns = logicalColumns(c.Columns)
+		table.ForeignKeys[name] = &revived
+	}
+}
+
+// duplicatorSnapshot is pgroll's stored schema from before mig's contraction:
+// mig's own resulting_schema, recorded when it was marked deferred, right
+// after its Start, with the originals and their constraints still in place;
+// else, for the active leaf whose own is written only at completion, its
+// parent's.
+func (m *Roll) duplicatorSnapshot(ctx context.Context, mig *migrations.Migration) (*schema.Schema, error) {
+	own, err := m.state.SchemaAfterMigration(ctx, m.schema, mig.Name)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the schema snapshot of %q: %w", mig.Name, err)
+	}
+	if len(own.Tables) > 0 {
+		return own, nil
+	}
+	parent, err := m.state.MigrationParent(ctx, m.schema, mig.Name)
+	if err != nil || parent == nil {
+		return schema.New(), err
+	}
+	before, err := m.state.SchemaAfterMigration(ctx, m.schema, *parent)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the schema snapshot before %q: %w", mig.Name, err)
+	}
+	return before, nil
+}
+
+// hasOrphanDuplicate reports whether any table holds a duplicate made under
+// scope whose original column is gone, so the snapshot is read only then.
+func hasOrphanDuplicate(s *schema.Schema, scope string) bool {
+	suffix := "_" + scope
+	for _, table := range s.Tables {
+		for name := range table.Columns {
+			if !strings.HasPrefix(name, "_pgroll_new_") || !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			original := strings.TrimSuffix(strings.TrimPrefix(name, "_pgroll_new_"), suffix)
+			if table.GetColumn(original) == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reviveConstraints copies, from the snapshot table, the primary key and the
+// constraints on column that table no longer has.
+func reviveConstraints(table, before *schema.Table, column string) {
+	if slices.Contains(logicalColumns(before.PrimaryKey), column) && !slices.Contains(table.PrimaryKey, column) {
+		table.PrimaryKey = logicalColumns(before.PrimaryKey)
+	}
+	for name, c := range before.CheckConstraints {
+		if slices.Contains(logicalColumns(c.Columns), column) && table.CheckConstraints[name] == nil {
+			reviveConstraint(table, before, name)
+		}
+	}
+	for name, c := range before.UniqueConstraints {
+		if slices.Contains(logicalColumns(c.Columns), column) && table.UniqueConstraints[name] == nil {
+			reviveConstraint(table, before, name)
+		}
+	}
+	for name, c := range before.ForeignKeys {
+		if slices.Contains(logicalColumns(c.Columns), column) && table.ForeignKeys[name] == nil {
+			reviveConstraint(table, before, name)
+		}
+	}
+}
+
+// logicalColumns maps column names as a snapshot recorded them to logical
+// ones: a snapshot taken mid-train can hold a constraint on an earlier
+// migration's duplicate, which that migration's contraction has since
+// renamed into place.
+func logicalColumns(columns []string) []string {
+	out := make([]string, len(columns))
+	for i, c := range columns {
+		out[i] = migrations.LogicalColumnName(c)
+	}
+	return out
+}
+
+// reviveForProjection runs reviveFromSnapshot, projecting, for every
+// migration the live projection replays.
+func (m *Roll) reviveForProjection(ctx context.Context, s *schema.Schema, exclude []string, leaf *migrations.Migration) error {
+	pending, err := m.state.DeferredCompletes(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	if leaf != nil {
+		pending = append(pending, leaf)
+	}
+	for _, mig := range pending {
+		if slices.Contains(exclude, mig.Name) {
+			continue
+		}
+		if err := m.reviveFromSnapshot(ctx, mig, s, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }

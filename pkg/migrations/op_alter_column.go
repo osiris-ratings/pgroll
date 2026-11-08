@@ -120,53 +120,30 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 	if table == nil {
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
-	// Resuming a Complete interrupted after it dropped the original column:
-	// the sub-operations and the sequence-owner move ran before that drop.
-	if duplicateOnly(table, scope, o.Column) {
-		return []DBAction{
-			NewDropFunctionAction(
-				conn,
-				backfill.TriggerFunctionName(scope, o.Table, o.Column),
-				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
-			),
-			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-			NewRenameDuplicatedColumnAction(conn, scope, table, o.Column),
-		}, nil
-	}
-
-	ops := o.subOperations()
+	columns := duplicatedColumns(table, scope, o.Column)
 
 	dbActions := make([]DBAction, 0)
-	// Perform any operation specific completion steps
-	for _, op := range ops {
-		actions, err := op.Complete(l, conn, s)
-		if err != nil {
-			return nil, err
+	// The sub-operations run before the tail; resuming one an older pgroll
+	// interrupted, or retrying one that committed, they already ran.
+	if columns[0].pending() {
+		for _, op := range o.subOperations() {
+			actions, err := op.Complete(l, conn, s)
+			if err != nil {
+				return nil, err
+			}
+			dbActions = append(dbActions, actions...)
 		}
-		dbActions = append(dbActions, actions...)
-	}
-
-	column := table.GetColumn(o.Column)
-	if column == nil {
-		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
+		if table.GetColumn(o.Column) == nil {
+			return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
+		}
 	}
 
 	// All DDL targets the physical base relation (table.Name). Under a deferred
 	// in-train rename table.Name is the still-physical name while o.Table is the
 	// post-rename logical name; do not overwrite table.Name with o.Table (that
-	// would misdirect the duplicated-column rename below). Trigger-function
+	// would misdirect the duplicated-column rename). Trigger-function
 	// identifiers stay keyed by o.Table to match what Start installed.
-	return append(dbActions, []DBAction{
-		NewAlterSequenceOwnerAction(conn, table.Name, column.Name, TemporaryName(scope, column.Name)),
-		NewDropColumnAction(conn, table.Name, o.Column),
-		NewDropFunctionAction(
-			conn,
-			backfill.TriggerFunctionName(scope, o.Table, o.Column),
-			backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
-		),
-		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-		NewRenameDuplicatedColumnAction(conn, scope, table, o.Column),
-	}...), nil
+	return append(dbActions, duplicatorTailActions(conn, scope, table, o.Table, columns)...), nil
 }
 
 func (o *OpAlterColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {

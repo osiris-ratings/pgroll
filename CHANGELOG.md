@@ -29,10 +29,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every contraction puts back missing live views when it starts, after
     any raw SQL, at its end and on every failure. A cancelled context gets
     a fresh 15 s one, inside a supervisor's 20 s kill.
-- **An interrupted `alter_column` or `drop_constraint` contraction resumes.**
-  Interrupted after dropping the original column, the retry failed
-  (`alter_column`: column does not exist) or panicked (`drop_constraint`).
-  It now finishes from the duplicate.
+- **A duplicator's contraction is atomic.** `alter_column`,
+  `drop_constraint`, `drop_multicolumn_constraint` and `create_constraint`
+  end by dropping the original column and renaming the duplicate into its
+  place. That now runs in one transaction with the trigger drop, the
+  sequence-ownership move and the primary key's re-add, so an interrupt
+  leaves the table before or after it, never with the column missing. The
+  duplicate's CHECK constraints are validated before the transaction, so it
+  holds no scan under its ACCESS EXCLUSIVE lock. A retry after the
+  transaction committed no longer drops the column it finds in place.
+- **State an older pgroll left between that drop and that rename resumes
+  from pgroll's schema snapshot.** The retry failed (`alter_column`: column
+  does not exist) or panicked (`drop_constraint`), and a resume from the
+  catalog lost the table's primary key and dropped the column from the live
+  view. The primary key, the constraints and the column mapping now come
+  from the migration's stored `resulting_schema`, never from the catalog
+  the drop changed.
+- **Two duplicators on one column in a train.** `drop_constraint` named its
+  duplicate, triggers and schema entry after the column's physical name,
+  which after an earlier duplicator is that duplicator's temporary column.
+  Its trigger wrote a column that does not exist, so writes failed while
+  the train was expanded, and the live view stayed bound to the earlier
+  duplicate, which contraction then renamed and tried to drop. It now
+  names everything after the logical column, as the other duplicators do.
+- **Trigger creation failures fail the migration.** `Start` ignored them, so
+  a duplicate could be left out of sync with the column apps write and
+  contraction would swap stale data in. `Start` now rolls back.
+- **An interrupted `alter_column … nullable: false` contraction resumes.**
+  Its NOT NULL steps are skipped once their check is gone, instead of
+  failing to validate it.
 
 ### Changed
 

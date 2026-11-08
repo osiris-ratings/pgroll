@@ -584,6 +584,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	if err != nil {
 		return fmt.Errorf("unable to read schema: %w", err)
 	}
+	if err := m.reviveFromSnapshot(ctx, migration, currentSchema, false); err != nil {
+		return err
+	}
 	// Set the active migration's scope so its op.Complete naming helpers
 	// match the identifiers installed by its earlier Start.
 	currentSchema.MigrationScope = migrations.MigrationScopeFor(migration.Name)
@@ -906,7 +909,15 @@ func (m *Roll) performBackfills(ctx context.Context, job *backfill.Job, cfg *bac
 
 	bf := backfill.New(m.pgConn, cfg, job.MigrationScope())
 
-	bf.CreateTriggers(ctx, job)
+	// A trigger that fails to install would leave the duplicate unsynced with
+	// the column apps write, and contraction would then swap stale data in.
+	if err := bf.CreateTriggers(ctx, job); err != nil {
+		m.logger.LogRollbackOnFailure(fmt.Sprintf("creating backfill triggers failed: %v", err))
+		cleanupCtx, cancel := m.rollbackContext(ctx)
+		errRollback := m.Rollback(cleanupCtx)
+		cancel()
+		return errors.Join(fmt.Errorf("unable to create backfill triggers: %w", err), errRollback)
+	}
 
 	for _, table := range job.Tables {
 		m.logger.LogBackfillStart(table.Name)
@@ -986,6 +997,9 @@ func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migrati
 	drainSchema, err := m.state.ReadSchema(ctx, m.schema)
 	if err != nil {
 		return fmt.Errorf("unable to read schema for deferred complete %q: %w", dm.Name, err)
+	}
+	if err := m.reviveFromSnapshot(ctx, dm, drainSchema, false); err != nil {
+		return err
 	}
 	drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 

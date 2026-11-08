@@ -4,6 +4,7 @@ package migrations
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/lib/pq"
@@ -112,21 +113,16 @@ func (o *OpDropMultiColumnConstraint) Complete(l Logger, conn db.DB, s *schema.S
 	// post-rename logical name; do not overwrite table.Name with o.Table.
 	// Trigger-function identifiers stay keyed by o.Table to match Start.
 	constraintColumns := table.GetConstraintColumns(o.Name)
-	dbActions := make([]DBAction, 0, 5*len(constraintColumns))
-	for _, columnName := range constraintColumns {
-		dbActions = append(
-			dbActions,
-			NewDropFunctionAction(conn,
-				backfill.TriggerFunctionName(scope, o.Table, columnName),
-				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, columnName))),
-			NewAlterSequenceOwnerAction(conn, table.Name, columnName, TemporaryName(scope, columnName)),
-			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
-			NewDropColumnAction(conn, table.Name, columnName),
-			NewRenameDuplicatedColumnAction(conn, scope, table, columnName),
-		)
+	if len(constraintColumns) == 0 {
+		// Retrying a Complete whose tail committed: the constraint went with
+		// the original column, the trigger functions with the tail.
+		if tailCommitted(table, scope) {
+			return []DBAction{NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope))}, nil
+		}
+		return nil, fmt.Errorf("constraint %q is not on table %q, and pgroll's schema snapshot did not "+
+			"restore it, so the columns it was on are unknown", o.Name, o.Table)
 	}
-
-	return dbActions, nil
+	return duplicatorTailActions(conn, scope, table, o.Table, duplicatedColumns(table, scope, constraintColumns...)), nil
 }
 
 func (o *OpDropMultiColumnConstraint) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
