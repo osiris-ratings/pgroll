@@ -82,6 +82,38 @@ func TestMaterializeIsIdempotent(t *testing.T) {
 	})
 }
 
+// TestMaterializeLeavesExistingViewsAlone: materialize creates only what is
+// missing. A view that exists, whatever it reads, is never dropped or
+// rebuilt: it may be the live view apps are reading.
+func TestMaterializeLeavesExistingViewsAlone(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		const version = "01_create_table"
+		versionSchema := roll.VersionedSchemaName(cSchema, version)
+
+		require.NoError(t, m.Start(ctx, &migrations.Migration{
+			Name:       version,
+			Operations: migrations.Operations{createTableOp("widgets")},
+		}, backfill.NewConfig()))
+		require.NoError(t, m.Complete(ctx))
+
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`DROP VIEW %[1]q.widgets;
+			CREATE VIEW %[1]q.widgets AS SELECT id FROM %[2]q.widgets;
+			CREATE TABLE %[2]q.gadgets (id integer PRIMARY KEY)`, versionSchema, cSchema))
+		require.NoError(t, err)
+
+		sc, err := m.State().ReadSchema(ctx, m.Schema())
+		require.NoError(t, err)
+		require.NoError(t, m.Materialize(ctx, version, sc))
+
+		assert.True(t, viewExists(t, db, versionSchema, "gadgets"), "a missing view is created")
+		_, err = db.ExecContext(ctx, fmt.Sprintf("SELECT name FROM %q.widgets", versionSchema))
+		require.Error(t, err, "an existing view is never rebuilt")
+	})
+}
+
 func TestMaterializeRejectsOverlongVersionName(t *testing.T) {
 	t.Parallel()
 

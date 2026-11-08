@@ -486,19 +486,6 @@ func (s *State) ReadSchema(ctx context.Context, schemaName string) (*schema.Sche
 	return &sc, nil
 }
 
-// MigrationParent returns the name of the migration `name` was applied on
-// top of in `schemaName`, or nil for the first one.
-func (s *State) MigrationParent(ctx context.Context, schemaName, name string) (*string, error) {
-	var parent *string
-	err := s.pgConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT parent FROM %s.migrations WHERE schema=$1 AND name=$2", pq.QuoteIdentifier(s.schema)),
-		schemaName, name).Scan(&parent)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read the parent of migration %q: %w", name, err)
-	}
-	return parent, nil
-}
-
 // SchemaAfterMigration reads the schema after the migration `version` was
 // applied to `schemaName`
 func (s *State) SchemaAfterMigration(ctx context.Context, schemaName, version string) (*schema.Schema, error) {

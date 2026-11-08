@@ -132,7 +132,10 @@ func (o *OpCreateConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	columns := duplicatedColumns(table, scope, o.Columns...)
+	columns, err := duplicatedColumns(table, scope, o.Columns...)
+	if err != nil {
+		return nil, err
+	}
 	resuming := slices.ContainsFunc(columns, func(c duplicatedColumn) bool { return !c.pending() })
 
 	dbActions := make([]DBAction, 0)

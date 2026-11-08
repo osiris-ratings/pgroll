@@ -25,19 +25,21 @@ func materializeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "materialize",
 		Short: "Re-create the version schema and views from the live database state",
-		Long: "Materialize re-projects the version schema (<schema>_<version>) and the views\n" +
-			"apps connect to, using the live target schema as the source of truth. It is a\n" +
-			"recovery tool for situations where the live tables exist but the version schema\n" +
-			"is missing — for example after an interrupted batched migrate, or when the\n" +
-			"version schema was dropped manually. It does NOT modify pgroll state and does\n" +
-			"NOT execute migration operations against user tables.\n\n" +
+		Long: "Materialize creates the version schema (<schema>_<version>) and the views apps\n" +
+			"connect to that are missing from it, using the live target schema, with any\n" +
+			"still-queued contraction's Starts replayed over it, as the source of truth. It\n" +
+			"is a recovery tool for situations where the live tables exist but the version\n" +
+			"schema, or a view in it, is missing — for example after an interrupted batched\n" +
+			"migrate, or when the version schema was dropped manually. It never drops or\n" +
+			"rebuilds a view that exists, does NOT modify pgroll state and does NOT execute\n" +
+			"migration operations against user tables.\n\n" +
 			"Pass --migrations <dir> to fast-forward through unapplied migration files in\n" +
 			"memory before projecting views; this lets the projected views match what apps\n" +
 			"will see after those migrations land, even though the live tables haven't yet.\n\n" +
-			"While a migration is in progress, materialize re-projects that migration's\n" +
-			"version schema, the one apps are pinned to, as its Start projected it: the\n" +
-			"recovery for a contraction that left it missing. --migrations and --version\n" +
-			"do not apply then.",
+			"While a migration is in progress, materialize creates what is missing from\n" +
+			"that migration's version schema, the one apps are pinned to, as its Start\n" +
+			"projected it, and fails without creating anything if that projection cannot\n" +
+			"be rebuilt. --migrations and --version do not apply then.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -56,7 +58,10 @@ func materializeCmd() *cobra.Command {
 				return materializeActive(ctx, m, migrationsDir, versionOverride, yes)
 			}
 
-			sc, err := m.State().ReadSchema(ctx, m.Schema())
+			// With contraction queued, the version schema projects the queued
+			// Starts, not the bare tables: a duplicate under the column's name,
+			// a renamed column under its new name.
+			sc, err := m.ReadSchemaWithDeferred(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to read live schema: %w", err)
 			}
@@ -118,13 +123,13 @@ func materializeCmd() *cobra.Command {
 	return cmd
 }
 
-// materializeActive re-projects the active migration's version schema. It
-// never suggests `pgroll rollback`: rolling back the active migration would
-// undo its expand under the code that is already reading it.
+// materializeActive creates what is missing from the active migration's version
+// schema. It never suggests `pgroll rollback`: rolling back the active
+// migration would undo its expand under the code that is already reading it.
 func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, versionOverride string, yes bool) error {
 	if migrationsDir != "" || versionOverride != "" {
-		return fmt.Errorf("a migration is in progress on schema %q: materialize re-projects its version "+
-			"schema as its Start did, so --migrations and --version do not apply", m.Schema())
+		return fmt.Errorf("a migration is in progress on schema %q: materialize creates what is missing "+
+			"from its version schema as its Start projected it, so --migrations and --version do not apply", m.Schema())
 	}
 	active, err := m.State().GetActiveMigration(ctx, m.Schema())
 	if err != nil {
@@ -134,7 +139,7 @@ func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, version
 
 	title := pterm.NewStyle(pterm.FgWhite, pterm.Bold).Sprint("▶ pgroll materialize")
 	fmt.Fprintf(os.Stdout, "\n%s   %s\n\n", title, pterm.FgGray.Sprintf("%s · migration %s in progress", m.Schema(), active.Name))
-	fmt.Fprintf(os.Stdout, "  %s %s  re-project the live version schema %s from the tables\n\n",
+	fmt.Fprintf(os.Stdout, "  %s %s  create the views missing from the live version schema %s\n\n",
 		pterm.FgCyan.Sprint("●"), pterm.NewStyle(pterm.FgCyan, pterm.Bold).Sprint("RESTORE"), target)
 
 	if !yes {
@@ -153,7 +158,7 @@ func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, version
 	if n == 0 {
 		sp.Success(fmt.Sprintf("Version schema %q is complete; nothing to restore", target))
 	} else {
-		sp.Success(fmt.Sprintf("Version schema %q restored: %d view(s) created or rebuilt", target, n))
+		sp.Success(fmt.Sprintf("Version schema %q restored: %d view(s) created", target, n))
 	}
 	return nil
 }
@@ -163,7 +168,7 @@ func materializeActive(ctx context.Context, m *roll.Roll, migrationsDir, version
 // Precedence:
 //  1. --version override, if set.
 //  2. Final unapplied migration's VersionSchemaName, if --migrations resolved any.
-//  3. state.LatestMigration, if non-nil and non-empty.
+//  3. The VersionSchemaName of state.LatestMigration, if there is one.
 //  4. Error — caller must pass --version or --migrations.
 func resolveMaterializeVersion(ctx context.Context, m *roll.Roll, parsedMigs []*migrations.Migration, override string) (string, error) {
 	if override != "" {
@@ -177,7 +182,11 @@ func resolveMaterializeVersion(ctx context.Context, m *roll.Roll, parsedMigs []*
 		return "", fmt.Errorf("reading latest migration from state: %w", err)
 	}
 	if latest != nil && *latest != "" {
-		return *latest, nil
+		mig, err := m.State().GetMigration(ctx, m.Schema(), *latest)
+		if err != nil {
+			return "", fmt.Errorf("reading latest migration %q from state: %w", *latest, err)
+		}
+		return mig.VersionSchemaName(), nil
 	}
 	return "", fmt.Errorf("no version name could be derived: pass --version or --migrations <dir>")
 }

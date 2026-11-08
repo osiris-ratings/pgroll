@@ -4,7 +4,10 @@ package migrations_test
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
+
+	"github.com/lib/pq"
 
 	"github.com/xataio/pgroll/pkg/migrations"
 )
@@ -77,13 +80,19 @@ func TestRawSQL(t *testing.T) {
 				TableMustNotExist(t, db, schema, "test_table")
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
-				// table can be accessed after start
+				// the table exists once complete has run the SQL
 				TableMustExist(t, db, schema, "test_table")
 
-				// inserts work
-				MustInsert(t, db, schema, "01_create_table", "test_table", map[string]string{
-					"name": "foo",
-				})
+				// the version schema keeps what its Start projected: contraction
+				// never rebuilds it, so the next migration's version schema is
+				// the first to show the table
+				ViewMustNotExist(t, db, schema, "01_create_table", "test_table")
+
+				// inserts work on the table
+				_, err := db.Exec(fmt.Sprintf("INSERT INTO %s.test_table (name) VALUES ('foo')", pq.QuoteIdentifier(schema)))
+				if err != nil {
+					t.Fatal(err)
+				}
 			},
 		},
 		{
@@ -118,15 +127,20 @@ func TestRawSQL(t *testing.T) {
 				TableMustNotExist(t, db, schema, "test_table")
 			},
 			afterComplete: func(t *testing.T, db *sql.DB, schema string) {
-				// table can be accessed after start
+				// the column exists once complete has run the SQL
 				TableMustExist(t, db, schema, "test_table")
 				ColumnMustExist(t, db, schema, "test_table", "age")
 
-				// inserts work
+				// the version schema keeps what its Start projected: inserts
+				// through it work, and the next migration's version schema is
+				// the first to show the column
 				MustInsert(t, db, schema, "01_create_table", "test_table", map[string]string{
 					"name": "foo",
-					"age":  "42",
 				})
+				MustNotInsert(t, db, schema, "01_create_table", "test_table", map[string]string{
+					"name": "foo",
+					"age":  "42",
+				}, "undefined_column")
 			},
 		},
 		{

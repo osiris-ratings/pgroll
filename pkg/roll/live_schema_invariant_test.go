@@ -55,6 +55,9 @@ type contractionCase struct {
 	// examples: the train is every migration in examples/ (what `make
 	// examples` applies), in place of base, setup, train and leaf.
 	examples bool
+	// refused: the contraction must fail, every time, with an error that
+	// contains this, and leave the live schema as it was.
+	refused string
 }
 
 // examplesDir is the repository's examples, relative to this package.
@@ -216,16 +219,56 @@ func contractionCorpus() []contractionCase {
 			},
 		},
 		{
-			// Raw SQL a live view really depends on: it takes the
-			// transactional fallback.
-			name:  "raw_sql_conflicting_with_view",
-			train: []*migrations.Migration{rawOnComplete("01_raw_drop_value", "ALTER TABLE t DROP COLUMN value")},
-			leaf:  events(),
+			// Raw SQL a live view depends on (2BP01): the contraction stops
+			// and names the view, and nothing changes.
+			name:    "raw_sql_conflicting_with_view",
+			train:   []*migrations.Migration{rawOnComplete("01_raw_drop_value", "ALTER TABLE t DROP COLUMN value")},
+			leaf:    events(),
+			refused: "conflicts with view " + liveView("09_leaf", "t"),
 			check: func(t *testing.T, db *sql.DB) {
-				assert.False(t, columnExists(t, db, cSchema, "t", "value"))
+				assert.True(t, columnExists(t, db, cSchema, "t", "value"))
+			},
+		},
+		{
+			// The same column dropped with CASCADE, which takes the live view
+			// with it while the table remains: rolled back.
+			name:    "raw_sql_cascade_drops_view",
+			train:   []*migrations.Migration{rawOnComplete("01_raw_drop_value", "ALTER TABLE t DROP COLUMN value CASCADE")},
+			leaf:    events(),
+			refused: "dropped view " + liveView("09_leaf", "t"),
+			check: func(t *testing.T, db *sql.DB) {
+				assert.True(t, columnExists(t, db, cSchema, "t", "value"))
+			},
+		},
+		{
+			// A statement Postgres refuses inside a transaction runs outside
+			// the one that guards the live views, so nothing rolls it back:
+			// a retry runs it again, and only IF NOT EXISTS makes that safe.
+			name: "raw_sql_create_index_concurrently_if_not_exists",
+			train: []*migrations.Migration{rawOnComplete("01_raw_index",
+				"CREATE INDEX CONCURRENTLY IF NOT EXISTS t_value_cidx ON t (value)")},
+			leaf: events(),
+			check: func(t *testing.T, db *sql.DB) {
+				assert.True(t, indexExists(t, db, "t_value_cidx"))
 			},
 		},
 	}
+}
+
+// liveView is a view of version's schema as pgroll's errors name it.
+func liveView(version, view string) string {
+	return pq.QuoteIdentifier(roll.VersionedSchemaName(cSchema, version)) + "." + pq.QuoteIdentifier(view)
+}
+
+// contractOrRefuse runs the contraction c expects to finish, or to refuse.
+func contractOrRefuse(t *testing.T, c contractionCase, contract func() error, msgAndArgs ...any) {
+	t.Helper()
+	err := contract()
+	if c.refused == "" {
+		require.NoError(t, err, msgAndArgs...)
+		return
+	}
+	require.ErrorContains(t, err, c.refused, msgAndArgs...)
 }
 
 // contractionPath is how a train is left for contraction and contracted:
@@ -358,7 +401,7 @@ func countContractionCalls(t *testing.T, c contractionCase, p contractionPath) i
 			applyCase(t, mig, db, c, p)
 			fc := &faultConn{}
 			fc.DB = roll.SwapConnForTest(mig, fc)
-			require.NoError(t, p.contract(context.Background(), mig))
+			contractOrRefuse(t, c, func() error { return p.contract(context.Background(), mig) })
 			calls = fc.count()
 		})
 	})
@@ -434,8 +477,8 @@ func TestContractionLiveSchemaSurvivesEveryFault(t *testing.T) {
 								assert.Empty(t, orphanedDuplicates(t, db), "a duplicator tail left half done "+
 									"after a fault at statement %d of %d (%s)", n, k, fc.fired)
 
-								require.NoError(t, pgrollComplete(context.Background(), mig),
-									"the fault-free retry must contract (fault was at %d: %s)", n, fc.fired)
+								contractOrRefuse(t, c, func() error { return pgrollComplete(context.Background(), mig) },
+									"the fault-free retry (fault was at %d: %s)", n, fc.fired)
 								assertLiveReadable(t, db, live, views, "after the retry")
 								c.check(t, db)
 							})
@@ -463,7 +506,7 @@ func TestContractionHasNoReadGap(t *testing.T) {
 					live, views := applyCase(t, mig, db, c, p)
 
 					probe := startLiveReader(t, db, live, views)
-					require.NoError(t, p.contract(context.Background(), mig))
+					contractOrRefuse(t, c, func() error { return p.contract(context.Background(), mig) })
 					reads, missing := probe()
 
 					assert.Positive(t, reads, "the reader must have run during the contraction")
@@ -478,7 +521,8 @@ func TestContractionHasNoReadGap(t *testing.T) {
 
 // TestContractionRefusesNonTransactionalViewConflict: raw SQL that a live
 // view blocks and that cannot run inside a transaction (here a procedure
-// that COMMITs) fails the contraction with the live schema untouched.
+// that COMMITs) fails the contraction, naming the view, with the live schema
+// untouched.
 func TestContractionRefusesNonTransactionalViewConflict(t *testing.T) {
 	t.Parallel()
 
@@ -500,7 +544,7 @@ func TestContractionRefusesNonTransactionalViewConflict(t *testing.T) {
 				_, missing := probe()
 
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "cannot run inside a transaction")
+				assert.Contains(t, err.Error(), "conflicts with view "+liveView("09_leaf", "t"))
 				assert.Empty(t, missing, "the live schema must never be missing a relation")
 				assertLiveReadable(t, db, live, views, "after the refused contraction")
 				assert.True(t, viewHasColumn(t, db, live, "t", "value"), "nothing was changed")

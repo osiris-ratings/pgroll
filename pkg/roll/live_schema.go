@@ -12,338 +12,374 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/lib/pq"
 
+	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/schema"
 )
 
-// restoreTimeout bounds putting the live version schema back after the
-// caller's context was cancelled. It must finish before a supervisor's hard
-// kill: a deploy engine typically escalates an abort to SIGKILL 20 s after the
-// interrupt, so the 30 s rollbackCleanupTimeout would lose that race.
-const restoreTimeout = 15 * time.Second
+// Contraction never drops or rebuilds the live version schema, the one apps
+// are pinned to. It refuses to start without that schema, and it runs each
+// onComplete raw SQL statement in a transaction that rolls back if the
+// statement removes a live view whose table remains (liveSQLAction).
 
-// liveGuard is what a contraction knows about the live version schema, the
-// projection apps are pinned to, so it can keep that schema readable:
-// contraction never drops it, never leaves it missing views, and drops a view
-// only inside a transaction that recreates it (see runAroundLiveViews).
-type liveGuard struct {
-	// live is the migration whose version schema apps read.
-	live *migrations.Migration
-	// pendingLeaf: live is the active migration, its Start has run and its
-	// own Complete has not, so its Start is replayed when projecting.
-	pendingLeaf bool
-	// completed names a still-queued migration whose Complete has already run,
-	// left out of the replay (FinishContraction clears the last flag late).
-	completed string
-	// rawRan: onComplete raw SQL ran against the tables, so views may be
-	// missing (a raw CASCADE) or stale (a raw rename).
-	rawRan bool
-}
-
-func (g *liveGuard) versionSchema(m *Roll) string {
-	return VersionedSchemaName(m.schema, g.live.VersionSchemaName())
-}
-
-// liveProjection is the schema the live views project, as Start projected
-// it: the physical schema with every Start whose Complete has not run yet
-// replayed over it. A physical read alone would show pre-rename names and
-// bind views to columns about to be dropped.
-func (m *Roll) liveProjection(ctx context.Context, g *liveGuard) (*schema.Schema, error) {
-	var leaf *migrations.Migration
-	if g.pendingLeaf {
-		leaf = g.live
-	}
-	s, err := m.state.ReadSchema(ctx, m.schema)
+// hasVersionSchema reports whether mig's version schema exists.
+func (m *Roll) hasVersionSchema(ctx context.Context, mig *migrations.Migration) (bool, error) {
+	existing, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	if err := m.reviveForProjection(ctx, s, []string{g.completed}, leaf); err != nil {
-		return nil, err
-	}
-	return m.replayPending(ctx, s, []string{g.completed}, leaf)
+	return slices.Contains(existing, VersionedSchemaName(m.schema, mig.VersionSchemaName())), nil
 }
 
-// restoreLiveViews makes the live version schema project every table it
-// should. A missing schema or view is always created. With refresh, a view
-// whose columns no longer match the projection is rebuilt too; views that
-// match are left alone, so nothing re-locks a view apps are reading for no
-// reason. Each view falls back to the physical schema when the replayed
-// projection cannot build it, so one odd table never leaves the rest
-// missing. Returns the number of views created or rebuilt.
-func (m *Roll) restoreLiveViews(ctx context.Context, g *liveGuard, refresh bool) (int, error) {
-	if g == nil || m.disableVersionSchemas {
-		return 0, nil
-	}
-	versionSchema := g.versionSchema(m)
-
-	projection, projErr := m.liveProjection(ctx, g)
-	physical, err := m.state.ReadSchema(ctx, m.schema)
+// requireLiveViews refuses a contraction when the version schema of `version`
+// is missing a view of a table project returns. Only a table that already
+// existed when that schema was created counts: one created after it, such as a
+// partition pg_partman adds or a table onComplete SQL creates, was never
+// projected. When the projection cannot be rebuilt (a Complete that ran part
+// way), there is nothing to compare against and the check is skipped.
+func (m *Roll) requireLiveViews(ctx context.Context, version string, project func() (*schema.Schema, error)) error {
+	projection, err := project()
 	if err != nil {
-		return 0, fmt.Errorf("unable to read schema: %w", err)
-	}
-	if projErr != nil {
-		m.logger.Info("live projection unavailable; projecting the physical schema",
-			"schema", versionSchema, "error", projErr.Error())
-		projection = physical
-	}
-
-	existing, err := m.liveViewColumns(ctx, versionSchema)
-	if err != nil {
-		return 0, err
-	}
-
-	names := make([]string, 0, len(projection.Tables))
-	for name := range projection.Tables {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	created := false
-	rebuilt := 0
-	var errs []error
-	for _, name := range names {
-		table := projection.Tables[name]
-		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") {
-			continue
-		}
-		have, ok := existing[name]
-		if ok && (!refresh || slices.Equal(have, projectedColumns(table))) {
-			continue
-		}
-		if !created {
-			if _, err := m.pgConn.ExecContext(ctx,
-				fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pq.QuoteIdentifier(versionSchema))); err != nil {
-				return rebuilt, fmt.Errorf("unable to create live version schema %q: %w", versionSchema, err)
-			}
-			created = true
-		}
-		err := m.ensureView(ctx, g.live.VersionSchemaName(), name, table)
-		if err != nil && projection != physical {
-			if alt := physical.GetTable(name); alt != nil && !strings.HasPrefix(alt.Name, "_pgroll_del_") {
-				err = m.ensureView(ctx, g.live.VersionSchemaName(), name, alt)
-			}
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("view %s.%s: %w", versionSchema, name, err))
-			continue
-		}
-		rebuilt++
-	}
-	if rebuilt > 0 {
-		m.logger.Info("restored live version schema views", "schema", versionSchema, "views", rebuilt)
-	}
-	return rebuilt, errors.Join(errs...)
-}
-
-// projectedColumns is the sorted list of column names ensureView projects
-// for a table.
-func projectedColumns(table *schema.Table) []string {
-	cols := make([]string, 0, len(table.Columns))
-	for name, col := range table.Columns {
-		if col.Deleted || strings.HasPrefix(name, "_pgroll_") {
-			continue
-		}
-		cols = append(cols, name)
-	}
-	sort.Strings(cols)
-	return cols
-}
-
-// liveViewColumns returns each view in the version schema with its sorted
-// column names; empty when the schema does not exist.
-func (m *Roll) liveViewColumns(ctx context.Context, versionSchema string) (map[string][]string, error) {
-	rows, err := m.pgConn.QueryContext(ctx, `SELECT c.relname, a.attname
-		FROM pg_catalog.pg_class c
-		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-		WHERE n.nspname = $1 AND c.relkind = 'v' AND a.attnum > 0 AND NOT a.attisdropped`,
-		versionSchema)
-	if err != nil {
-		return nil, fmt.Errorf("unable to list views in %q: %w", versionSchema, err)
-	}
-	defer rows.Close()
-
-	views := map[string][]string{}
-	for rows.Next() {
-		var view, column string
-		if err := rows.Scan(&view, &column); err != nil {
-			return nil, fmt.Errorf("unable to scan view column: %w", err)
-		}
-		views[view] = append(views[view], column)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating view columns: %w", err)
-	}
-	for _, cols := range views {
-		sort.Strings(cols)
-	}
-	return views, nil
-}
-
-// restoreAfterFailure puts the live views back after a contraction failed,
-// and adds to cause anything it could not restore. A cancelled caller gets a
-// fresh context of at most restoreTimeout.
-func (m *Roll) restoreAfterFailure(ctx context.Context, g *liveGuard, cause error) error {
-	if g == nil || m.disableVersionSchemas {
-		return cause
-	}
-	rctx, cancel := ctx, context.CancelFunc(func() {})
-	if ctx.Err() != nil {
-		m.logger.Info("context cancelled; restoring the live version schema with a fresh context",
-			"timeout", restoreTimeout.String())
-		rctx, cancel = context.WithTimeout(context.Background(), restoreTimeout)
-	}
-	defer cancel()
-
-	if _, err := m.restoreLiveViews(rctx, g, false); err != nil {
-		return errors.Join(cause, fmt.Errorf(
-			"the live version schema %q could not be fully restored; run `pgroll materialize`: %w",
-			g.versionSchema(m), err,
-		))
-	}
-	return cause
-}
-
-// viewConflictRecovery returns the coordinator hook a contraction runs its
-// Complete actions with. An action Postgres refuses because a live view
-// depends on what it changes is raw SQL pgroll cannot reason about; it runs
-// again inside one transaction with the blocking views dropped and recreated
-// (runAroundLiveViews). Any other failure is returned as it is. `completing`
-// is the migration whose actions run, left out of the projection's replay.
-func (m *Roll) viewConflictRecovery(g *liveGuard, completing *migrations.Migration) func(context.Context, migrations.DBAction, error) error {
-	if g == nil || m.disableVersionSchemas {
+		m.logger.Info("not checking the live views: their projection cannot be rebuilt", "error", err.Error())
 		return nil
 	}
-	return func(ctx context.Context, action migrations.DBAction, err error) error {
-		versionSchema := g.versionSchema(m)
-		if !isLiveViewConflict(err, versionSchema) {
-			return err
+	versionSchema := VersionedSchemaName(m.schema, version)
+	views, err := liveViewReads(ctx, m.pgConn, versionSchema)
+	if err != nil {
+		return err
+	}
+	rows, err := m.pgConn.QueryContext(ctx, `SELECT c.relname FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
+			AND c.oid < (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $2)`, m.schema, versionSchema)
+	if err != nil {
+		return fmt.Errorf("unable to list the tables %q projects: %w", versionSchema, err)
+	}
+	defer rows.Close()
+	older := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("unable to scan table name: %w", err)
 		}
+		older[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	var missing []string
+	for name, table := range projection.Tables {
+		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") || !older[table.Name] ||
+			slices.ContainsFunc(views, func(r liveViewRead) bool { return r.view == name }) {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("cannot contract: the live version schema is missing %s, which apps read, and "+
+		"contraction would finish without it. Restore it with `pgroll materialize`, then run `pgroll complete` "+
+		"again", qualifiedViews(versionSchema, missing))
+}
+
+// guardLiveViews runs every onComplete raw SQL action among a contraction's
+// actions as a liveSQLAction against the live version schema of `live`. The
+// actions are `completing`'s; pendingLeaf is the active migration when its
+// Start is still unprojected over the tables (nil once it is completing).
+func (m *Roll) guardLiveViews(actions []migrations.DBAction, live, completing, pendingLeaf *migrations.Migration) []migrations.DBAction {
+	if live == nil || m.disableVersionSchemas {
+		return actions
+	}
+	out := make([]migrations.DBAction, len(actions))
+	for i, action := range actions {
 		raw, ok := action.(migrations.SQLAction)
 		if !ok {
-			return fmt.Errorf("a view in the live version schema %q depends on what %s changes; "+
-				"pgroll runs only raw SQL around live views, so the live schema is unchanged: %w",
-				versionSchema, action.ID(), err)
+			out[i] = action
+			continue
 		}
-		return m.runAroundLiveViews(ctx, g, completing, raw.SQL(), err)
+		out[i] = &liveSQLAction{
+			m:           m,
+			raw:         raw,
+			version:     live.VersionSchemaName(),
+			schema:      VersionedSchemaName(m.schema, live.VersionSchemaName()),
+			swap:        isRawInverse(completing),
+			completing:  completing,
+			pendingLeaf: pendingLeaf,
+		}
 	}
+	return out
+}
+
+// isRawInverse reports whether mig is an inverse that a sealed revert
+// generated from a raw SQL migration's `down`, and holds nothing else. Such a
+// `down` can remove what the restored version schema still projects.
+func isRawInverse(mig *migrations.Migration) bool {
+	if mig == nil || mig.RevertOf == "" || len(mig.Operations) == 0 {
+		return false
+	}
+	for _, op := range mig.Operations {
+		if raw, ok := op.(*migrations.OpRawSQL); !ok || !raw.OnComplete {
+			return false
+		}
+	}
+	return true
+}
+
+// liveSQLAction runs one onComplete raw SQL statement in a transaction that
+// keeps the live version schema whole. A statement that a live view blocks
+// (2BP01, 0A000) fails with the view named, and one that leaves a live view
+// missing while its table remains (a CASCADE) is rolled back. Only a raw
+// inverse (swap) may drop the views its statement blocks, recreating, from
+// the projection the statement leaves, those whose table remains.
+type liveSQLAction struct {
+	m           *Roll
+	raw         migrations.SQLAction
+	version     string
+	schema      string
+	swap        bool
+	completing  *migrations.Migration
+	pendingLeaf *migrations.Migration
+}
+
+func (a *liveSQLAction) ID() string { return a.raw.ID() }
+
+func (a *liveSQLAction) Execute(ctx context.Context) error {
+	if err := migrations.CheckNoTransactionControl(a.raw.SQL()); err != nil {
+		return fmt.Errorf("%w. It was not run, the contraction stopped and the live schema is unchanged; the "+
+			"deployment stays uncontracted until the statement is changed by hand", err)
+	}
+	err := a.m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		before, err := liveViewReads(ctx, tx, a.schema)
+		if err != nil {
+			return err
+		}
+		if err := a.run(ctx, tx); err != nil {
+			return err
+		}
+		if err := checkLiveViews(ctx, tx, a.schema, before); err != nil {
+			return fmt.Errorf("%w; it was rolled back, and the live schema is unchanged. pgroll never "+
+				"drops a live view during contraction: run the statement at Start in a migration of its own", err)
+		}
+		return nil
+	})
+	if !isNonTransactional(err) {
+		return err
+	}
+	return a.runOutsideTransaction(ctx)
+}
+
+func (a *liveSQLAction) run(ctx context.Context, tx *sql.Tx) error {
+	if a.swap {
+		return a.runAroundViews(ctx, tx)
+	}
+	_, err := tx.ExecContext(ctx, a.raw.SQL())
+	return a.conflict(err)
+}
+
+// runOutsideTransaction runs a statement Postgres refuses inside a
+// transaction (CONCURRENTLY, VACUUM, a procedure that commits), then checks
+// the live views. A view it removed cannot be put back by a rollback.
+func (a *liveSQLAction) runOutsideTransaction(ctx context.Context) error {
+	before, err := liveViewReads(ctx, a.m.pgConn, a.schema)
+	if err != nil {
+		return err
+	}
+	if err := a.conflict(a.raw.Execute(ctx)); err != nil {
+		return err
+	}
+	if err := checkLiveViews(ctx, a.m.pgConn, a.schema, before); err != nil {
+		return fmt.Errorf("%w; the statement cannot run in a transaction, so it was not rolled back: "+
+			"restore the view with `pgroll materialize`", err)
+	}
+	return nil
+}
+
+// conflict names the live views err says block the statement.
+func (a *liveSQLAction) conflict(err error) error {
+	views := liveViewsBlocking(err, a.schema)
+	if len(views) == 0 {
+		return err
+	}
+	return fmt.Errorf("onComplete raw SQL conflicts with %s of the live version schema, which apps read; "+
+		"the contraction stopped and the live schema is unchanged. pgroll never drops or rebuilds a live "+
+		"view during contraction: run the statement at Start in a migration of its own, or change it so no "+
+		"live view depends on what it changes: %w", qualifiedViews(a.schema, views), err)
 }
 
 // maxConflictRounds bounds how many times a statement is retried as Postgres
 // names more blocking views (it lists at most 100 dependents per error).
 const maxConflictRounds = 64
 
-// runAroundLiveViews runs stmt, which the live views named in conflict block,
-// in one transaction: drop those views, run it, recreate them from the
-// projection it leaves. Readers of those views wait for the lock instead of
-// erroring, and any failure rolls back to the intact schema. A statement that
-// cannot run inside a transaction fails the contraction instead.
-func (m *Roll) runAroundLiveViews(ctx context.Context, g *liveGuard, completing *migrations.Migration, stmt string, conflict error) error {
-	versionSchema := g.versionSchema(m)
-	m.logger.Info("live views block a contraction statement; running it in a transaction that drops "+
-		"and recreates them", "schema", versionSchema, "error", conflict.Error())
-
-	err := m.pgConn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		var dropped []string
-		seen := map[string]bool{}
-		blocked := conflict
-		for round := 0; ; round++ {
-			var fresh []string
-			for _, view := range liveViewsBlocking(blocked, versionSchema) {
-				if !seen[view] {
-					seen[view] = true
-					fresh = append(fresh, view)
-				}
-			}
-			if len(fresh) == 0 || round == maxConflictRounds {
-				return blocked
-			}
-			for _, view := range fresh {
-				if _, err := tx.ExecContext(ctx, fmt.Sprintf("DROP VIEW IF EXISTS %s.%s",
-					pq.QuoteIdentifier(versionSchema), pq.QuoteIdentifier(view))); err != nil {
-					return err
-				}
-			}
-			dropped = append(dropped, fresh...)
-
-			if _, err := tx.ExecContext(ctx, "SAVEPOINT pgroll_live_views"); err != nil {
-				return err
-			}
-			_, err := tx.ExecContext(ctx, stmt)
-			if err == nil {
-				break
-			}
-			if _, rbErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT pgroll_live_views"); rbErr != nil {
-				return errors.Join(err, rbErr)
-			}
-			if !isLiveViewConflict(err, versionSchema) {
-				return err
-			}
-			blocked = err
-		}
-
-		projection, err := m.liveProjectionTx(ctx, tx, g, completing)
-		if err != nil {
+// runAroundViews runs a raw inverse's statement inside tx, dropping each live
+// view it blocks first, then recreates those whose table the projection still
+// has. The caller's check fails the transaction if one whose table remains is
+// left missing.
+func (a *liveSQLAction) runAroundViews(ctx context.Context, tx *sql.Tx) error {
+	var dropped []string
+	for round := 0; ; round++ {
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT pgroll_live_views"); err != nil {
 			return err
 		}
-		for _, view := range dropped {
-			table := projection.Tables[view]
-			if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") {
-				m.logger.Info("not recreating a live view whose table the statement removed",
-					"schema", versionSchema, "view", view)
-				continue
-			}
-			for _, viewStmt := range m.viewStatements(g.live.VersionSchemaName(), view, table) {
-				if _, err := tx.ExecContext(ctx, viewStmt); err != nil {
-					return err
-				}
+		_, err := tx.ExecContext(ctx, a.raw.SQL())
+		if err == nil {
+			break
+		}
+		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT pgroll_live_views"); rbErr != nil {
+			return errors.Join(err, rbErr)
+		}
+		var fresh []string
+		for _, view := range liveViewsBlocking(err, a.schema) {
+			if !slices.Contains(dropped, view) && !slices.Contains(fresh, view) {
+				fresh = append(fresh, view)
 			}
 		}
-		return nil
-	})
-	if err == nil {
-		g.rawRan = true
+		if len(fresh) == 0 || round == maxConflictRounds {
+			return err
+		}
+		for _, view := range fresh {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf("DROP VIEW %s.%s",
+				pq.QuoteIdentifier(a.schema), pq.QuoteIdentifier(view))); err != nil {
+				return err
+			}
+		}
+		dropped = append(dropped, fresh...)
+	}
+	if len(dropped) == 0 {
 		return nil
 	}
-	if isNonTransactional(err) {
-		return fmt.Errorf("live views in %q block a contraction statement that cannot run inside a "+
-			"transaction, so pgroll cannot run it around them; the live schema is unchanged. Make the "+
-			"statement transactional, or change it so no live view depends on what it changes: %w",
-			versionSchema, err)
+
+	a.m.logger.Info("a raw inverse statement removed what live views read; recreated them in its transaction",
+		"schema", a.schema, "views", strings.Join(dropped, ","))
+	projection, err := a.projection(ctx, tx)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("unable to run a contraction statement around the live views of %q; "+
-		"the live schema is unchanged: %w", versionSchema, err)
+	for _, view := range dropped {
+		table := projection.Tables[view]
+		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") {
+			continue
+		}
+		for _, stmt := range a.m.createViewStatements(a.version, view, table) {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
-// liveProjectionTx is liveProjection read inside tx, so it sees what the
-// transaction has changed. The migration being completed is left out of the
-// replay: its Complete is what is running.
-func (m *Roll) liveProjectionTx(ctx context.Context, tx *sql.Tx, g *liveGuard, completing *migrations.Migration) (*schema.Schema, error) {
+// projection is the schema the live views project once the statement has run
+// in tx: the tables as tx sees them, with every pending Start but the
+// completing migration's replayed over them.
+func (a *liveSQLAction) projection(ctx context.Context, tx *sql.Tx) (*schema.Schema, error) {
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT %s.read_schema($1)",
-		pq.QuoteIdentifier(m.state.Schema())), m.schema).Scan(&raw); err != nil {
+		pq.QuoteIdentifier(a.m.state.Schema())), a.m.schema).Scan(&raw); err != nil {
 		return nil, fmt.Errorf("unable to read schema: %w", err)
 	}
 	var s schema.Schema
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, fmt.Errorf("unable to unmarshal schema: %w", err)
 	}
-	exclude := []string{g.completed}
-	var leaf *migrations.Migration
-	if completing != nil {
-		exclude = append(exclude, completing.Name)
+	return a.m.replayPending(ctx, &s, []string{a.completing.Name}, a.pendingLeaf)
+}
+
+// querier is what the live view checks read the catalog through: the
+// contraction's transaction, or its connection.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// liveViewRead is a live view and the relations it reads.
+type liveViewRead struct {
+	view   string
+	oids   []int64
+	tables []string
+}
+
+// liveViewReads lists each view in versionSchema with the relations it reads.
+func liveViewReads(ctx context.Context, q querier, versionSchema string) ([]liveViewRead, error) {
+	rows, err := q.QueryContext(ctx, `SELECT v.relname,
+			coalesce(array_agg(DISTINCT b.oid::bigint) FILTER (WHERE b.oid IS NOT NULL), '{}'),
+			coalesce(array_agg(DISTINCT format('%I.%I', bn.nspname, b.relname)) FILTER (WHERE b.oid IS NOT NULL), '{}')
+		FROM pg_catalog.pg_class v
+		JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+		LEFT JOIN pg_catalog.pg_rewrite r ON r.ev_class = v.oid
+		LEFT JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_rewrite'::regclass AND d.objid = r.oid
+			AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid <> v.oid
+		LEFT JOIN pg_catalog.pg_class b ON b.oid = d.refobjid
+		LEFT JOIN pg_catalog.pg_namespace bn ON bn.oid = b.relnamespace
+		WHERE vn.nspname = $1 AND v.relkind = 'v'
+		GROUP BY v.relname
+		ORDER BY v.relname`, versionSchema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to list views in %q: %w", versionSchema, err)
 	}
-	if g.pendingLeaf && (completing == nil || completing.Name != g.live.Name) {
-		leaf = g.live
+	defer rows.Close()
+
+	var reads []liveViewRead
+	for rows.Next() {
+		var r liveViewRead
+		if err := rows.Scan(&r.view, pq.Array(&r.oids), pq.Array(&r.tables)); err != nil {
+			return nil, fmt.Errorf("unable to scan view: %w", err)
+		}
+		reads = append(reads, r)
 	}
-	if err := m.reviveForProjection(ctx, &s, exclude, leaf); err != nil {
-		return nil, err
+	return reads, rows.Err()
+}
+
+// checkLiveViews fails when a view of `before` is gone while a relation it
+// read is still there, by OID or by name.
+func checkLiveViews(ctx context.Context, q querier, versionSchema string, before []liveViewRead) error {
+	after, err := liveViewReads(ctx, q, versionSchema)
+	if err != nil {
+		return err
 	}
-	return m.replayPending(ctx, &s, exclude, leaf)
+	for _, r := range before {
+		if slices.ContainsFunc(after, func(a liveViewRead) bool { return a.view == r.view }) {
+			continue
+		}
+		remains, err := anyRelationExists(ctx, q, r)
+		if err != nil {
+			return err
+		}
+		if remains {
+			return fmt.Errorf("onComplete raw SQL dropped %s, which apps read, while the table it reads "+
+				"(%s) remains", qualifiedViews(versionSchema, []string{r.view}), strings.Join(r.tables, ", "))
+		}
+	}
+	return nil
+}
+
+func anyRelationExists(ctx context.Context, q querier, r liveViewRead) (bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE oid::bigint = ANY ($1))
+		OR EXISTS (SELECT 1 FROM unnest($2::text[]) AS t(name) WHERE to_regclass(t.name) IS NOT NULL)`,
+		pq.Array(r.oids), pq.Array(r.tables))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var exists bool
+	if rows.Next() {
+		if err := rows.Scan(&exists); err != nil {
+			return false, err
+		}
+	}
+	return exists, rows.Err()
+}
+
+func qualifiedViews(versionSchema string, views []string) string {
+	names := make([]string, len(views))
+	for i, v := range views {
+		names[i] = "view " + pq.QuoteIdentifier(versionSchema) + "." + pq.QuoteIdentifier(v)
+	}
+	return strings.Join(names, ", ")
 }
 
 // viewInDetail matches `view <schema>.<name>` in a Postgres dependency
@@ -369,10 +405,6 @@ func liveViewsBlocking(err error, versionSchema string) []string {
 	return views
 }
 
-func isLiveViewConflict(err error, versionSchema string) bool {
-	return len(liveViewsBlocking(err, versionSchema)) > 0
-}
-
 func unquoteIdent(ident string) string {
 	if len(ident) >= 2 && strings.HasPrefix(ident, `"`) && strings.HasSuffix(ident, `"`) {
 		return strings.ReplaceAll(ident[1:len(ident)-1], `""`, `"`)
@@ -381,27 +413,21 @@ func unquoteIdent(ident string) string {
 }
 
 // isNonTransactional reports whether err is Postgres refusing a statement
-// because it cannot run inside a transaction: 25001 (CONCURRENTLY, VACUUM),
-// 2D000 (a procedure that COMMITs), 55P04 (using an enum value added in the
-// same transaction).
+// because it cannot run inside a transaction: 25001 (CONCURRENTLY, VACUUM) or
+// 2D000 (a procedure that commits).
 func isNonTransactional(err error) bool {
 	var pqErr *pq.Error
 	if !errors.As(err, &pqErr) {
 		return false
 	}
-	switch pqErr.Code {
-	case "25001", "2D000", "55P04":
-		return true
-	}
-	return false
+	return pqErr.Code == "25001" || pqErr.Code == "2D000"
 }
 
-// RestoreActiveVersionSchema re-projects the active migration's version
-// schema from the tables, creating missing views and rebuilding stale ones,
-// without touching pgroll state or user tables. It is the recovery for a
-// contraction that left the live schema dropped while the migration it
-// belongs to is still in progress. Returns the schema and the number of views
-// created or rebuilt.
+// RestoreActiveVersionSchema creates the views missing from the active
+// migration's version schema, the one apps are pinned to, as its Start
+// projected them: every pending Start, its own last, replayed over the
+// tables. It never drops or rebuilds a view, and creates nothing when the
+// replay fails. Returns the schema and the number of views created.
 func (m *Roll) RestoreActiveVersionSchema(ctx context.Context) (string, int, error) {
 	if m.disableVersionSchemas {
 		return "", 0, fmt.Errorf("version schemas are disabled")
@@ -410,212 +436,70 @@ func (m *Roll) RestoreActiveVersionSchema(ctx context.Context) (string, int, err
 	if err != nil {
 		return "", 0, fmt.Errorf("unable to get active migration: %w", err)
 	}
-	g := &liveGuard{live: active, pendingLeaf: true}
-	n, err := m.restoreLiveViews(ctx, g, true)
-	return g.versionSchema(m), n, err
+	versionSchema := VersionedSchemaName(m.schema, active.VersionSchemaName())
+	projection, err := m.readSchemaReplaying(ctx, "", active)
+	if err != nil {
+		return versionSchema, 0, fmt.Errorf("unable to project %q as the Start of %q did, so nothing was "+
+			"created: %w", versionSchema, active.Name, err)
+	}
+	n, err := m.createMissingViews(ctx, active.VersionSchemaName(), projection)
+	return versionSchema, n, err
 }
 
-// reviveFromSnapshot puts back, in s, what an older pgroll's interrupted
-// duplicator contraction took from the catalog when it dropped an original
-// column before renaming its duplicate: the primary key and the constraints
-// that went with the column, read from pgroll's stored schema snapshot
-// (duplicatorSnapshot), never from the catalog, which no longer has them. With project, the duplicate is also keyed under the
-// column's logical name, so the live views keep exposing the user's column
-// with the duplicate's data. The atomic duplicator tail never leaves this
-// state; this exists for state an older binary left.
-func (m *Roll) reviveFromSnapshot(ctx context.Context, mig *migrations.Migration, s *schema.Schema, project bool) error {
-	scope := migrations.MigrationScopeFor(mig.Name)
-	dropped := droppedConstraints(mig, s)
-	if len(dropped) == 0 && !hasOrphanDuplicate(s, scope) {
+// ReadSchemaWithDeferred is the schema as the latest migration's Start
+// projected it: the tables with every still-deferred Start replayed over
+// them.
+func (m *Roll) ReadSchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
+	return m.readSchemaWithDeferred(ctx)
+}
+
+// createMissingViews creates version's schema if needed and, in it, a view
+// for each table of sc that has none. A view that exists is left as it is.
+// Returns the number of views created.
+func (m *Roll) createMissingViews(ctx context.Context, version string, sc *schema.Schema) (int, error) {
+	if err := validateVersionSchemaName(m.schema, version); err != nil {
+		return 0, err
+	}
+	versionSchema := VersionedSchemaName(m.schema, version)
+	if _, err := m.pgConn.ExecContext(ctx,
+		fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pq.QuoteIdentifier(versionSchema))); err != nil {
+		return 0, fmt.Errorf("unable to create version schema %q: %w", versionSchema, err)
+	}
+	existing, err := liveViewReads(ctx, m.pgConn, versionSchema)
+	if err != nil {
+		return 0, err
+	}
+
+	names := make([]string, 0, len(sc.Tables))
+	for name := range sc.Tables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	created := 0
+	for _, name := range names {
+		table := sc.Tables[name]
+		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") ||
+			slices.ContainsFunc(existing, func(r liveViewRead) bool { return r.view == name }) {
+			continue
+		}
+		if err := runInTransaction(ctx, m.pgConn, m.createViewStatements(version, name, table)); err != nil {
+			return created, fmt.Errorf("unable to create view %s.%s: %w", versionSchema, name, err)
+		}
+		created++
+	}
+	m.logger.Info("created missing version schema views", "schema", versionSchema, "views", created)
+	return created, nil
+}
+
+// runInTransaction runs stmts in one retryable transaction.
+func runInTransaction(ctx context.Context, conn db.DB, stmts []string) error {
+	return conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		for _, stmt := range stmts {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
 		return nil
-	}
-	snapshot, err := m.duplicatorSnapshot(ctx, mig)
-	if err != nil {
-		return err
-	}
-
-	// A constraint-dropping duplicator whose constraint is gone (its tail
-	// committed, or an older pgroll dropped the column it was on) finds the
-	// column it was on from the snapshot.
-	for _, d := range dropped {
-		if before := snapshot.GetTable(d.table); before != nil {
-			reviveConstraint(s.GetTable(d.table), before, d.name)
-		}
-	}
-
-	for tableName, columns := range migrations.DuplicatedColumnsOf(mig, snapshot) {
-		table := s.GetTable(tableName)
-		if table == nil {
-			continue
-		}
-		before := snapshot.GetTable(tableName)
-		if before == nil {
-			before = snapshot.GetTable(table.Name)
-		}
-		for _, column := range columns {
-			if !migrations.ResumesDuplicate(table, scope, column) {
-				continue
-			}
-			m.logger.Info("reviving an interrupted duplicator contraction from the schema snapshot",
-				"migration", mig.Name, "table", tableName, "column", column)
-			if before != nil {
-				reviveConstraints(table, before, column)
-			}
-			if project {
-				revived := *table.GetColumn(migrations.TemporaryName(scope, column))
-				table.AddColumn(column, &revived)
-			}
-		}
-	}
-	return nil
-}
-
-type tableConstraint struct{ table, name string }
-
-// droppedConstraints lists the constraints mig's constraint-dropping
-// duplicators name that s no longer has.
-func droppedConstraints(mig *migrations.Migration, s *schema.Schema) []tableConstraint {
-	var out []tableConstraint
-	for _, op := range mig.Operations {
-		var c tableConstraint
-		switch o := op.(type) {
-		case *migrations.OpDropConstraint:
-			c = tableConstraint{o.Table, o.Name}
-		case *migrations.OpDropMultiColumnConstraint:
-			c = tableConstraint{o.Table, o.Name}
-		default:
-			continue
-		}
-		if t := s.GetTable(c.table); t != nil && !t.ConstraintExists(c.name) {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// reviveConstraint copies the named constraint's metadata from the snapshot
-// table, whatever its kind, with its columns under their logical names.
-func reviveConstraint(table, before *schema.Table, name string) {
-	if c, ok := before.CheckConstraints[name]; ok {
-		if table.CheckConstraints == nil {
-			table.CheckConstraints = map[string]*schema.CheckConstraint{}
-		}
-		revived := *c
-		revived.Columns = logicalColumns(c.Columns)
-		table.CheckConstraints[name] = &revived
-	}
-	if c, ok := before.UniqueConstraints[name]; ok {
-		if table.UniqueConstraints == nil {
-			table.UniqueConstraints = map[string]*schema.UniqueConstraint{}
-		}
-		revived := *c
-		revived.Columns = logicalColumns(c.Columns)
-		table.UniqueConstraints[name] = &revived
-	}
-	if c, ok := before.ForeignKeys[name]; ok {
-		if table.ForeignKeys == nil {
-			table.ForeignKeys = map[string]*schema.ForeignKey{}
-		}
-		revived := *c
-		revived.Columns = logicalColumns(c.Columns)
-		table.ForeignKeys[name] = &revived
-	}
-}
-
-// duplicatorSnapshot is pgroll's stored schema from before mig's contraction:
-// mig's own resulting_schema, recorded when it was marked deferred, right
-// after its Start, with the originals and their constraints still in place;
-// else, for the active leaf whose own is written only at completion, its
-// parent's.
-func (m *Roll) duplicatorSnapshot(ctx context.Context, mig *migrations.Migration) (*schema.Schema, error) {
-	own, err := m.state.SchemaAfterMigration(ctx, m.schema, mig.Name)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read the schema snapshot of %q: %w", mig.Name, err)
-	}
-	if len(own.Tables) > 0 {
-		return own, nil
-	}
-	parent, err := m.state.MigrationParent(ctx, m.schema, mig.Name)
-	if err != nil || parent == nil {
-		return schema.New(), err
-	}
-	before, err := m.state.SchemaAfterMigration(ctx, m.schema, *parent)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read the schema snapshot before %q: %w", mig.Name, err)
-	}
-	return before, nil
-}
-
-// hasOrphanDuplicate reports whether any table holds a duplicate made under
-// scope whose original column is gone, so the snapshot is read only then.
-func hasOrphanDuplicate(s *schema.Schema, scope string) bool {
-	suffix := "_" + scope
-	for _, table := range s.Tables {
-		for name := range table.Columns {
-			if !strings.HasPrefix(name, "_pgroll_new_") || !strings.HasSuffix(name, suffix) {
-				continue
-			}
-			original := strings.TrimSuffix(strings.TrimPrefix(name, "_pgroll_new_"), suffix)
-			if table.GetColumn(original) == nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// reviveConstraints copies, from the snapshot table, the primary key and the
-// constraints on column that table no longer has.
-func reviveConstraints(table, before *schema.Table, column string) {
-	if slices.Contains(logicalColumns(before.PrimaryKey), column) && !slices.Contains(table.PrimaryKey, column) {
-		table.PrimaryKey = logicalColumns(before.PrimaryKey)
-	}
-	for name, c := range before.CheckConstraints {
-		if slices.Contains(logicalColumns(c.Columns), column) && table.CheckConstraints[name] == nil {
-			reviveConstraint(table, before, name)
-		}
-	}
-	for name, c := range before.UniqueConstraints {
-		if slices.Contains(logicalColumns(c.Columns), column) && table.UniqueConstraints[name] == nil {
-			reviveConstraint(table, before, name)
-		}
-	}
-	for name, c := range before.ForeignKeys {
-		if slices.Contains(logicalColumns(c.Columns), column) && table.ForeignKeys[name] == nil {
-			reviveConstraint(table, before, name)
-		}
-	}
-}
-
-// logicalColumns maps column names as a snapshot recorded them to logical
-// ones: a snapshot taken mid-train can hold a constraint on an earlier
-// migration's duplicate, which that migration's contraction has since
-// renamed into place.
-func logicalColumns(columns []string) []string {
-	out := make([]string, len(columns))
-	for i, c := range columns {
-		out[i] = migrations.LogicalColumnName(c)
-	}
-	return out
-}
-
-// reviveForProjection runs reviveFromSnapshot, projecting, for every
-// migration the live projection replays.
-func (m *Roll) reviveForProjection(ctx context.Context, s *schema.Schema, exclude []string, leaf *migrations.Migration) error {
-	pending, err := m.state.DeferredCompletes(ctx, m.schema)
-	if err != nil {
-		return fmt.Errorf("unable to query deferred completes: %w", err)
-	}
-	if leaf != nil {
-		pending = append(pending, leaf)
-	}
-	for _, mig := range pending {
-		if slices.Contains(exclude, mig.Name) {
-			continue
-		}
-		if err := m.reviveFromSnapshot(ctx, mig, s, true); err != nil {
-			return err
-		}
-	}
-	return nil
+	})
 }
