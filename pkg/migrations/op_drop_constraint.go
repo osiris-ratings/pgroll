@@ -4,6 +4,7 @@ package migrations
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/lib/pq"
 
@@ -100,7 +101,24 @@ func (o *OpDropConstraint) Complete(l Logger, conn db.DB, s *schema.Schema) ([]D
 	if table == nil {
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
-	column := table.GetColumn(table.GetConstraintColumns(o.Name)[0])
+	constraintColumns := table.GetConstraintColumns(o.Name)
+	if len(constraintColumns) == 0 {
+		// Resuming a Complete interrupted after it dropped the original
+		// column, and the constraint with it: finish from the duplicate.
+		name, ok := duplicatedColumnName(table, scope)
+		if !ok || !duplicateOnly(table, scope, name) {
+			return nil, fmt.Errorf("constraint %q no longer exists on table %q and the column it was on "+
+				"cannot be identified from its duplicate", o.Name, o.Table)
+		}
+		return []DBAction{
+			NewDropFunctionAction(conn,
+				backfill.TriggerFunctionName(scope, o.Table, name),
+				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, name))),
+			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
+			NewRenameDuplicatedColumnAction(conn, scope, table, name),
+		}, nil
+	}
+	column := table.GetColumn(constraintColumns[0])
 
 	// Target the physical base relation (table.Name); under a deferred in-train
 	// rename it differs from the logical o.Table. Trigger-function identifiers

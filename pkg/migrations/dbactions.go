@@ -22,6 +22,13 @@ type DBAction interface {
 	Execute(context.Context) error
 }
 
+// SQLAction is a DBAction that is a single SQL string, which a caller can run
+// another way, e.g. inside a transaction of its own.
+type SQLAction interface {
+	DBAction
+	SQL() string
+}
+
 type addColumnAction struct {
 	conn                  db.DB
 	id                    string
@@ -1271,6 +1278,8 @@ func NewRawSQLAction(conn db.DB, sql string) *rawSQLAction {
 }
 
 func (a *rawSQLAction) ID() string { return a.id }
+
+func (a *rawSQLAction) SQL() string { return a.sql }
 
 func (a *rawSQLAction) Execute(ctx context.Context) error {
 	_, err := a.conn.ExecContext(ctx, a.sql)

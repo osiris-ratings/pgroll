@@ -323,28 +323,18 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
-// CompleteRequiresLiveSchemaDrop reports whether draining this migration's
-// Complete requires dropping the live version schema first.
+// CompleteRunsRawSQL reports whether this migration's Complete runs
+// onComplete raw SQL.
 //
-// For every *typed* contracting operation it does not: pgroll's expand-phase
-// views never reference the object the Complete touches.
-//   - rename column / table — Postgres auto-follows the rename in dependent
-//     views (references are by attribute number / OID, not name).
-//   - drop column — marked deleted at Start, and ensureView skips deleted
-//     columns, so the live view never projected it.
-//   - alter column / create-or-drop constraint (duplicators) — the live view
-//     projects the temporary column (`_pgroll_new_… AS col`); Complete drops the
-//     original (which the view does not reference) and renames the temp back,
-//     which Postgres auto-follows.
-//   - drop table — ensureViews filters out soft-deleted tables, so the live
-//     view never included it.
-//
-// The one Complete pgroll cannot reason about is onComplete raw SQL: its
-// arbitrary statements may drop or rename anything the live view projects, so a
-// queue containing one forces the conservative whole-schema drop. The expected
-// safety of leaving the live schema in place for typed ops is enforced
-// empirically by the per-op seal tests, not by this comment.
-func (m *Migration) CompleteRequiresLiveSchemaDrop() bool {
+// Contraction keeps the live version schema in place for every Complete:
+// typed contracting operations never touch what the live views reference
+// (renames auto-follow, dropped columns and tables were never projected,
+// duplicators project the temporary column). Raw SQL is the one Complete
+// pgroll cannot reason about, so after it runs the contraction checks the
+// live views against the projection and rebuilds any it dropped or renamed
+// under them, and a statement live views block runs again in one transaction
+// that drops those views and recreates them.
+func (m *Migration) CompleteRunsRawSQL() bool {
 	for _, op := range m.Operations {
 		if raw, ok := op.(*OpRawSQL); ok && raw.OnComplete {
 			return true

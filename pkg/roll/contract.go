@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/lib/pq"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 // FinishContraction contracts whatever the current deployment left pending
@@ -29,13 +29,11 @@ import (
 // they are idempotent by construction (catalog probes guard renames and
 // constraint adds).
 //
-// The leaf's version schema — the projection apps are pinned to — is dropped
-// before the drain only when the queue contains onComplete raw SQL, whose
-// arbitrary statements may drop or rename objects the views project (typed
-// contractions never invalidate the live views: renames auto-follow, dropped
-// columns were never projected, dropped tables are filtered out). It is
-// recreated from the post-drain physical state immediately after.
-func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (int, int64, error) {
+// The leaf's version schema — the projection apps are pinned to — stays in
+// place through the drain, and the contraction keeps it whole whether it
+// succeeds, fails or is cancelled: missing views are put back first and last,
+// and after any onComplete raw SQL (see Complete and liveGuard).
+func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_ int, _ int64, err error) {
 	var o contractOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -46,6 +44,15 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 		return 0, 0, fmt.Errorf("unable to query deferred completes: %w", err)
 	}
 	if len(queued) == 0 {
+		// A leaf that was already contracted (sealed) before this call is live:
+		// if a contraction left its version schema missing (an older binary's
+		// retry could report success without rebuilding it), put it back. An
+		// unsealed leaf without one is an unfinished batch, left alone below.
+		contracted, err := m.contractedLeafGuard(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+
 		// Nothing to drain — close any open window: done rows never stamped
 		// sealed, whether stranded by an older binary's crash between drain
 		// and stamp, or legitimately open (e.g. a train re-opened by a
@@ -54,6 +61,9 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 		stamped, err := m.state.MarkSealed(ctx, m.schema)
 		if err != nil {
 			return 0, 0, err
+		}
+		if _, err := m.restoreLiveViews(ctx, contracted, false); err != nil {
+			return 0, stamped, fmt.Errorf("unable to restore live version schema: %w", err)
 		}
 		// Converge the schemas too: inline-class intermediates skip their
 		// old-schema cleanup ("deferred to the next non-deferred Complete"),
@@ -168,6 +178,23 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 		}
 	}
 
+	// Put back a live schema a part-way contraction left missing (resuming
+	// one an older binary began, which dropped it before the drain), then
+	// whatever a failure or cancel below leaves missing.
+	var guard *liveGuard
+	if !m.disableVersionSchemas {
+		guard = &liveGuard{live: live}
+		if _, err := m.restoreLiveViews(ctx, guard, false); err != nil {
+			return 0, 0, fmt.Errorf("the live version schema %q is incomplete and could not be restored; "+
+				"nothing was contracted: %w", guard.versionSchema(m), err)
+		}
+		defer func() {
+			if err != nil {
+				err = m.restoreAfterFailure(ctx, guard, err)
+			}
+		}()
+	}
+
 	m.logger.Info("contracting deployment: draining deferred completes",
 		"count", len(queued), "live", live.Name)
 
@@ -177,17 +204,6 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 	// contracted row as losslessly revertible.
 	if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 		return 0, 0, err
-	}
-
-	// The one Complete pgroll cannot reason about is onComplete raw SQL,
-	// whose arbitrary statements may drop or rename anything the live views
-	// project — that forces the conservative whole-schema drop below.
-	needsLiveDrop := false
-	for _, dm := range queued {
-		if dm.CompleteRequiresLiveSchemaDrop() {
-			needsLiveDrop = true
-			break
-		}
 	}
 
 	if !m.disableVersionSchemas {
@@ -200,30 +216,10 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 		if err := m.DropVersionSchemasExcept(ctx, live.VersionSchemaName()); err != nil {
 			return 0, 0, fmt.Errorf("unable to drop old version schemas: %w", err)
 		}
-
-		versionSchema := VersionedSchemaName(m.schema, live.VersionSchemaName())
-		if needsLiveDrop {
-			// Reached only for an onComplete raw SQL drain: it cannot be
-			// skipped (the raw SQL could fail on a view's deptype=n
-			// dependency), so a blocked drop must fail the contraction
-			// rather than corrupt it.
-			if _, err := m.pgConn.ExecContext(ctx,
-				fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pq.QuoteIdentifier(versionSchema))); err != nil {
-				if isLockNotAvailable(err) {
-					return 0, 0, fmt.Errorf("unable to drop live version schema %q before contraction "+
-						"(apps still reading it must move off it first); blocked by:%s: %w",
-						versionSchema, m.schemaLockHolders(ctx, versionSchema), err)
-				}
-				return 0, 0, fmt.Errorf("unable to drop live version schema before drain: %w", err)
-			}
-		} else {
-			m.logger.Info("keeping the live version schema in place; the drain's typed contractions "+
-				"do not invalidate its views", "schema", versionSchema)
-		}
 	}
 
 	for _, dm := range queued[:len(queued)-1] {
-		if err := m.drainDeferredMigration(ctx, dm); err != nil {
+		if err := m.drainDeferredMigration(ctx, dm, guard); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -232,7 +228,7 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 	// it only after the live schema and boundary snapshot are restored, so
 	// an interrupted contraction always re-runs with a non-empty queue.
 	last := queued[len(queued)-1]
-	if err := m.applyDeferredComplete(ctx, last); err != nil {
+	if err := m.applyDeferredComplete(ctx, last, guard); err != nil {
 		return 0, 0, err
 	}
 
@@ -240,17 +236,13 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 		return 0, 0, fmt.Errorf("unable to refresh boundary snapshot for %q: %w", live.Name, err)
 	}
 
-	if !m.disableVersionSchemas && needsLiveDrop {
-		// Only rebuild what was dropped. A projection-preserving drain left
-		// the live schema in place, so its views are still valid and
-		// re-running ensureViews would needlessly reacquire the
-		// AccessExclusive locks the drop was skipped to avoid.
-		currentSchema, err := m.state.ReadSchema(ctx, m.schema)
-		if err != nil {
-			return 0, 0, fmt.Errorf("unable to read schema after drain: %w", err)
-		}
-		if err := m.ensureViews(ctx, currentSchema, live); err != nil {
-			return 0, 0, fmt.Errorf("unable to recreate live version schema: %w", err)
+	// Check the live views against what they now project: missing views are
+	// created, and after raw SQL, views whose columns changed are rebuilt.
+	// The last Complete has run, so it is left out of the replay.
+	if guard != nil {
+		guard.completed = last.Name
+		if _, err := m.restoreLiveViews(ctx, guard, guard.rawRan); err != nil {
+			return 0, 0, fmt.Errorf("unable to restore live version schema: %w", err)
 		}
 	}
 
@@ -268,4 +260,32 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (i
 	m.logger.Info("deployment contracted", "drained", len(queued))
 
 	return len(queued), stamped, nil
+}
+
+// contractedLeafGuard returns a guard for the history leaf when it was sealed
+// (contracted) before this call, so its version schema is the live one; nil
+// when there is no such leaf or version schemas are disabled.
+func (m *Roll) contractedLeafGuard(ctx context.Context) (*liveGuard, error) {
+	if m.disableVersionSchemas {
+		return nil, nil
+	}
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine latest migration: %w", err)
+	}
+	if latest == nil {
+		return nil, nil
+	}
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return nil, err
+	}
+	if slices.ContainsFunc(unsealed, func(r *state.MigrationRecord) bool { return r.Name == *latest }) {
+		return nil, nil
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return nil, fmt.Errorf("unable to load latest migration: %w", err)
+	}
+	return &liveGuard{live: leaf}, nil
 }

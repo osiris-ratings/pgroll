@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Contraction never drops the live version schema.** `pgroll complete`
+  used to drop the version schema apps are pinned to before draining any
+  `onComplete` raw SQL, and recreate it only after the whole drain. Apps had
+  no tables for the length of the drain (15 s on staging), and a drain that
+  failed or was interrupted left the schema dropped: a production outage
+  when an operator stopped a contraction waiting on a lock. A retry did not
+  bring it back once the raw SQL had drained. Now:
+  - `onComplete` raw SQL runs with the live views in place. Views never
+    depend on constraints, so `ADD CONSTRAINT … NOT VALID` and `VALIDATE`
+    touch no view.
+  - A raw statement that live views genuinely block (Postgres answers 2BP01
+    or 0A000 and names them) runs again in one transaction that drops just
+    those views, runs it and recreates them. Readers wait on the lock rather
+    than erroring, and any failure rolls back to the intact schema. A
+    statement that cannot run in a transaction (`CONCURRENTLY`, `VACUUM`, a
+    procedure that `COMMIT`s) fails the contraction with the live schema
+    untouched.
+  - Every contraction puts back missing live views when it starts, after
+    any raw SQL, at its end and on every failure. A cancelled context gets
+    a fresh 15 s one, inside a supervisor's 20 s kill.
+- **An interrupted `alter_column` or `drop_constraint` contraction resumes.**
+  Interrupted after dropping the original column, the retry failed
+  (`alter_column`: column does not exist) or panicked (`drop_constraint`).
+  It now finishes from the duplicate.
+
+### Changed
+
+- **`pgroll materialize` restores the active migration's version schema**
+  while a migration is in progress, instead of refusing and suggesting
+  `pgroll rollback`, which would undo the expand under the code reading it.
+
 ## [0.16.2-baselayer.25] - 2026-10-30
 
 ## [0.16.2-baselayer.24] - 2026-10-25

@@ -116,6 +116,24 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 	l.LogOperationComplete(o)
 	scope := s.MigrationScope
 
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+	// Resuming a Complete interrupted after it dropped the original column:
+	// the sub-operations and the sequence-owner move ran before that drop.
+	if duplicateOnly(table, scope, o.Column) {
+		return []DBAction{
+			NewDropFunctionAction(
+				conn,
+				backfill.TriggerFunctionName(scope, o.Table, o.Column),
+				backfill.TriggerFunctionName(scope, o.Table, TemporaryName(scope, o.Column)),
+			),
+			NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
+			NewRenameDuplicatedColumnAction(conn, scope, table, o.Column),
+		}, nil
+	}
+
 	ops := o.subOperations()
 
 	dbActions := make([]DBAction, 0)
@@ -128,10 +146,6 @@ func (o *OpAlterColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBAc
 		dbActions = append(dbActions, actions...)
 	}
 
-	table := s.GetTable(o.Table)
-	if table == nil {
-		return nil, TableDoesNotExistError{Name: o.Table}
-	}
 	column := table.GetColumn(o.Column)
 	if column == nil {
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
