@@ -21,7 +21,7 @@ import (
 )
 
 func migrateCmd() *cobra.Command {
-	var complete, expectOne bool
+	var complete, expectOne, leafUnpinned bool
 	var batchSize int
 	var batchDelay time.Duration
 	var toMigration string
@@ -227,21 +227,11 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
-			// A bounded revert leaves a train open on a leaf the fleet pins.
 			// With --complete nothing is pinned, and the run contracts the
 			// open train along with its own.
-			if !complete {
-				reopened, err := m.ReopenedTrainLeaf(ctx)
-				if err != nil {
-					return fmt.Errorf("unable to check for an open train: %w", err)
-				}
-				if reopened != "" {
-					return fmt.Errorf(
-						"migration %q is the leaf of a train that was applied and never contracted, "+
-							"left open by a bounded `pgroll revert`; a new train cannot start on top of it. "+
-							"Run `pgroll complete` to contract it once the fleet has rolled to it, or "+
-							"`pgroll revert` to undo the rest of it, then re-run `pgroll migrate`", reopened,
-					)
+			if !complete && !leafUnpinned {
+				if err := refuseOnOpenTrain(ctx, m); err != nil {
+					return err
 				}
 			}
 
@@ -385,6 +375,7 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, leafUnpinnedUsage)
 	migrateCmd.Flags().StringVar(&toMigration, "to", "", "apply migrations only up to (and including) this one; already applied is a no-op")
 
 	return migrateCmd
@@ -807,4 +798,29 @@ func interruptedMessage(ctx context.Context, m *roll.Roll, active string) string
 			base,
 		)
 	}
+}
+
+const leafUnpinnedUsage = "start on top of an applied, uncontracted train whose leaf has a version schema; " +
+	"only when no workload is pinned to that schema"
+
+// refuseOnOpenTrain refuses to start a migration on top of a train that is
+// applied and not contracted while its leaf's version schema exists. A fleet
+// on that schema is a third revision beside the previous deployment's and
+// the new train's, and the open train's triggers tell only two apart.
+func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
+	leaf, err := m.ReopenedTrainLeaf(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to check for an open train: %w", err)
+	}
+	if leaf == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot start on top of an open train: migration %[1]q is applied and not contracted, nothing "+
+			"is in progress, and its version schema %[2]q exists. If the fleet runs on that schema (a "+
+			"bounded `pgroll revert` leaves this), run `pgroll complete` to contract the train first, or "+
+			"`pgroll revert` to undo it. If no workload is pinned to that schema (`pgroll materialize` "+
+			"after an interrupted `pgroll migrate` leaves this), re-run with --leaf-unpinned",
+		leaf, roll.VersionedSchemaName(m.Schema(), leaf),
+	)
 }

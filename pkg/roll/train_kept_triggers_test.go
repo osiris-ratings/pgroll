@@ -193,3 +193,72 @@ func TestTrainAddColumnUpOnPreviousRevisionUpdates(t *testing.T) {
 		})
 	}
 }
+
+// An expand-only sealed revert is a train too: while the fleet repins from
+// the current schema to the restored one, both revisions keep writing.
+func TestExpandOnlySealedRevertServesBothRevisions(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		require.NoError(t, mig.Start(ctx, baseMigration(
+			`CREATE TABLE u (id integer PRIMARY KEY, v integer, email text);
+			 INSERT INTO u VALUES (1, 5, 'a@example.com')`,
+		), backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		applyExpandOnlyTrain(t, mig, []*migrations.Migration{
+			laterIndexNamed("01_index", "u", "id"),
+			{
+				Name: "02_check_v",
+				Operations: migrations.Operations{
+					&migrations.OpAlterColumn{
+						Table: "u", Column: "v",
+						Check: &migrations.CheckConstraint{Name: "v_pos", Constraint: "v > 0"},
+						Up:    "CASE WHEN v > 0 THEN v ELSE 1 END", Down: "v",
+					},
+				},
+			},
+			{
+				Name: "03_drop_email",
+				Operations: migrations.Operations{
+					&migrations.OpDropColumn{Table: "u", Column: "email", Down: "'x@example.com'"},
+				},
+			},
+		})
+		require.NoError(t, mig.Complete(ctx))
+
+		plan, err := mig.RevertSealed(ctx, "00_base", nil, roll.WithExpandOnly())
+		require.NoError(t, err)
+		require.NotNil(t, plan)
+
+		const current, restored = "public_03_drop_email", "public_00_base"
+
+		require.NoError(t, execAs(t, db, current, `INSERT INTO u (id, v) VALUES (2, 7)`))
+		var email sql.NullString
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT email FROM public_00_base.u WHERE id = 2`).Scan(&email))
+		require.Equal(t, "x@example.com", email.String,
+			"the restored revision reads a row the current one wrote")
+		require.Error(t, execAs(t, db, current, `INSERT INTO u (id, v) VALUES (3, -1)`),
+			"the current revision is still held to its CHECK")
+
+		require.NoError(t, execAs(t, db, restored, `INSERT INTO u (id, v, email) VALUES (4, -1, 'b@example.com')`))
+		require.Equal(t, -1, *intPtr(db, t, `SELECT v FROM public_00_base.u WHERE id = 4`),
+			"the restored revision keeps what it wrote")
+		require.Equal(t, 1, *intPtr(db, t, `SELECT v FROM public_03_drop_email.u WHERE id = 4`),
+			"the current revision reads it through the CHECK's up")
+
+		require.NoError(t, mig.Complete(ctx))
+		finished, err := mig.FinishPendingSealedRevert(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, finished)
+		require.Zero(t, pgrollLeftovers(t, db))
+		require.Equal(t, -1, *intPtr(db, t, `SELECT v FROM public.u WHERE id = 4`))
+	})
+}
+
+func laterIndexNamed(name, table, column string) *migrations.Migration {
+	m := laterIndex(table, column)
+	m.Name = name
+	return m
+}

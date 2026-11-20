@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xataio/pgroll/internal/testutils"
+	"github.com/xataio/pgroll/pkg/backfill"
+	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
 )
 
@@ -177,5 +179,62 @@ func TestMigrateRefusesANewTrainOnAReopenedOne(t *testing.T) {
 			complete.SetArgs(nil)
 			require.NoError(t, complete.ExecuteContext(ctx))
 			require.NoError(t, migrate())
+		})
+}
+
+// Materializing the leaf of a train that stopped part-way leaves the same
+// state as a bounded revert. Both commands refuse it; saying that nothing
+// is pinned to the materialized schema resumes the train.
+// Not parallel: the command reads its connection from process-wide flags.
+func TestAnOpenTrainWithAMaterializedLeafNeedsLeafUnpinned(t *testing.T) {
+	testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+		func(m *roll.Roll, connStr string, _ *sql.DB) {
+			ctx := context.Background()
+			viper.Set("PG_URL", connStr)
+			viper.Set("SCHEMA", "public")
+			viper.Set("STATE_SCHEMA", "pgroll")
+			viper.Set("LOCK_TIMEOUT", 500)
+			viper.Set("USE_VERSION_SCHEMA", true)
+			t.Cleanup(viper.Reset)
+
+			dir := t.TempDir()
+			write := func(name, up, down string) string {
+				path := filepath.Join(dir, name+".yaml")
+				body := "operations:\n  - sql:\n      up: " + up + "\n      down: " + down + "\n"
+				require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+				return path
+			}
+			migrate := func(args ...string) error {
+				c := migrateCmd()
+				c.SetArgs(append([]string{dir}, args...))
+				c.SilenceUsage, c.SilenceErrors = true, true
+				return c.ExecuteContext(ctx)
+			}
+
+			write("00_base", "CREATE TABLE u (id integer PRIMARY KEY)", "DROP TABLE u")
+			require.NoError(t, migrate("--complete"))
+
+			write("01_one", "COMMENT ON TABLE u IS 'one'", "COMMENT ON TABLE u IS NULL")
+			two := write("02_two", "COMMENT ON TABLE u IS 'two'", "COMMENT ON TABLE u IS 'one'")
+
+			// The train stops after its first migration.
+			one, err := migrations.ReadMigration(os.DirFS(dir), "01_one.yaml")
+			require.NoError(t, err)
+			require.NoError(t, m.Start(ctx, one, backfill.NewConfig(), roll.WithoutVersionSchema()))
+			require.NoError(t, m.Complete(ctx, roll.WithSkipSchemaDrop()))
+
+			// Its leaf is then materialized.
+			sc, err := m.State().ReadSchema(ctx, m.Schema())
+			require.NoError(t, err)
+			require.NoError(t, m.Materialize(ctx, "01_one", sc))
+
+			require.ErrorContains(t, migrate(), "--leaf-unpinned")
+
+			start := startCmd()
+			start.SetArgs([]string{two})
+			start.SilenceUsage, start.SilenceErrors = true, true
+			require.ErrorContains(t, start.ExecuteContext(ctx), "--leaf-unpinned")
+
+			require.NoError(t, migrate("--leaf-unpinned"))
 		})
 }

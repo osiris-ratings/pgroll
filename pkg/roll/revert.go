@@ -442,11 +442,13 @@ func (m *Roll) rollbackCompletedOperations(ctx context.Context, migration *migra
 	return nil
 }
 
-// ReopenedTrainLeaf returns the name of the history leaf when a bounded
-// revert left a train open on it: migrations applied and not yet contracted,
-// nothing active, and the leaf's version schema live for the fleet to pin.
-// It returns "" otherwise, including for a train that stopped part-way,
-// whose leaf has no version schema.
+// ReopenedTrainLeaf returns the name of the history leaf when a train is
+// open on it with a version schema a fleet can pin: migrations applied and
+// not yet contracted, and the leaf's version schema present. A bounded
+// revert leaves that, and so does materializing the leaf of a train that
+// stopped part-way. It returns "" otherwise, including for a train that
+// stopped part-way and was left alone, whose leaf has no version schema.
+// Callers ask only when nothing is in progress.
 //
 // A new train started in that state would give the open one's triggers a
 // third revision to tell apart, which they cannot do.
