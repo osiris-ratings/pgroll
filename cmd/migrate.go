@@ -227,6 +227,24 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
+			// A bounded revert leaves a train open on a leaf the fleet pins.
+			// With --complete nothing is pinned, and the run contracts the
+			// open train along with its own.
+			if !complete {
+				reopened, err := m.ReopenedTrainLeaf(ctx)
+				if err != nil {
+					return fmt.Errorf("unable to check for an open train: %w", err)
+				}
+				if reopened != "" {
+					return fmt.Errorf(
+						"migration %q is the leaf of a train that was applied and never contracted, "+
+							"left open by a bounded `pgroll revert`; a new train cannot start on top of it. "+
+							"Run `pgroll complete` to contract it once the fleet has rolled to it, or "+
+							"`pgroll revert` to undo the rest of it, then re-run `pgroll migrate`", reopened,
+					)
+				}
+			}
+
 			// In 'expect one' mode, abort if there is more than one unapplied migration
 			if expectOne && len(rawMigs) > 1 {
 				return fmt.Errorf("expected one migration to apply but found %d", len(rawMigs))

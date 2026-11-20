@@ -253,6 +253,10 @@ func TestTrainResumedWithADifferentLastMigration(t *testing.T) {
 				}, backfill.NewConfig(), roll.WithoutVersionSchema(), abandoned))
 				require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
 
+				reopened, err := mig.ReopenedTrainLeaf(ctx)
+				require.NoError(t, err)
+				require.Empty(t, reopened, "a train that stopped part-way may resume")
+
 				applyExpandOnlyTrain(t, mig, rest)
 
 				const resumed = "public_10_resumed"
@@ -301,6 +305,10 @@ func TestTrainBoundedRevertRekeysTheRemainingTriggers(t *testing.T) {
 
 		_, err := mig.Revert(ctx, roll.WithRevertTo("02_comment"))
 		require.NoError(t, err)
+
+		reopened, err := mig.ReopenedTrainLeaf(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "02_comment", reopened)
 
 		const leaf = "public_02_comment"
 		require.Error(t, execAs(t, db, leaf, `INSERT INTO u (id, v) VALUES (10, -1)`),

@@ -132,3 +132,50 @@ operations:
 				        WHERE table_schema = 'public' AND column_name LIKE '\_pgroll\_%')`))
 		})
 }
+
+// After a bounded revert the fleet pins the leaf it left; a new train is
+// refused until that one is contracted.
+// Not parallel: the command reads its connection from process-wide flags.
+func TestMigrateRefusesANewTrainOnAReopenedOne(t *testing.T) {
+	testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+		func(m *roll.Roll, connStr string, _ *sql.DB) {
+			ctx := context.Background()
+			viper.Set("PG_URL", connStr)
+			viper.Set("SCHEMA", "public")
+			viper.Set("STATE_SCHEMA", "pgroll")
+			viper.Set("LOCK_TIMEOUT", 500)
+			viper.Set("USE_VERSION_SCHEMA", true)
+			t.Cleanup(viper.Reset)
+
+			dir := t.TempDir()
+			write := func(name, up, down string) {
+				body := "operations:\n  - sql:\n      up: " + up + "\n      down: " + down + "\n"
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name+".yaml"), []byte(body), 0o600))
+			}
+			migrate := func(args ...string) error {
+				c := migrateCmd()
+				c.SetArgs(append([]string{dir}, args...))
+				c.SilenceUsage, c.SilenceErrors = true, true
+				return c.ExecuteContext(ctx)
+			}
+
+			write("00_base", "CREATE TABLE u (id integer PRIMARY KEY)", "DROP TABLE u")
+			require.NoError(t, migrate("--complete"))
+
+			write("01_one", "COMMENT ON TABLE u IS 'one'", "COMMENT ON TABLE u IS NULL")
+			write("02_two", "COMMENT ON TABLE u IS 'two'", "COMMENT ON TABLE u IS 'one'")
+			require.NoError(t, migrate())
+
+			_, err := m.Revert(ctx, roll.WithRevertTo("01_one"))
+			require.NoError(t, err)
+
+			require.NoError(t, os.Remove(filepath.Join(dir, "02_two.yaml")))
+			write("03_three", "COMMENT ON TABLE u IS 'three'", "COMMENT ON TABLE u IS 'one'")
+			require.ErrorContains(t, migrate(), "pgroll complete")
+
+			complete := completeCmd()
+			complete.SetArgs(nil)
+			require.NoError(t, complete.ExecuteContext(ctx))
+			require.NoError(t, migrate())
+		})
+}

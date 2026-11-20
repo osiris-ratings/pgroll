@@ -441,3 +441,40 @@ func (m *Roll) rollbackCompletedOperations(ctx context.Context, migration *migra
 	}
 	return nil
 }
+
+// ReopenedTrainLeaf returns the name of the history leaf when a bounded
+// revert left a train open on it: migrations applied and not yet contracted,
+// nothing active, and the leaf's version schema live for the fleet to pin.
+// It returns "" otherwise, including for a train that stopped part-way,
+// whose leaf has no version schema.
+//
+// A new train started in that state would give the open one's triggers a
+// third revision to tell apart, which they cannot do.
+func (m *Roll) ReopenedTrainLeaf(ctx context.Context) (string, error) {
+	if m.disableVersionSchemas {
+		return "", nil
+	}
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return "", err
+	}
+	if !slices.ContainsFunc(unsealed, func(r *state.MigrationRecord) bool { return r.Done }) {
+		return "", nil
+	}
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil || latest == nil {
+		return "", err
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return "", err
+	}
+	existing, err := m.ExistingVersionSchemas(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !slices.Contains(existing, VersionedSchemaName(m.schema, leaf.VersionSchemaName())) {
+		return "", nil
+	}
+	return leaf.Name, nil
+}
