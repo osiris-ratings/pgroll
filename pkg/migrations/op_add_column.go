@@ -155,8 +155,9 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 
 	dbActions := append(
 		[]DBAction{NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name)},
-		o.RetireTriggers(conn, s)...,
+		o.RetireTriggers(conn, scope)...,
 	)
+	dbActions = append(dbActions, NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)))
 
 	return o.settleActions(conn, table, scope, dbActions), nil
 }
@@ -176,48 +177,63 @@ func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Sc
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
+	// The migration's other operations rename or drop their own temporary
+	// columns around this one, so the function names none of them until
+	// RebuildKeptTriggers.
 	temporary := TemporaryName(scope, o.Column.Name)
 	columns := make(map[string]*schema.Column, len(table.Columns))
 	for name, column := range table.Columns {
-		if column.Name == temporary {
+		switch {
+		case column.Name == temporary:
 			renamed := *column
 			renamed.Name = o.Column.Name
 			columns[o.Column.Name] = &renamed
-			continue
+		case !strings.HasPrefix(column.Name, "_pgroll_"):
+			columns[name] = column
 		}
-		columns[name] = column
 	}
 
 	dbActions := []DBAction{
-		&retargetTriggerAction{
-			conn:       conn,
-			schemaName: s.Name,
-			scope:      scope,
-			from:       temporary,
-			trigger: backfill.OperationTrigger{
-				Name:           backfill.TriggerName(scope, o.Table, o.Column.Name),
-				Direction:      backfill.TriggerDirectionUp,
-				Columns:        columns,
-				TableName:      table.Name,
-				PhysicalColumn: o.Column.Name,
-				SQL:            o.Up,
-			},
-		},
+		o.keptTrigger(conn, s, table.Name, columns, temporary),
+		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 
 	return o.settleActions(conn, table, scope, dbActions), nil
 }
 
-// RetireTriggers drops the column's trigger function and the backfill marker.
-func (o *OpAddColumn) RetireTriggers(conn db.DB, s *schema.Schema) []DBAction {
+// RebuildKeptTriggers rebuilds the kept trigger so its `up` can name every
+// column the table ends the migration with.
+func (o *OpAddColumn) RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction {
 	table := s.GetTable(o.Table)
-	if table == nil {
+	if o.Up == "" || table == nil {
 		return nil
 	}
-	scope := s.MigrationScope
+	return []DBAction{o.keptTrigger(conn, s, table.Name, table.Columns, "")}
+}
+
+func (o *OpAddColumn) keptTrigger(conn db.DB, s *schema.Schema, tableName string, columns map[string]*schema.Column, from string) DBAction {
+	return &retargetTriggerAction{
+		conn:       conn,
+		schemaName: s.Name,
+		scope:      s.MigrationScope,
+		from:       from,
+		trigger: backfill.OperationTrigger{
+			Name:           backfill.TriggerName(s.MigrationScope, o.Table, o.Column.Name),
+			Direction:      backfill.TriggerDirectionUp,
+			Columns:        columns,
+			TableName:      tableName,
+			PhysicalColumn: o.Column.Name,
+			SQL:            o.Up,
+		},
+	}
+}
+
+// RetireTriggers drops the column's trigger function, and its trigger with
+// it. The function is named for the table as Start saw it, so a rename or
+// drop of the table later in the train does not hide it.
+func (o *OpAddColumn) RetireTriggers(conn db.DB, scope string) []DBAction {
 	return []DBAction{
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
-		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 }
 

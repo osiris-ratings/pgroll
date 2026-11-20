@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"text/template"
 
 	"github.com/lib/pq"
@@ -112,6 +113,9 @@ func executeTemplate(name, content string, cfg triggerConfig) (string, error) {
 		Funcs(template.FuncMap{
 			"ql": pq.QuoteLiteral,
 			"qi": pq.QuoteIdentifier,
+			// pgroll's own columns come and go under a live function, and no
+			// `up` or `down` expression names one.
+			"internal": func(name string) bool { return strings.HasPrefix(name, "_pgroll_") },
 		}).
 		Parse(content))
 
@@ -152,7 +156,8 @@ const TrainTargetFunction = "_pgroll_train_target"
 // functionName. Postgres fires a table's triggers in name order, so `up`
 // triggers sort by ascending position and `down` triggers by descending:
 // a write crosses a train's migrations in the order its revision needs.
-func OrderedTriggerName(direction TriggerDirection, position int, functionName string) string {
+// index orders the triggers of one migration among themselves.
+func OrderedTriggerName(direction TriggerDirection, position, index int, functionName string) string {
 	const last = 9999
 	position = min(max(position, 0), last)
 	key := fmt.Sprintf("a%04d", position)
@@ -160,26 +165,26 @@ func OrderedTriggerName(direction TriggerDirection, position int, functionName s
 		key = fmt.Sprintf("z%04d", last-position)
 	}
 	sum := sha256.Sum256([]byte(functionName))
-	return "_pgroll_trigger_" + key + "_" + hex.EncodeToString(sum[:8])
+	return fmt.Sprintf("_pgroll_trigger_%s_%03d_%s", key, min(max(index, 0), 999), hex.EncodeToString(sum[:8]))
 }
 
 // RetargetTrigger renames the column a trigger fills and rebuilds the trigger
 // function to write it under its new name, in one transaction, so no write
 // sees the function and the column disagree. trigger.PhysicalColumn is the
 // new name. A re-run after the rename has landed only rebuilds the function.
-// The rebuilt function follows the train's target.
+// The rebuilt function follows the train's target and leaves the backfill
+// marker alone: the backfill is over by the time a trigger is kept.
 func RetargetTrigger(ctx context.Context, conn db.DB, schemaName, scope string, trigger OperationTrigger, from string) error {
 	cfg := triggerConfig{
-		Name:                trigger.Name,
-		Direction:           trigger.Direction,
-		Columns:             trigger.Columns,
-		SchemaName:          schemaName,
-		TableName:           trigger.TableName,
-		PhysicalColumn:      trigger.PhysicalColumn,
-		TargetFunction:      TrainTargetFunction,
-		SQL:                 []string{trigger.SQL},
-		NeedsBackfillColumn: NeedsBackfillColumnName(scope),
-		MigrationScope:      scope,
+		Name:           trigger.Name,
+		Direction:      trigger.Direction,
+		Columns:        trigger.Columns,
+		SchemaName:     schemaName,
+		TableName:      trigger.TableName,
+		PhysicalColumn: trigger.PhysicalColumn,
+		TargetFunction: TrainTargetFunction,
+		SQL:            []string{trigger.SQL},
+		MigrationScope: scope,
 	}
 	if sql := cfg.SQL[0]; len(sql) > 0 && sql[0] != '(' {
 		cfg.SQL[0] = "(" + sql + ")"

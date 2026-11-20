@@ -658,9 +658,21 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		}
 	}
 
+	if o.trainTarget != nil {
+		if err := m.setTrainTarget(ctx, VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())); err != nil {
+			return err
+		}
+	}
+
 	coordinator := migrations.NewCoordinator(actions)
 	if err := coordinator.ExecuteWithRecovery(ctx, m.viewConflictRecovery(guard, migration)); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
+	}
+
+	if o.trainTarget != nil {
+		if err := m.rebuildKeptTriggers(ctx, migration); err != nil {
+			return err
+		}
 	}
 
 	// Check the live views against the schema they now project, before the
@@ -757,26 +769,45 @@ func (m *Roll) retireKeptTriggers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var sch *schema.Schema
 	for _, record := range unsealed {
 		if !record.Done || record.CompleteDeferred {
 			continue
 		}
+		scope := migrations.MigrationScopeFor(record.Migration.Name)
 		for _, op := range record.Migration.Operations {
 			keeper, ok := op.(migrations.TrainTriggerKeeper)
 			if !ok {
 				continue
 			}
-			if sch == nil {
-				if sch, err = m.readSchemaWithDeferred(ctx); err != nil {
-					return fmt.Errorf("unable to read schema: %w", err)
-				}
-			}
-			sch.MigrationScope = migrations.MigrationScopeFor(record.Migration.Name)
-			if err := migrations.NewCoordinator(keeper.RetireTriggers(m.pgConn, sch)).Execute(ctx); err != nil {
+			if err := migrations.NewCoordinator(keeper.RetireTriggers(m.pgConn, scope)).Execute(ctx); err != nil {
 				return fmt.Errorf("unable to retire the triggers of %q: %w", record.Migration.Name, err)
 			}
 		}
+	}
+	return nil
+}
+
+// rebuildKeptTriggers rebuilds the triggers migration kept, now that all of
+// its operations have completed and its columns carry their final names.
+func (m *Roll) rebuildKeptTriggers(ctx context.Context, migration *migrations.Migration) error {
+	var actions []migrations.DBAction
+	var sch *schema.Schema
+	for _, op := range migration.Operations {
+		keeper, ok := op.(migrations.TrainTriggerKeeper)
+		if !ok {
+			continue
+		}
+		if sch == nil {
+			var err error
+			if sch, err = m.readSchemaWithDeferredExcluding(ctx, migration.Name); err != nil {
+				return fmt.Errorf("unable to read schema: %w", err)
+			}
+			sch.MigrationScope = migrations.MigrationScopeFor(migration.Name)
+		}
+		actions = append(actions, keeper.RebuildKeptTriggers(m.pgConn, sch)...)
+	}
+	if err := migrations.NewCoordinator(actions).Execute(ctx); err != nil {
+		return fmt.Errorf("unable to rebuild the triggers %q keeps: %w", migration.Name, err)
 	}
 	return nil
 }

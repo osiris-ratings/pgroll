@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -115,7 +117,6 @@ func (j *Job) AddTask(t *Task) {
 			// No need to rewrite the SQL here, as it is the first time we are adding it.
 			j.triggers[trigger.Name] = triggerConfig{
 				Name:                trigger.Name,
-				TriggerName:         OrderedTriggerName(trigger.Direction, j.Position, trigger.Name),
 				Direction:           trigger.Direction,
 				Columns:             trigger.Columns,
 				SchemaName:          j.schemaName,
@@ -167,7 +168,11 @@ func New(conn db.DB, c *Config, scope string) *Backfill {
 
 // CreateTriggers creates the triggers for the tables before starting the backfill.
 func (bf *Backfill) CreateTriggers(ctx context.Context, j *Job) error {
-	for _, trigger := range j.triggers {
+	// In function-name order, which is the order one migration's triggers
+	// fire in.
+	for index, name := range slices.Sorted(maps.Keys(j.triggers)) {
+		trigger := j.triggers[name]
+		trigger.TriggerName = OrderedTriggerName(trigger.Direction, j.Position, index, trigger.Name)
 		a := &createTriggerAction{
 			conn: bf.conn,
 			cfg:  trigger,

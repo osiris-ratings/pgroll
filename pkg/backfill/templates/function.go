@@ -9,9 +9,9 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
     DECLARE
       {{- $schemaName := .SchemaName  }}
       {{- $tableName := .TableName  }}
-      {{ range $name, $col := .Columns }} 
+      {{ range $name, $col := .Columns }}{{ if not (internal $name) }} 
       {{- $name | qi }} {{ $schemaName | qi }}.{{ $tableName | qi}}.{{ $col.Name | qi }}%TYPE := NEW.{{ $col.Name | qi }};
-      {{ end -}}
+      {{ end }}{{ end -}}
       latest_schema text;
       search_path text;
     BEGIN
@@ -23,7 +23,9 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
       {{- $physicalColumn := .PhysicalColumn | qi  }}{{ range $s := .SQL }}
         NEW.{{ $physicalColumn  }} = {{ $s }};
       {{- end }}
+      {{- if .NeedsBackfillColumn }}
         NEW.{{ .NeedsBackfillColumn | qi }} = false;
+      {{- end }}
       END IF;
 
       RETURN NEW;

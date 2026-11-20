@@ -202,13 +202,17 @@ func (m *RawMigration) SelectedBy(t string) bool {
 // need until the train contracts.
 type TrainTriggerKeeper interface {
 	// CompleteKeepingTriggers returns the Complete actions with the trigger
-	// kept, telling the revisions apart by targetSchema, the version schema
-	// of the train's last migration.
+	// kept.
 	CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
 
+	// RebuildKeptTriggers returns the actions that rebuild the kept triggers
+	// against s, read once every operation of the migration has completed.
+	RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction
+
 	// RetireTriggers returns the actions that remove what
-	// CompleteKeepingTriggers kept. They are safe to run when nothing was kept.
-	RetireTriggers(conn db.DB, s *schema.Schema) []DBAction
+	// CompleteKeepingTriggers kept for the migration with this scope. They
+	// are safe to run when nothing was kept.
+	RetireTriggers(conn db.DB, scope string) []DBAction
 }
 
 // VersionSchemaName returns the version schema name for the migration.
