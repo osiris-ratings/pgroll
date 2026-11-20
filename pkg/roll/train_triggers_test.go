@@ -270,3 +270,48 @@ func TestTrainResumedWithADifferentLastMigration(t *testing.T) {
 		})
 	}
 }
+
+// A revert bounded at an earlier migration of the train makes that migration
+// the leaf the revisions pin; the triggers left behind follow it.
+func TestTrainBoundedRevertRekeysTheRemainingTriggers(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		require.NoError(t, mig.Start(ctx, baseMigration(
+			`CREATE TABLE u (id integer PRIMARY KEY, v integer);
+			 INSERT INTO u VALUES (1, 5)`,
+		), backfill.NewConfig()))
+		require.NoError(t, mig.Complete(ctx))
+
+		applyExpandOnlyTrain(t, mig, []*migrations.Migration{
+			{
+				Name: "01_check_v",
+				Operations: migrations.Operations{
+					&migrations.OpAlterColumn{
+						Table: "u", Column: "v",
+						Check: &migrations.CheckConstraint{Name: "v_pos", Constraint: "v > 0"},
+						Up:    "CASE WHEN v > 0 THEN v ELSE 1 END", Down: "v",
+					},
+				},
+			},
+			rawSQL("02_comment", `COMMENT ON TABLE u IS 'kept'`, `COMMENT ON TABLE u IS NULL`),
+			laterIndex("u", "id"),
+		})
+
+		_, err := mig.Revert(ctx, roll.WithRevertTo("02_comment"))
+		require.NoError(t, err)
+
+		const leaf = "public_02_comment"
+		require.Error(t, execAs(t, db, leaf, `INSERT INTO u (id, v) VALUES (10, -1)`),
+			"the new revision's write must meet the new CHECK")
+		require.NoError(t, execAs(t, db, leaf, `INSERT INTO u (id, v) VALUES (11, 7)`))
+		require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO u (id, v) VALUES (12, -3)`))
+		require.Equal(t, 7, *intPtr(db, t, `SELECT v FROM public_00_base.u WHERE id = 11`))
+
+		_, err = mig.Revert(ctx)
+		require.NoError(t, err)
+		require.Zero(t, pgrollLeftovers(t, db))
+		require.Equal(t, -3, *intPtr(db, t, `SELECT v FROM public.u WHERE id = 12`))
+	})
+}
