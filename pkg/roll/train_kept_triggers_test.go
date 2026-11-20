@@ -154,3 +154,42 @@ func TestTrainRefusedContractionKeepsTheTriggers(t *testing.T) {
 		require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 2`))
 	})
 }
+
+// `up` runs on every write of the previous revision until the train
+// contracts, wherever its add_column sits in the train. An `up` that does
+// not read the row overwrites what the new revision stored; one that reads
+// its own column keeps it.
+func TestTrainAddColumnUpOnPreviousRevisionUpdates(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		up        string
+		afterward int
+	}{
+		"a constant up overwrites the new revision's value": {up: "7", afterward: 7},
+		"an up that reads its own column keeps it":          {up: "COALESCE(a, 7)", afterward: 99},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for position, train := range map[string][]*migrations.Migration{
+				"mid-train":     {addColumn("01_add_a", "a", tc.up), laterIndex("w", "x")},
+				"last of train": {addColumn("09_later", "a", tc.up)},
+			} {
+				t.Run(position, func(t *testing.T) {
+					t.Parallel()
+					testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+						baseW(t, mig)
+						applyExpandOnlyTrain(t, mig, train)
+
+						require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO w (id, x) VALUES (2, 20)`))
+						require.Equal(t, 7, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 2`))
+
+						require.NoError(t, execAs(t, db, targetSchema, `INSERT INTO w (id, x, a) VALUES (3, 30, 99)`))
+						require.NoError(t, execAs(t, db, previousSchema, `UPDATE w SET x = 31 WHERE id = 3`))
+						require.Equal(t, tc.afterward, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 3`))
+					})
+				})
+			}
+		})
+	}
+}
