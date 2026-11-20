@@ -129,10 +129,28 @@ func TestTrainThreeAddColumnsAllBackfilled(t *testing.T) {
 	})
 }
 
-// A native nullability relax and the drop of the same column in one train.
+// A native nullability relax and the drop of the same column in one train:
+// the drop's NULL reaches the original column through the relax's `down`,
+// so the new revision's write lands only when that `down` yields a value.
 func TestTrainNativeRelaxThenDrop(t *testing.T) {
-	t.Skip("known gap: the relax's NOT NULL removal waits for the train's contraction")
 	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		relaxDown string
+		accepted  bool
+	}{
+		"the relax's down fills the column":    {relaxDown: "COALESCE(gone, 0)", accepted: true},
+		"the relax's down passes NULL through": {relaxDown: "gone", accepted: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testTrainNativeRelaxThenDrop(t, tc.relaxDown, tc.accepted)
+		})
+	}
+}
+
+func testTrainNativeRelaxThenDrop(t *testing.T, relaxDown string, accepted bool) {
+	t.Helper()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
 		ctx := context.Background()
@@ -149,7 +167,7 @@ func TestTrainNativeRelaxThenDrop(t *testing.T) {
 				Operations: migrations.Operations{
 					&migrations.OpAlterColumn{
 						Table: "u", Column: "gone", Nullable: &nullable,
-						Up: "gone", Down: "COALESCE(gone, 0)",
+						Up: "gone", Down: relaxDown,
 					},
 				},
 			},
@@ -161,16 +179,22 @@ func TestTrainNativeRelaxThenDrop(t *testing.T) {
 			},
 		})
 
-		require.NoError(t, execAs(t, db, targetSchema, `INSERT INTO u (id) VALUES (2)`))
+		err := execAs(t, db, targetSchema, `INSERT INTO u (id) VALUES (2)`)
+		if !accepted {
+			require.ErrorContains(t, err, "not-null")
+			return
+		}
+		require.NoError(t, err)
+		require.Equal(t, 0, *intPtr(db, t, `SELECT gone FROM public_00_base.u WHERE id = 2`))
 		require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO u (id, gone) VALUES (3, 3)`))
 		require.NoError(t, mig.Complete(ctx))
 		require.Equal(t, 3, *intPtr(db, t, `SELECT count(*) FROM public.u`))
+		require.Zero(t, pgrollLeftovers(t, db))
 	})
 }
 
 // Two alter_columns on the same column in one train.
 func TestTrainTwoAlterColumnsOnOneColumn(t *testing.T) {
-	t.Skip("known gap: down triggers fire in name order, not train order")
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {

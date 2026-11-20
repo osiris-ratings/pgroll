@@ -312,6 +312,9 @@ func (m *Roll) Revert(ctx context.Context, opts ...RevertOption) ([]RevertTarget
 		if err := m.ensureLeafVersionSchema(ctx); err != nil {
 			return nil, fmt.Errorf("unable to materialize version schema for the new leaf: %w", err)
 		}
+		if err := m.dropTrainTargetIfUnused(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	return targets, nil
@@ -339,6 +342,10 @@ func (m *Roll) ensureLeafVersionSchema(ctx context.Context) error {
 		return err
 	}
 	want := VersionedSchemaName(m.schema, leaf.VersionSchemaName())
+	// The revisions now pin the new leaf: what is left of the train follows.
+	if err := m.retargetTrain(ctx, want); err != nil {
+		return err
+	}
 	existing, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
 		return err

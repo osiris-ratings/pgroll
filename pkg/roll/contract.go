@@ -43,6 +43,11 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_
 	if err := m.retireKeptTriggers(ctx); err != nil {
 		return 0, 0, err
 	}
+	defer func() {
+		if err == nil {
+			err = m.dropTrainTargetIfUnused(ctx)
+		}
+	}()
 
 	queued, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {

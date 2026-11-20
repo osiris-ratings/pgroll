@@ -208,8 +208,8 @@ type startOptions struct {
 	// history; see WithSatisfiedDependencies.
 	satisfiedDependencies map[string]struct{}
 
-	// The train's last migration, when this Start is for an earlier one;
-	// see WithTrainTarget.
+	// The last migration of the train this Start belongs to; see
+	// WithTrainTarget.
 	trainTarget *migrations.Migration
 }
 
@@ -229,7 +229,9 @@ func WithoutVersionSchema() StartOption {
 // to. Pods only ever pin the previous deployment's version schema or the
 // train's last one, so an earlier migration's triggers tell the two
 // revisions apart by the last migration's schema, not their own, which is
-// never projected.
+// never projected. Pass it to the last migration's Start too: a train
+// resumed with a different last migration then re-keys the triggers the
+// first attempt installed.
 func WithTrainTarget(final *migrations.Migration) StartOption {
 	return func(o *startOptions) { o.trainTarget = final }
 }

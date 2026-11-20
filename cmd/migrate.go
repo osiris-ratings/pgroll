@@ -307,6 +307,10 @@ func migrateCmd() *cobra.Command {
 			// train tells the revisions apart by the last one. With
 			// --complete nothing is pinned and the triggers go inline.
 			final := migs[len(migs)-1]
+			trainOpts := []migrationOption{satisfiedDeps}
+			if !complete {
+				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
+			}
 			for _, mig := range migs[:len(migs)-1] {
 				completeOpts := []migrationOption{AsCompleteOption(roll.WithSkipSchemaDrop())}
 				if !complete {
@@ -317,11 +321,9 @@ func migrateCmd() *cobra.Command {
 				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
-					append([]migrationOption{
+					append(append([]migrationOption{
 						AsStartOption(roll.WithoutVersionSchema()),
-						AsStartOption(roll.WithTrainTarget(final)),
-						satisfiedDeps,
-					}, completeOpts...)...,
+					}, trainOpts...), completeOpts...)...,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}
@@ -338,7 +340,7 @@ func migrateCmd() *cobra.Command {
 			// schema and a later `pgroll complete` contracts the deployment.
 			// Until that contraction, the whole batch is losslessly
 			// revertible via `pgroll revert`.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, satisfiedDeps); err != nil {
+			if err := runMigration(ctx, m, final, complete, backfillConfig, trainOpts...); err != nil {
 				return err
 			}
 

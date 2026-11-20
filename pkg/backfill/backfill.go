@@ -47,6 +47,14 @@ type Job struct {
 	migrationScope string
 	triggers       map[string]triggerConfig
 
+	// Position orders this migration's triggers among those of the other
+	// migrations still expanded on the same tables.
+	Position int
+
+	// TargetFunction, when set, makes the triggers follow that function
+	// instead of the job's latest schema.
+	TargetFunction string
+
 	Tables []*schema.Table
 }
 
@@ -107,12 +115,14 @@ func (j *Job) AddTask(t *Task) {
 			// No need to rewrite the SQL here, as it is the first time we are adding it.
 			j.triggers[trigger.Name] = triggerConfig{
 				Name:                trigger.Name,
+				TriggerName:         OrderedTriggerName(trigger.Direction, j.Position, trigger.Name),
 				Direction:           trigger.Direction,
 				Columns:             trigger.Columns,
 				SchemaName:          j.schemaName,
 				TableName:           trigger.TableName,
 				PhysicalColumn:      trigger.PhysicalColumn,
 				LatestSchema:        j.latestSchema,
+				TargetFunction:      j.TargetFunction,
 				SQL:                 []string{trigger.SQL},
 				NeedsBackfillColumn: NeedsBackfillColumnName(j.migrationScope),
 				MigrationScope:      j.migrationScope,

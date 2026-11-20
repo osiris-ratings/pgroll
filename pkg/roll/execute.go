@@ -305,9 +305,14 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	// triggers.
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
 	// An earlier migration of a train projects no schema of its own; the new
-	// revision pins the train's last one.
+	// revision pins the train's last one. The train's triggers read it from
+	// one function, so a train resumed with a different last migration
+	// re-keys the triggers already installed.
 	if o.trainTarget != nil {
 		versionSchemaName = VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())
+		if err := m.setTrainTarget(ctx, versionSchemaName); err != nil {
+			return nil, err
+		}
 	}
 
 	// Reread the latest schema as validation may have updated the schema object
@@ -329,6 +334,14 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 
 	// execute operations
 	job := backfill.NewJob(m.schema, versionSchemaName, scope)
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the migrations still expanded: %w", err)
+	}
+	job.Position = len(unsealed)
+	if o.trainTarget != nil {
+		job.TargetFunction = backfill.TrainTargetFunction
+	}
 	for _, op := range migration.Operations {
 		startOp, err := op.Start(ctx, m.logger, m.pgConn, newSchema)
 		if err != nil {
@@ -631,8 +644,7 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	for _, op := range migration.Operations {
 		var opActions []migrations.DBAction
 		if keeper, ok := op.(migrations.TrainTriggerKeeper); ok && o.trainTarget != nil {
-			opActions, err = keeper.CompleteKeepingTriggers(m.logger, m.pgConn, currentSchema,
-				VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName()))
+			opActions, err = keeper.CompleteKeepingTriggers(m.logger, m.pgConn, currentSchema)
 		} else {
 			opActions, err = op.Complete(m.logger, m.pgConn, currentSchema)
 		}
@@ -683,11 +695,58 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 			return err
 		}
+		if err := m.dropTrainTargetIfUnused(ctx); err != nil {
+			return err
+		}
 	}
 
 	m.logger.LogMigrationComplete(migration)
 
 	return nil
+}
+
+// setTrainTarget points the train's triggers at versionSchema.
+func (m *Roll) setTrainTarget(ctx context.Context, versionSchema string) error {
+	_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"CREATE OR REPLACE FUNCTION %s.%s() RETURNS text LANGUAGE sql STABLE AS %s",
+		pq.QuoteIdentifier(m.schema),
+		pq.QuoteIdentifier(backfill.TrainTargetFunction),
+		pq.QuoteLiteral("SELECT "+pq.QuoteLiteral(versionSchema)+"::text"),
+	))
+	if err != nil {
+		return fmt.Errorf("unable to set the train's target schema: %w", err)
+	}
+	return nil
+}
+
+// retargetTrain points a train's remaining triggers at versionSchema, when a
+// train is in flight.
+func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) error {
+	exists, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2)`,
+		m.schema, backfill.TrainTargetFunction)
+	if err != nil || !exists {
+		return err
+	}
+	return m.setTrainTarget(ctx, versionSchema)
+}
+
+// dropTrainTargetIfUnused removes the train's target function once no
+// trigger function is left to call it.
+func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
+	inUse, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%')`,
+		m.schema)
+	if err != nil || inUse {
+		return err
+	}
+	_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s()",
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+	return err
 }
 
 // retireKeptTriggers removes the triggers that the train's inline-completed
@@ -750,7 +809,7 @@ func (m *Roll) Rollback(ctx context.Context) error {
 
 	m.logger.LogMigrationRollbackComplete(migration)
 
-	return nil
+	return m.dropTrainTargetIfUnused(ctx)
 }
 
 // dropVersionSchema deletes the migration's version schema and its views, if

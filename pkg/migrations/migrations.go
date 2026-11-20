@@ -204,7 +204,7 @@ type TrainTriggerKeeper interface {
 	// CompleteKeepingTriggers returns the Complete actions with the trigger
 	// kept, telling the revisions apart by targetSchema, the version schema
 	// of the train's last migration.
-	CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema, targetSchema string) ([]DBAction, error)
+	CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
 
 	// RetireTriggers returns the actions that remove what
 	// CompleteKeepingTriggers kept. They are safe to run when nothing was kept.

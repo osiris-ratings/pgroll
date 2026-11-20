@@ -32,7 +32,7 @@ func applyExpandOnlyTrain(t *testing.T, mig *roll.Roll, train []*migrations.Migr
 			require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop(), roll.WithTriggersKeptFor(final)))
 		}
 	}
-	require.NoError(t, mig.Start(ctx, final, backfill.NewConfig()))
+	require.NoError(t, mig.Start(ctx, final, backfill.NewConfig(), target))
 }
 
 // execAs runs one statement as a pod pinned to the given version schema.
@@ -212,4 +212,61 @@ func TestTrainNonFinalAddColumnKeepsBackfillingPreviousRevision(t *testing.T) {
 			        WHERE table_schema = 'public' AND column_name LIKE '\_pgroll\_%')`).Scan(&leftovers))
 		require.Zero(t, leftovers, "the train's contraction removes every trigger and marker column")
 	})
+}
+
+// A train that stopped part-way and resumes with a different last migration
+// re-keys the triggers its first attempt installed.
+func TestTrainResumedWithADifferentLastMigration(t *testing.T) {
+	t.Parallel()
+
+	for name, rest := range map[string][]*migrations.Migration{
+		"more migrations follow": {
+			rawSQL("02_comment", `COMMENT ON TABLE u IS 'resumed'`, `SELECT 1`),
+			rawSQL("10_resumed", `COMMENT ON COLUMN u.id IS 'resumed'`, `SELECT 1`),
+		},
+		"only the last one follows": {
+			rawSQL("10_resumed", `COMMENT ON COLUMN u.id IS 'resumed'`, `SELECT 1`),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+				ctx := context.Background()
+				require.NoError(t, mig.Start(ctx, baseMigration(
+					`CREATE TABLE u (id integer PRIMARY KEY, v integer);
+					 INSERT INTO u VALUES (1, 5)`,
+				), backfill.NewConfig()))
+				require.NoError(t, mig.Complete(ctx))
+
+				// The first attempt stops after its first migration.
+				abandoned := roll.WithTrainTarget(laterIndex("u", "id"))
+				require.NoError(t, mig.Start(ctx, &migrations.Migration{
+					Name: "01_check_v",
+					Operations: migrations.Operations{
+						&migrations.OpAlterColumn{
+							Table: "u", Column: "v",
+							Check: &migrations.CheckConstraint{Name: "v_pos", Constraint: "v > 0"},
+							Up:    "CASE WHEN v > 0 THEN v ELSE 1 END", Down: "v",
+						},
+					},
+				}, backfill.NewConfig(), roll.WithoutVersionSchema(), abandoned))
+				require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+
+				applyExpandOnlyTrain(t, mig, rest)
+
+				const resumed = "public_10_resumed"
+				require.Error(t, execAs(t, db, resumed, `INSERT INTO u (id, v) VALUES (10, -1)`),
+					"the new revision's write must meet the new CHECK")
+				require.NoError(t, execAs(t, db, resumed, `INSERT INTO u (id, v) VALUES (11, 7)`))
+				require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO u (id, v) VALUES (12, -3)`))
+				require.Equal(t, 7, *intPtr(db, t, `SELECT v FROM public_00_base.u WHERE id = 11`))
+
+				require.NoError(t, mig.Complete(ctx))
+				require.Equal(t, 7, *intPtr(db, t, `SELECT v FROM public.u WHERE id = 11`))
+				require.Equal(t, 1, *intPtr(db, t, `SELECT v FROM public.u WHERE id = 12`))
+				require.Zero(t, pgrollLeftovers(t, db))
+			})
+		})
+	}
 }

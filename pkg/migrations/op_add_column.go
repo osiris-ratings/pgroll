@@ -164,7 +164,7 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 // CompleteKeepingTriggers completes the column but keeps its `up` trigger, so
 // a later migration in the train can name the column while the previous
 // revision's writes are still filled.
-func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema, targetSchema string) ([]DBAction, error) {
+func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
 	if o.Up == "" {
 		return o.Complete(l, conn, s)
 	}
@@ -190,11 +190,10 @@ func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Sc
 
 	dbActions := []DBAction{
 		&retargetTriggerAction{
-			conn:         conn,
-			schemaName:   s.Name,
-			targetSchema: targetSchema,
-			scope:        scope,
-			from:         temporary,
+			conn:       conn,
+			schemaName: s.Name,
+			scope:      scope,
+			from:       temporary,
 			trigger: backfill.OperationTrigger{
 				Name:           backfill.TriggerName(scope, o.Table, o.Column.Name),
 				Direction:      backfill.TriggerDirectionUp,
@@ -223,12 +222,11 @@ func (o *OpAddColumn) RetireTriggers(conn db.DB, s *schema.Schema) []DBAction {
 }
 
 type retargetTriggerAction struct {
-	conn         db.DB
-	schemaName   string
-	targetSchema string
-	scope        string
-	from         string
-	trigger      backfill.OperationTrigger
+	conn       db.DB
+	schemaName string
+	scope      string
+	from       string
+	trigger    backfill.OperationTrigger
 }
 
 func (a *retargetTriggerAction) ID() string {
@@ -236,7 +234,7 @@ func (a *retargetTriggerAction) ID() string {
 }
 
 func (a *retargetTriggerAction) Execute(ctx context.Context) error {
-	return backfill.RetargetTrigger(ctx, a.conn, a.schemaName, a.targetSchema, a.scope, a.trigger, a.from)
+	return backfill.RetargetTrigger(ctx, a.conn, a.schemaName, a.scope, a.trigger, a.from)
 }
 
 // settleActions appends what gives the renamed column its final constraints
