@@ -215,14 +215,15 @@ func TestBuildTrigger(t *testing.T) {
 		{
 			name: "trigger",
 			config: triggerConfig{
-				Name:      "triggerName",
-				TableName: "reviews",
+				Name:        "functionName",
+				TriggerName: "triggerName",
+				TableName:   "reviews",
 			},
 			expected: `CREATE OR REPLACE TRIGGER "triggerName"
     BEFORE UPDATE OR INSERT
     ON "reviews"
     FOR EACH ROW
-    EXECUTE PROCEDURE "triggerName"();
+    EXECUTE PROCEDURE "functionName"();
 `,
 		},
 	}

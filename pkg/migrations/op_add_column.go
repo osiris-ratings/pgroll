@@ -153,12 +153,109 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
+	dbActions := append(
+		[]DBAction{NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name)},
+		o.RetireTriggers(conn, scope)...,
+	)
+	dbActions = append(dbActions, NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)))
+
+	return o.settleActions(conn, table, scope, dbActions), nil
+}
+
+// CompleteKeepingTriggers completes the column but keeps its `up` trigger, so
+// a later migration in the train can name the column while the previous
+// revision's writes are still filled.
+func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
+	if o.Up == "" {
+		return o.Complete(l, conn, s)
+	}
+	l.LogOperationComplete(o)
+	scope := s.MigrationScope
+
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return nil, TableDoesNotExistError{Name: o.Table}
+	}
+
+	// The migration's other operations rename or drop their own temporary
+	// columns around this one, so the function names none of them until
+	// RebuildKeptTriggers.
+	temporary := TemporaryName(scope, o.Column.Name)
+	columns := make(map[string]*schema.Column, len(table.Columns))
+	for name, column := range table.Columns {
+		switch {
+		case column.Name == temporary:
+			renamed := *column
+			renamed.Name = o.Column.Name
+			columns[o.Column.Name] = &renamed
+		case !strings.HasPrefix(column.Name, "_pgroll_"):
+			columns[name] = column
+		}
+	}
+
 	dbActions := []DBAction{
-		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name),
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
+		o.keptTrigger(conn, s, table.Name, columns, temporary),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 
+	return o.settleActions(conn, table, scope, dbActions), nil
+}
+
+// RebuildKeptTriggers rebuilds the kept trigger so its `up` can name every
+// column the table ends the migration with.
+func (o *OpAddColumn) RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction {
+	table := s.GetTable(o.Table)
+	if o.Up == "" || table == nil {
+		return nil
+	}
+	return []DBAction{o.keptTrigger(conn, s, table.Name, table.Columns, "")}
+}
+
+func (o *OpAddColumn) keptTrigger(conn db.DB, s *schema.Schema, tableName string, columns map[string]*schema.Column, from string) DBAction {
+	return &retargetTriggerAction{
+		conn:       conn,
+		schemaName: s.Name,
+		scope:      s.MigrationScope,
+		from:       from,
+		trigger: backfill.OperationTrigger{
+			Name:           backfill.TriggerName(s.MigrationScope, o.Table, o.Column.Name),
+			Direction:      backfill.TriggerDirectionUp,
+			Columns:        columns,
+			TableName:      tableName,
+			PhysicalColumn: o.Column.Name,
+			SQL:            o.Up,
+		},
+	}
+}
+
+// RetireTriggers drops the column's trigger function, and its trigger with
+// it. The function is named for the table as Start saw it, so a rename or
+// drop of the table later in the train does not hide it.
+func (o *OpAddColumn) RetireTriggers(conn db.DB, scope string) []DBAction {
+	return []DBAction{
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
+	}
+}
+
+type retargetTriggerAction struct {
+	conn       db.DB
+	schemaName string
+	scope      string
+	from       string
+	trigger    backfill.OperationTrigger
+}
+
+func (a *retargetTriggerAction) ID() string {
+	return fmt.Sprintf("retarget_trigger_%s", a.trigger.Name)
+}
+
+func (a *retargetTriggerAction) Execute(ctx context.Context) error {
+	return backfill.RetargetTrigger(ctx, a.conn, a.schemaName, a.scope, a.trigger, a.from)
+}
+
+// settleActions appends what gives the renamed column its final constraints
+// and default.
+func (o *OpAddColumn) settleActions(conn db.DB, table *schema.Table, scope string, dbActions []DBAction) []DBAction {
 	if !o.Column.IsNullable() && o.Column.Default == nil {
 		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
 	}
@@ -186,7 +283,7 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		}
 	}
 
-	return dbActions, nil
+	return dbActions
 }
 
 func (o *OpAddColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {

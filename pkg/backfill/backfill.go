@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -46,6 +48,14 @@ type Job struct {
 	latestSchema   string
 	migrationScope string
 	triggers       map[string]triggerConfig
+
+	// Position orders this migration's triggers among those of the other
+	// migrations still expanded on the same tables.
+	Position int
+
+	// TargetFunction, when set, makes the triggers follow that function
+	// instead of the job's latest schema.
+	TargetFunction string
 
 	Tables []*schema.Table
 }
@@ -113,6 +123,7 @@ func (j *Job) AddTask(t *Task) {
 				TableName:           trigger.TableName,
 				PhysicalColumn:      trigger.PhysicalColumn,
 				LatestSchema:        j.latestSchema,
+				TargetFunction:      j.TargetFunction,
 				SQL:                 []string{trigger.SQL},
 				NeedsBackfillColumn: NeedsBackfillColumnName(j.migrationScope),
 				MigrationScope:      j.migrationScope,
@@ -157,7 +168,11 @@ func New(conn db.DB, c *Config, scope string) *Backfill {
 
 // CreateTriggers creates the triggers for the tables before starting the backfill.
 func (bf *Backfill) CreateTriggers(ctx context.Context, j *Job) error {
-	for _, trigger := range j.triggers {
+	// In function-name order, which is the order one migration's triggers
+	// fire in.
+	for index, name := range slices.Sorted(maps.Keys(j.triggers)) {
+		trigger := j.triggers[name]
+		trigger.TriggerName = OrderedTriggerName(trigger.Direction, j.Position, index, trigger.Name)
 		a := &createTriggerAction{
 			conn: bf.conn,
 			cfg:  trigger,

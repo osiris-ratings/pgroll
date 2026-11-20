@@ -197,6 +197,24 @@ func (m *RawMigration) SelectedBy(t string) bool {
 	return slices.Contains(m.Targets, t)
 }
 
+// TrainTriggerKeeper is implemented by operations that complete inline in the
+// middle of a train but whose triggers the previous revision's writes still
+// need until the train contracts.
+type TrainTriggerKeeper interface {
+	// CompleteKeepingTriggers returns the Complete actions with the trigger
+	// kept.
+	CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
+
+	// RebuildKeptTriggers returns the actions that rebuild the kept triggers
+	// against s, read once every operation of the migration has completed.
+	RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction
+
+	// RetireTriggers returns the actions that remove what
+	// CompleteKeepingTriggers kept for the migration with this scope. They
+	// are safe to run when nothing was kept.
+	RetireTriggers(conn db.DB, scope string) []DBAction
+}
+
 // VersionSchemaName returns the version schema name for the migration.
 // It defaults to the migration name if no version schema is set.
 func (m *Migration) VersionSchemaName() string {

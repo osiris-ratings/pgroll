@@ -304,6 +304,16 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	// but ops need to know the name in advance in order to construct backfill
 	// triggers.
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
+	// An earlier migration of a train projects no schema of its own; the new
+	// revision pins the train's last one. The train's triggers read it from
+	// one function, so a train resumed with a different last migration
+	// re-keys the triggers already installed.
+	if o.trainTarget != nil {
+		versionSchemaName = VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())
+		if err := m.setTrainTarget(ctx, versionSchemaName); err != nil {
+			return nil, err
+		}
+	}
 
 	// Reread the latest schema as validation may have updated the schema object
 	// in memory. Use the deferred-aware helper so this migration's operations
@@ -324,6 +334,14 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 
 	// execute operations
 	job := backfill.NewJob(m.schema, versionSchemaName, scope)
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the migrations still expanded: %w", err)
+	}
+	job.Position = len(unsealed)
+	if o.trainTarget != nil {
+		job.TargetFunction = backfill.TrainTargetFunction
+	}
 	for _, op := range migration.Operations {
 		startOp, err := op.Start(ctx, m.logger, m.pgConn, newSchema)
 		if err != nil {
@@ -419,6 +437,10 @@ func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migr
 type completeOptions struct {
 	skipSchemaDrop bool
 	deferComplete  bool
+
+	// The train's last migration, when this Complete is for an earlier one;
+	// see WithTriggersKeptFor.
+	trainTarget *migrations.Migration
 }
 
 // CompleteOption is a functional option for the Complete method.
@@ -432,6 +454,14 @@ type CompleteOption func(*completeOptions)
 // also defers the operations themselves.
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
+}
+
+// WithTriggersKeptFor completes an earlier migration of a train inline while
+// keeping the triggers the previous revision's writes need, keyed on the
+// version schema of the train's last migration. The train's contraction
+// removes them.
+func WithTriggersKeptFor(final *migrations.Migration) CompleteOption {
+	return func(o *completeOptions) { o.trainTarget = final }
 }
 
 // WithDeferComplete returns a CompleteOption that records the migration as
@@ -545,6 +575,11 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	// never touch what they reference, and onComplete raw SQL runs in place,
 	// with the views checked and rebuilt after it (see drainDeferredMigration).
 	if !o.skipSchemaDrop {
+		// Before the drain, which can drop a column a kept trigger reads.
+		if err := m.retireKeptTriggers(ctx); err != nil {
+			return err
+		}
+
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
@@ -607,7 +642,12 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	refreshViews := false
 	var actions []migrations.DBAction
 	for _, op := range migration.Operations {
-		opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
+		var opActions []migrations.DBAction
+		if keeper, ok := op.(migrations.TrainTriggerKeeper); ok && o.trainTarget != nil {
+			opActions, err = keeper.CompleteKeepingTriggers(m.logger, m.pgConn, currentSchema)
+		} else {
+			opActions, err = op.Complete(m.logger, m.pgConn, currentSchema)
+		}
 		if err != nil {
 			return fmt.Errorf("unable to collect actions for complete operation: %w", err)
 		}
@@ -618,9 +658,21 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		}
 	}
 
+	if o.trainTarget != nil {
+		if err := m.setTrainTarget(ctx, VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())); err != nil {
+			return err
+		}
+	}
+
 	coordinator := migrations.NewCoordinator(actions)
 	if err := coordinator.ExecuteWithRecovery(ctx, m.viewConflictRecovery(guard, migration)); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
+	}
+
+	if o.trainTarget != nil {
+		if err := m.rebuildKeptTriggers(ctx, migration); err != nil {
+			return err
+		}
 	}
 
 	// Check the live views against the schema they now project, before the
@@ -655,10 +707,108 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 			return err
 		}
+		if err := m.dropTrainTargetIfUnused(ctx); err != nil {
+			return err
+		}
 	}
 
 	m.logger.LogMigrationComplete(migration)
 
+	return nil
+}
+
+// setTrainTarget points the train's triggers at versionSchema.
+func (m *Roll) setTrainTarget(ctx context.Context, versionSchema string) error {
+	_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf(
+		"CREATE OR REPLACE FUNCTION %s.%s() RETURNS text LANGUAGE sql STABLE AS %s",
+		pq.QuoteIdentifier(m.schema),
+		pq.QuoteIdentifier(backfill.TrainTargetFunction),
+		pq.QuoteLiteral("SELECT "+pq.QuoteLiteral(versionSchema)+"::text"),
+	))
+	if err != nil {
+		return fmt.Errorf("unable to set the train's target schema: %w", err)
+	}
+	return nil
+}
+
+// retargetTrain points a train's remaining triggers at versionSchema, when a
+// train is in flight.
+func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) error {
+	exists, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2)`,
+		m.schema, backfill.TrainTargetFunction)
+	if err != nil || !exists {
+		return err
+	}
+	return m.setTrainTarget(ctx, versionSchema)
+}
+
+// dropTrainTargetIfUnused removes the train's target function once no
+// trigger function is left to call it.
+func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
+	inUse, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%')`,
+		m.schema)
+	if err != nil || inUse {
+		return err
+	}
+	_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s()",
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+	return err
+}
+
+// retireKeptTriggers removes the triggers that the train's inline-completed
+// migrations kept for the previous revision (WithTriggersKeptFor). The train
+// is the unsealed window; contraction ends it.
+func (m *Roll) retireKeptTriggers(ctx context.Context) error {
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return err
+	}
+	for _, record := range unsealed {
+		if !record.Done || record.CompleteDeferred {
+			continue
+		}
+		scope := migrations.MigrationScopeFor(record.Migration.Name)
+		for _, op := range record.Migration.Operations {
+			keeper, ok := op.(migrations.TrainTriggerKeeper)
+			if !ok {
+				continue
+			}
+			if err := migrations.NewCoordinator(keeper.RetireTriggers(m.pgConn, scope)).Execute(ctx); err != nil {
+				return fmt.Errorf("unable to retire the triggers of %q: %w", record.Migration.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// rebuildKeptTriggers rebuilds the triggers migration kept, now that all of
+// its operations have completed and its columns carry their final names.
+func (m *Roll) rebuildKeptTriggers(ctx context.Context, migration *migrations.Migration) error {
+	var actions []migrations.DBAction
+	var sch *schema.Schema
+	for _, op := range migration.Operations {
+		keeper, ok := op.(migrations.TrainTriggerKeeper)
+		if !ok {
+			continue
+		}
+		if sch == nil {
+			var err error
+			if sch, err = m.readSchemaWithDeferredExcluding(ctx, migration.Name); err != nil {
+				return fmt.Errorf("unable to read schema: %w", err)
+			}
+			sch.MigrationScope = migrations.MigrationScopeFor(migration.Name)
+		}
+		actions = append(actions, keeper.RebuildKeptTriggers(m.pgConn, sch)...)
+	}
+	if err := migrations.NewCoordinator(actions).Execute(ctx); err != nil {
+		return fmt.Errorf("unable to rebuild the triggers %q keeps: %w", migration.Name, err)
+	}
 	return nil
 }
 
@@ -690,7 +840,7 @@ func (m *Roll) Rollback(ctx context.Context) error {
 
 	m.logger.LogMigrationRollbackComplete(migration)
 
-	return nil
+	return m.dropTrainTargetIfUnused(ctx)
 }
 
 // dropVersionSchema deletes the migration's version schema and its views, if

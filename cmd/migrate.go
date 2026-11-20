@@ -21,7 +21,7 @@ import (
 )
 
 func migrateCmd() *cobra.Command {
-	var complete, expectOne bool
+	var complete, expectOne, leafUnpinned bool
 	var batchSize int
 	var batchDelay time.Duration
 	var toMigration string
@@ -227,6 +227,14 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
+			// With --complete nothing is pinned, and the run contracts the
+			// open train along with its own.
+			if !complete && !leafUnpinned {
+				if err := refuseOnOpenTrain(ctx, m); err != nil {
+					return err
+				}
+			}
+
 			// In 'expect one' mode, abort if there is more than one unapplied migration
 			if expectOne && len(rawMigs) > 1 {
 				return fmt.Errorf("expected one migration to apply but found %d", len(rawMigs))
@@ -302,16 +310,28 @@ func migrateCmd() *cobra.Command {
 			// handed to every Start in the batch.
 			satisfiedDeps := AsStartOption(roll.WithSatisfiedDependencies(resolution.Excluded))
 
+			// Pods pin the previous deployment's schema or the last
+			// migration's, never an intermediate's, so every trigger in the
+			// train tells the revisions apart by the last one. With
+			// --complete nothing is pinned and the triggers go inline.
+			final := migs[len(migs)-1]
+			trainOpts := []migrationOption{satisfiedDeps}
+			if !complete {
+				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
+			}
 			for _, mig := range migs[:len(migs)-1] {
-				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
+				completeOpts := []migrationOption{AsCompleteOption(roll.WithSkipSchemaDrop())}
+				if !complete {
+					completeOpts = append(completeOpts, AsCompleteOption(roll.WithTriggersKeptFor(final)))
+				}
 				if mig.CompleteMustBeDeferred() {
-					completeOpt = AsCompleteOption(roll.WithDeferComplete())
+					completeOpts = []migrationOption{AsCompleteOption(roll.WithDeferComplete())}
 				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
-					AsStartOption(roll.WithoutVersionSchema()),
-					satisfiedDeps,
-					completeOpt,
+					append(append([]migrationOption{
+						AsStartOption(roll.WithoutVersionSchema()),
+					}, trainOpts...), completeOpts...)...,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}
@@ -328,7 +348,7 @@ func migrateCmd() *cobra.Command {
 			// schema and a later `pgroll complete` contracts the deployment.
 			// Until that contraction, the whole batch is losslessly
 			// revertible via `pgroll revert`.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, satisfiedDeps); err != nil {
+			if err := runMigration(ctx, m, final, complete, backfillConfig, trainOpts...); err != nil {
 				return err
 			}
 
@@ -355,6 +375,7 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, leafUnpinnedUsage)
 	migrateCmd.Flags().StringVar(&toMigration, "to", "", "apply migrations only up to (and including) this one; already applied is a no-op")
 
 	return migrateCmd
@@ -777,4 +798,29 @@ func interruptedMessage(ctx context.Context, m *roll.Roll, active string) string
 			base,
 		)
 	}
+}
+
+const leafUnpinnedUsage = "start on top of an applied, uncontracted train whose leaf has a version schema; " +
+	"only when no workload is pinned to that schema"
+
+// refuseOnOpenTrain refuses to start a migration on top of a train that is
+// applied and not contracted while its leaf's version schema exists. A fleet
+// on that schema is a third revision beside the previous deployment's and
+// the new train's, and the open train's triggers tell only two apart.
+func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
+	leaf, err := m.ReopenedTrainLeaf(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to check for an open train: %w", err)
+	}
+	if leaf == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot start on top of an open train: migration %[1]q is applied and not contracted, nothing "+
+			"is in progress, and its version schema %[2]q exists. If the fleet runs on that schema (a "+
+			"bounded `pgroll revert` leaves this), run `pgroll complete` to contract the train first, or "+
+			"`pgroll revert` to undo it. If no workload is pinned to that schema (`pgroll materialize` "+
+			"after an interrupted `pgroll migrate` leaves this), re-run with --leaf-unpinned",
+		leaf, roll.VersionedSchemaName(m.Schema(), leaf),
+	)
 }

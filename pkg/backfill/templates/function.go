@@ -9,9 +9,9 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
     DECLARE
       {{- $schemaName := .SchemaName  }}
       {{- $tableName := .TableName  }}
-      {{ range $name, $col := .Columns }} 
+      {{ range $name, $col := .Columns }}{{ if not (internal $name) }} 
       {{- $name | qi }} {{ $schemaName | qi }}.{{ $tableName | qi}}.{{ $col.Name | qi }}%TYPE := NEW.{{ $col.Name | qi }};
-      {{ end -}}
+      {{ end }}{{ end -}}
       latest_schema text;
       search_path text;
     BEGIN
@@ -19,11 +19,13 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
         INTO search_path
         FROM current_setting('search_path');
 
-      IF search_path {{- if eq .Direction "up" }} != {{- else }} = {{- end }} {{ .LatestSchema | ql }} THEN
+      IF search_path {{- if eq .Direction "up" }} != {{- else }} = {{- end }} {{ if .TargetFunction }}{{ .SchemaName | qi }}.{{ .TargetFunction | qi }}(){{ else }}{{ .LatestSchema | ql }}{{ end }} THEN
       {{- $physicalColumn := .PhysicalColumn | qi  }}{{ range $s := .SQL }}
         NEW.{{ $physicalColumn  }} = {{ $s }};
       {{- end }}
+      {{- if .NeedsBackfillColumn }}
         NEW.{{ .NeedsBackfillColumn | qi }} = false;
+      {{- end }}
       END IF;
 
       RETURN NEW;
