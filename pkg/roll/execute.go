@@ -304,6 +304,11 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	// but ops need to know the name in advance in order to construct backfill
 	// triggers.
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
+	// An earlier migration of a train projects no schema of its own; the new
+	// revision pins the train's last one.
+	if o.trainTarget != nil {
+		versionSchemaName = VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())
+	}
 
 	// Reread the latest schema as validation may have updated the schema object
 	// in memory. Use the deferred-aware helper so this migration's operations
@@ -419,6 +424,10 @@ func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migr
 type completeOptions struct {
 	skipSchemaDrop bool
 	deferComplete  bool
+
+	// The train's last migration, when this Complete is for an earlier one;
+	// see WithTriggersKeptFor.
+	trainTarget *migrations.Migration
 }
 
 // CompleteOption is a functional option for the Complete method.
@@ -432,6 +441,14 @@ type CompleteOption func(*completeOptions)
 // also defers the operations themselves.
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
+}
+
+// WithTriggersKeptFor completes an earlier migration of a train inline while
+// keeping the triggers the previous revision's writes need, keyed on the
+// version schema of the train's last migration. The train's contraction
+// removes them.
+func WithTriggersKeptFor(final *migrations.Migration) CompleteOption {
+	return func(o *completeOptions) { o.trainTarget = final }
 }
 
 // WithDeferComplete returns a CompleteOption that records the migration as
@@ -545,6 +562,11 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	// never touch what they reference, and onComplete raw SQL runs in place,
 	// with the views checked and rebuilt after it (see drainDeferredMigration).
 	if !o.skipSchemaDrop {
+		// Before the drain, which can drop a column a kept trigger reads.
+		if err := m.retireKeptTriggers(ctx); err != nil {
+			return err
+		}
+
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
@@ -607,7 +629,13 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	refreshViews := false
 	var actions []migrations.DBAction
 	for _, op := range migration.Operations {
-		opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
+		var opActions []migrations.DBAction
+		if keeper, ok := op.(migrations.TrainTriggerKeeper); ok && o.trainTarget != nil {
+			opActions, err = keeper.CompleteKeepingTriggers(m.logger, m.pgConn, currentSchema,
+				VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName()))
+		} else {
+			opActions, err = op.Complete(m.logger, m.pgConn, currentSchema)
+		}
 		if err != nil {
 			return fmt.Errorf("unable to collect actions for complete operation: %w", err)
 		}
@@ -659,6 +687,38 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 
 	m.logger.LogMigrationComplete(migration)
 
+	return nil
+}
+
+// retireKeptTriggers removes the triggers that the train's inline-completed
+// migrations kept for the previous revision (WithTriggersKeptFor). The train
+// is the unsealed window; contraction ends it.
+func (m *Roll) retireKeptTriggers(ctx context.Context) error {
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return err
+	}
+	var sch *schema.Schema
+	for _, record := range unsealed {
+		if !record.Done || record.CompleteDeferred {
+			continue
+		}
+		for _, op := range record.Migration.Operations {
+			keeper, ok := op.(migrations.TrainTriggerKeeper)
+			if !ok {
+				continue
+			}
+			if sch == nil {
+				if sch, err = m.readSchemaWithDeferred(ctx); err != nil {
+					return fmt.Errorf("unable to read schema: %w", err)
+				}
+			}
+			sch.MigrationScope = migrations.MigrationScopeFor(record.Migration.Name)
+			if err := migrations.NewCoordinator(keeper.RetireTriggers(m.pgConn, sch)).Execute(ctx); err != nil {
+				return fmt.Errorf("unable to retire the triggers of %q: %w", record.Migration.Name, err)
+			}
+		}
+	}
 	return nil
 }
 

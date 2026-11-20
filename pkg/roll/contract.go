@@ -39,6 +39,11 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_
 		opt(&o)
 	}
 
+	// Before anything is stamped sealed: the unsealed window names the train.
+	if err := m.retireKeptTriggers(ctx); err != nil {
+		return 0, 0, err
+	}
+
 	queued, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to query deferred completes: %w", err)

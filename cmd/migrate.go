@@ -302,16 +302,26 @@ func migrateCmd() *cobra.Command {
 			// handed to every Start in the batch.
 			satisfiedDeps := AsStartOption(roll.WithSatisfiedDependencies(resolution.Excluded))
 
+			// Pods pin the previous deployment's schema or the last
+			// migration's, never an intermediate's, so every trigger in the
+			// train tells the revisions apart by the last one. With
+			// --complete nothing is pinned and the triggers go inline.
+			final := migs[len(migs)-1]
 			for _, mig := range migs[:len(migs)-1] {
-				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
+				completeOpts := []migrationOption{AsCompleteOption(roll.WithSkipSchemaDrop())}
+				if !complete {
+					completeOpts = append(completeOpts, AsCompleteOption(roll.WithTriggersKeptFor(final)))
+				}
 				if mig.CompleteMustBeDeferred() {
-					completeOpt = AsCompleteOption(roll.WithDeferComplete())
+					completeOpts = []migrationOption{AsCompleteOption(roll.WithDeferComplete())}
 				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
-					AsStartOption(roll.WithoutVersionSchema()),
-					satisfiedDeps,
-					completeOpt,
+					append([]migrationOption{
+						AsStartOption(roll.WithoutVersionSchema()),
+						AsStartOption(roll.WithTrainTarget(final)),
+						satisfiedDeps,
+					}, completeOpts...)...,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}

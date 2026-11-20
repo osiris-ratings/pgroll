@@ -135,3 +135,51 @@ func TriggerFunctionName(scope, tableName, columnName string) string {
 func TriggerName(scope, tableName, columnName string) string {
 	return TriggerFunctionName(scope, tableName, columnName)
 }
+
+// RetargetTrigger renames the column a trigger fills and rebuilds the trigger
+// function to write it under its new name, in one transaction, so no write
+// sees the function and the column disagree. trigger.PhysicalColumn is the
+// new name. A re-run after the rename has landed only rebuilds the function.
+func RetargetTrigger(ctx context.Context, conn db.DB, schemaName, latestSchema, scope string, trigger OperationTrigger, from string) error {
+	cfg := triggerConfig{
+		Name:                trigger.Name,
+		Direction:           trigger.Direction,
+		Columns:             trigger.Columns,
+		SchemaName:          schemaName,
+		TableName:           trigger.TableName,
+		PhysicalColumn:      trigger.PhysicalColumn,
+		LatestSchema:        latestSchema,
+		SQL:                 []string{trigger.SQL},
+		NeedsBackfillColumn: NeedsBackfillColumnName(scope),
+		MigrationScope:      scope,
+	}
+	if sql := cfg.SQL[0]; len(sql) > 0 && sql[0] != '(' {
+		cfg.SQL[0] = "(" + sql + ")"
+	}
+	funcSQL, err := buildFunction(cfg)
+	if err != nil {
+		return err
+	}
+
+	return conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var pending bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_attribute
+				WHERE attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+				AND attname = $3 AND NOT attisdropped)`,
+			schemaName, trigger.TableName, from).Scan(&pending); err != nil {
+			return err
+		}
+		if pending {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+				pq.QuoteIdentifier(trigger.TableName),
+				pq.QuoteIdentifier(from),
+				pq.QuoteIdentifier(trigger.PhysicalColumn))); err != nil {
+				return err
+			}
+		}
+		_, err := tx.ExecContext(ctx, funcSQL)
+		return err
+	})
+}
