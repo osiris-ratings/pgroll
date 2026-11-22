@@ -28,7 +28,7 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
         IF TG_OP = 'UPDATE' THEN
           _pgroll_fill := NEW.{{ $physicalColumn }} IS NOT DISTINCT FROM OLD.{{ $physicalColumn }};
         ELSE
-          _pgroll_fill := true;
+          _pgroll_fill := {{ if .ColumnHasDefault }}true{{ else }}NEW.{{ $physicalColumn }} IS NULL{{ end }};
         END IF;
         IF current_setting('application_name') = {{ .MigrationSession | ql }} THEN
           IF TG_OP = 'UPDATE' THEN

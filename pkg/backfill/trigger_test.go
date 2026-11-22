@@ -276,7 +276,7 @@ func TestBuildFunctionKeepingMigrationWrites(t *testing.T) {
         IF TG_OP = 'UPDATE' THEN
           _pgroll_fill := NEW."a" IS NOT DISTINCT FROM OLD."a";
         ELSE
-          _pgroll_fill := true;
+          _pgroll_fill := NEW."a" IS NULL;
         END IF;
         IF current_setting('application_name') = 'pgroll' THEN
           IF TG_OP = 'UPDATE' THEN

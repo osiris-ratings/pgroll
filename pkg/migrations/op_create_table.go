@@ -46,8 +46,12 @@ func (o *OpCreateTable) Start(ctx context.Context, l Logger, conn db.DB, s *sche
 		dbActions = append(dbActions, NewCommentTableAction(conn, o.Name, o.Comment))
 	}
 
-	// Update the in-memory schema representation with the new table
-	o.updateSchema(s)
+	// Update the in-memory schema representation with the new table. A
+	// replay over a schema read after the table was created keeps what was
+	// read: later migrations may have changed the table.
+	if _, replay := conn.(*db.FakeDB); !replay || s.GetTable(o.Name) == nil {
+		o.updateSchema(s)
+	}
 
 	return &StartResult{Actions: dbActions}, nil
 }

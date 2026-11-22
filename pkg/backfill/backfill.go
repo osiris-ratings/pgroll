@@ -128,6 +128,7 @@ func (j *Job) AddTask(t *Task) {
 				Fills:                trigger.Fills,
 				OnlyFillsNull:        trigger.OnlyFillsNull,
 				KeepsMigrationWrites: trigger.KeepsMigrationWrites,
+				ColumnHasDefault:     trigger.ColumnHasDefault,
 				NeedsBackfillColumn:  NeedsBackfillColumnName(j.migrationScope),
 				MigrationScope:       j.migrationScope,
 			}

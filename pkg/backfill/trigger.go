@@ -46,6 +46,7 @@ type triggerConfig struct {
 	Fills                string
 	OnlyFillsNull        bool
 	KeepsMigrationWrites bool
+	ColumnHasDefault     bool
 	// MigrationScope is the per-migration suffix used when naming the
 	// marker column. Empty scope produces the legacy unscoped marker.
 	MigrationScope string
@@ -66,7 +67,7 @@ type OperationTrigger struct {
 	OnlyFillsNull bool
 	// KeepsMigrationWrites is for a column sessions on the table can already
 	// name. An UPDATE that changes the column keeps its value, whoever makes
-	// it. A write from pgroll's own session, running a later migration,
+	// it, and so does an INSERT that gives one (see ColumnHasDefault). A write from pgroll's own session, running a later migration,
 	// also keeps a value it inserts, and the expression fills only an insert
 	// that gave none and a row the backfill had not reached. The stored
 	// marker says so; a sibling trigger of the same migration may have
@@ -74,6 +75,10 @@ type OperationTrigger struct {
 	// before, and a write of the new revision marks its row as needing no
 	// backfill.
 	KeepsMigrationWrites bool
+	// ColumnHasDefault says an INSERT's value for the column may be its
+	// default rather than one the statement gave. Without a default a value
+	// was given, and under KeepsMigrationWrites it is kept.
+	ColumnHasDefault bool
 }
 
 type createTriggerAction struct {

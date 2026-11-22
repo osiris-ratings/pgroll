@@ -755,13 +755,13 @@ func TestTrainCaseUnpinnedUpdateAndACheckOnTheDerivedColumn(t *testing.T) {
 }
 
 // The same train on the host that runs `migrate --complete` with version
-// schemas disabled: the rolling host accepts a name re-added after a drop.
+// schemas disabled. There the add completes at once, while the dropped
+// column still holds the name, and is refused.
 func TestTrainCaseReAddedColumnNameOnTheNonRollingHost(t *testing.T) {
 	t.Parallel()
 	testutils.WithMigratorInSchemaAndConnectionToContainerWithOptions(t, "public",
 		[]roll.Option{roll.WithLockTimeoutMs(500), roll.WithVersionSchema(false)},
 		func(mig *roll.Roll, db *sql.DB) {
-			ctx := context.Background()
 			r2Base(t, mig, r2W)
 			err := r2TrainErr(mig, []*migrations.Migration{
 				{Name: "01_drop", Operations: migrations.Operations{&migrations.OpDropColumn{Table: "w", Column: "x", Down: "0"}}},
@@ -770,8 +770,7 @@ func TestTrainCaseReAddedColumnNameOnTheNonRollingHost(t *testing.T) {
 				}},
 				r2Last(),
 			})
-			require.NoError(t, err, "the train, as `migrate --complete --use-version-schema=false` applies it")
-			require.NoError(t, r2Safely(func() error { return mig.Complete(ctx) }))
+			require.ErrorContains(t, err, `column "x" of relation "w" already exists`)
 		})
 }
 

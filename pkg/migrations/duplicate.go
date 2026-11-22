@@ -225,6 +225,11 @@ func (d *duplicatorStmtBuilder) duplicateCheckConstraints(withoutConstraint []st
 		if slices.Contains(withoutConstraint, cc.Name) || IsDuplicatedName(cc.Name) {
 			continue
 		}
+		// The check a waiting add_column holds its NOT NULL in: the copy
+		// gets its own from the column (see duplicateColumn).
+		if IsNotNullConstraintName(cc.Name) {
+			continue
+		}
 		if duplicatedConstraintColumns := d.duplicatedConstraintColumns(cc.Columns, colNames...); len(duplicatedConstraintColumns) > 0 {
 			sql := fmt.Sprintf("ALTER TABLE %s ADD ", pq.QuoteIdentifier(d.table.Name))
 			writer := ConstraintSQLWriter{Name: DuplicationName(d.scope, cc.Name), SkipValidation: true}
@@ -270,6 +275,13 @@ func (d *duplicatorStmtBuilder) duplicateIndexes(withoutConstraint []string, col
 		if _, ok := d.table.UniqueConstraints[idx.Name]; ok && idx.Unique {
 			// unique constraints are duplicated as unique indexes
 			continue
+		}
+		// The index a waiting add_column's unique constraint is built from,
+		// which Start registers as the constraint it becomes.
+		if column, pending := strings.CutPrefix(idx.Name, UniqueIndexName("")); pending && idx.Unique {
+			if _, ok := d.table.UniqueConstraints[column]; ok {
+				continue
+			}
 		}
 
 		if duplicatedMember, columns := d.allConstraintColumns(idx.Columns, colNames...); duplicatedMember {

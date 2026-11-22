@@ -127,12 +127,25 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				OnlyFillsNull: !o.fillsPreviousRevisionWrites(),
 				// Under its own name a later migration can write the column.
 				KeepsMigrationWrites: started == o.Column.Name && o.fillsPreviousRevisionWrites(),
+				ColumnHasDefault:     o.Column.HasDefault(),
 			},
 		)
 	}
 
 	tmpColumn := toSchemaColumn(o.Column)
 	tmpColumn.Name = started
+	// Under its own name the column is there for a later migration to
+	// alter before Complete has made its index a constraint. The copy that
+	// alter makes carries the constraints the table has.
+	if started == o.Column.Name && o.Column.Unique {
+		if table.UniqueConstraints == nil {
+			table.UniqueConstraints = map[string]*schema.UniqueConstraint{}
+		}
+		table.UniqueConstraints[o.Column.Name] = &schema.UniqueConstraint{
+			Name:    o.Column.Name,
+			Columns: []string{started},
+		}
+	}
 	table.AddColumn(o.Column.Name, tmpColumn)
 
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
@@ -214,10 +227,9 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	// A column that started under its own name has nothing to rename, and
-	// another operation may have duplicated it under the temporary one.
+	// The rename is a no-op for a column that started under its own name.
 	dbActions := []DBAction{
-		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name).UnlessTargetExists(),
+		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name),
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
