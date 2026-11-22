@@ -144,7 +144,13 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		table.UniqueConstraints[o.Column.Name] = &schema.UniqueConstraint{
 			Name:    o.Column.Name,
 			Columns: []string{started},
+			Pending: true,
 		}
+	}
+	// Replayed over a schema read after Start, the column keeps the default
+	// and comment it has by now: a later migration may have changed them.
+	if existing := table.Columns[o.Column.Name]; started == o.Column.Name && existing != nil && !existing.Deleted && existing.Name == started {
+		tmpColumn.Default, tmpColumn.Comment = existing.Default, existing.Comment
 	}
 	table.AddColumn(o.Column.Name, tmpColumn)
 
@@ -182,6 +188,15 @@ func (o *OpAddColumn) startedName(s *schema.Schema, table *schema.Table) string 
 		if column.Name == o.Column.Name || column.Name == temporary {
 			return temporary
 		}
+	}
+	return o.Column.Name
+}
+
+// startedNameAt returns the name the column has in a schema read from the
+// database between Start and Complete.
+func (o *OpAddColumn) startedNameAt(table *schema.Table, scope string) string {
+	if temporary := TemporaryName(scope, o.Column.Name); table.PhysicalColumn(temporary) != nil {
+		return temporary
 	}
 	return o.Column.Name
 }
@@ -234,15 +249,22 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 
-	if !o.Column.IsNullable() && o.Column.Default == nil {
+	// A column that waited for the contraction may have had its pending
+	// constraints settled since Start: by a later migration that replaced
+	// the column with a copy, or by a Complete that stopped part-way.
+	settled := func(exists bool) bool { return o.Column.Name == o.startedNameAt(table, scope) && !exists }
+
+	_, notNullPending := table.CheckConstraints[NotNullConstraintName(o.Column.Name)]
+	if !o.Column.IsNullable() && o.Column.Default == nil && !settled(notNullPending) {
 		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
 	}
 
-	if o.Column.Check != nil {
+	if o.Column.Check != nil && !settled(table.ConstraintExists(o.Column.Check.Name)) {
 		dbActions = append(dbActions, NewValidateConstraintAction(conn, table.Name, o.Column.Check.Name))
 	}
 
-	if o.Column.Unique {
+	_, uniquePending := table.Indexes[UniqueIndexName(o.Column.Name)]
+	if o.Column.Unique && !settled(uniquePending) {
 		dbActions = append(dbActions, NewAddConstraintUsingUniqueIndex(conn,
 			table.Name,
 			o.Column.Name,
@@ -258,7 +280,9 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 	if column == nil {
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column.Name}
 	}
-	if o.Column.HasDefault() && column.Default == nil {
+	// Only an `up` that repeats the default leaves the default for here; a
+	// default missing otherwise was dropped since Start, and stays dropped.
+	if o.Column.HasDefault() && column.Default == nil && o.Up == *o.Column.Default {
 		dbActions = append(dbActions, NewSetDefaultValueAction(conn, table.Name, o.Column.Name, *o.Column.Default))
 
 		// Validate the `NOT NULL` constraint on the column if necessary
@@ -464,4 +488,15 @@ func CanonicalNotNullName(table, column string) string {
 		name = name[:maxIdentLen]
 	}
 	return name
+}
+
+// refusePendingConstraint refuses an operation on a unique constraint that a
+// waiting add_column has yet to create.
+func refusePendingConstraint(table *schema.Table, name string) error {
+	if uc, ok := table.UniqueConstraints[name]; ok && uc.Pending {
+		return InvalidMigrationError{Reason: fmt.Sprintf(
+			"constraint %q on %q belongs to a column added earlier in this deployment and exists only after `pgroll complete`; change it in the next deployment",
+			name, table.Name)}
+	}
+	return nil
 }

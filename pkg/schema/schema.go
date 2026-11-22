@@ -198,6 +198,10 @@ type UniqueConstraint struct {
 
 	// The columns that the unique constraint is defined on
 	Columns []string `json:"columns"`
+
+	// Pending says the constraint does not exist yet: an add_column that
+	// waits for its train's contraction has built its index. Not persisted.
+	Pending bool `json:"-"`
 }
 
 // ExcludeConstraint represents a unique constraint on a table

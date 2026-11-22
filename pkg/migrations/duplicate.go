@@ -177,7 +177,16 @@ func (d *duplicator) Execute(ctx context.Context) error {
 	// Generate SQL to duplicate any check constraints on the columns. This may faile
 	// if the check constraint is not valid for the new column type, in which case
 	// the error is ignored.
-	for _, sql := range d.stmtBuilder.duplicateCheckConstraints(d.withoutConstraint, colNames...) {
+	// The check a waiting add_column holds its NOT NULL in is not copied for
+	// a column the schema already has as NOT NULL: the copy took its own
+	// from the column above.
+	withoutChecks := slices.Clone(d.withoutConstraint)
+	for _, c := range d.columns {
+		if !c.column.Nullable {
+			withoutChecks = append(withoutChecks, NotNullConstraintName(c.column.Name))
+		}
+	}
+	for _, sql := range d.stmtBuilder.duplicateCheckConstraints(withoutChecks, colNames...) {
 		_, err := d.conn.ExecContext(ctx, sql)
 		err = errorIgnoringErrorCode(err, undefinedFunctionErrorCode)
 		if err != nil {
@@ -223,11 +232,6 @@ func (d *duplicatorStmtBuilder) duplicateCheckConstraints(withoutConstraint []st
 	stmts := make([]string, 0, len(d.table.CheckConstraints))
 	for _, cc := range d.table.CheckConstraints {
 		if slices.Contains(withoutConstraint, cc.Name) || IsDuplicatedName(cc.Name) {
-			continue
-		}
-		// The check a waiting add_column holds its NOT NULL in: the copy
-		// gets its own from the column (see duplicateColumn).
-		if IsNotNullConstraintName(cc.Name) {
 			continue
 		}
 		if duplicatedConstraintColumns := d.duplicatedConstraintColumns(cc.Columns, colNames...); len(duplicatedConstraintColumns) > 0 {
@@ -279,7 +283,7 @@ func (d *duplicatorStmtBuilder) duplicateIndexes(withoutConstraint []string, col
 		// The index a waiting add_column's unique constraint is built from,
 		// which Start registers as the constraint it becomes.
 		if column, pending := strings.CutPrefix(idx.Name, UniqueIndexName("")); pending && idx.Unique {
-			if _, ok := d.table.UniqueConstraints[column]; ok {
+			if uc, ok := d.table.UniqueConstraints[column]; ok && uc.Pending {
 				continue
 			}
 		}

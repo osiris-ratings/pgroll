@@ -145,7 +145,9 @@ func (c triggerConfig) MigrationSession() string { return MigrationApplicationNa
 func namedColumns(columns map[string]*schema.Column, expressions []string) map[string]*schema.Column {
 	named := make(map[string]*schema.Column, len(columns))
 	for name, column := range columns {
-		if slices.ContainsFunc(expressions, func(e string) bool { return namesIdentifier(e, name) }) {
+		// A quoted identifier doubles a quote it contains.
+		quoted := strings.ReplaceAll(name, `"`, `""`)
+		if slices.ContainsFunc(expressions, func(e string) bool { return namesIdentifier(e, name) || namesIdentifier(e, quoted) }) {
 			named[name] = column
 		}
 	}

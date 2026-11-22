@@ -694,6 +694,7 @@ func r3CompleteTrainErr(mig *roll.Roll, train []*migrations.Migration) error {
 }
 
 func TestTrainMatrixDiff(t *testing.T) {
+	skipUnlessTrainMatrix(t)
 	t.Parallel()
 
 	type mode struct {
@@ -974,6 +975,7 @@ func r3TableSig(t *testing.T, db *sql.DB, table string) string {
 }
 
 func TestTrainMatrixDiffTrains(t *testing.T) {
+	skipUnlessTrainMatrix(t)
 	t.Parallel()
 	ctx := context.Background()
 	step := func(label string, fn func() error) string { return label + "=" + r3Err(r2Safely(fn)) }

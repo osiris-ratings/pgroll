@@ -166,6 +166,9 @@ func (o *OpDropMultiColumnConstraint) Validate(ctx context.Context, s *schema.Sc
 	if !table.ConstraintExists(o.Name) {
 		return ConstraintDoesNotExistError{Table: o.Table, Constraint: o.Name}
 	}
+	if err := refusePendingConstraint(table, o.Name); err != nil {
+		return err
+	}
 
 	if o.Down == nil {
 		return FieldRequiredError{Name: "down"}

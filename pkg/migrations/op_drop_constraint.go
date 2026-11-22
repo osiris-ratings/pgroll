@@ -169,6 +169,9 @@ func (o *OpDropConstraint) Validate(ctx context.Context, s *schema.Schema) error
 	if !table.ConstraintExists(o.Name) {
 		return ConstraintDoesNotExistError{Table: o.Table, Constraint: o.Name}
 	}
+	if err := refusePendingConstraint(table, o.Name); err != nil {
+		return err
+	}
 
 	columns := table.GetConstraintColumns(o.Name)
 

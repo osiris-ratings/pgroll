@@ -75,6 +75,9 @@ func (o *OpRenameConstraint) Validate(ctx context.Context, s *schema.Schema) err
 	if !table.ConstraintExists(o.From) {
 		return ConstraintDoesNotExistError{Table: o.Table, Constraint: o.From}
 	}
+	if err := refusePendingConstraint(table, o.From); err != nil {
+		return err
+	}
 
 	if table.ConstraintExists(o.To) {
 		return ConstraintAlreadyExistsError{Table: o.Table, Constraint: o.To}
