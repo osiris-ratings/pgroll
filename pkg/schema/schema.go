@@ -300,6 +300,17 @@ func (t *Table) GetColumn(name string) *Column {
 	return c
 }
 
+// PhysicalColumn returns the column with the given physical name, whatever
+// name it is keyed under, or nil.
+func (t *Table) PhysicalColumn(name string) *Column {
+	for _, c := range t.Columns {
+		if c.Name == name && !c.Deleted {
+			return c
+		}
+	}
+	return nil
+}
+
 // ConstraintExists returns true if a constraint with the given name exists
 func (t *Table) ConstraintExists(name string) bool {
 	_, ok := t.CheckConstraints[name]

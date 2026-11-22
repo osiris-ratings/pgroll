@@ -259,3 +259,11 @@ func StartOptionsSkipVersionSchema(opts ...StartOption) bool {
 	}
 	return o.skipVersionSchema
 }
+
+// DefersCompleteInTrain reports whether an earlier migration of a train
+// waits for the train's contraction to complete. rolling says a fleet on the
+// previous revision keeps writing until then, which `--complete` and
+// disabled version schemas rule out.
+func DefersCompleteInTrain(mig *migrations.Migration, rolling bool) bool {
+	return mig.CompleteMustBeDeferred() || (rolling && mig.FillsPreviousRevisionWrites())
+}

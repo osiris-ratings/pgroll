@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -41,6 +42,8 @@ type triggerConfig struct {
 	TargetFunction      string
 	SQL                 []string
 	NeedsBackfillColumn string
+	// KeepsUnpinnedWrites: see OperationTrigger.
+	KeepsUnpinnedWrites bool
 	// MigrationScope is the per-migration suffix used when naming the
 	// marker column. Empty scope produces the legacy unscoped marker.
 	MigrationScope string
@@ -53,6 +56,12 @@ type OperationTrigger struct {
 	TableName      string
 	PhysicalColumn string
 	SQL            string
+	// KeepsUnpinnedWrites is for a column that sessions on the migrated
+	// schema itself can already name: pgroll's own, running a later
+	// migration, or anything else not pinned to a version schema. Their
+	// write keeps the value it gave the column. The expression still fills
+	// an insert that gave none and a row the backfill has not reached.
+	KeepsUnpinnedWrites bool
 }
 
 type createTriggerAction struct {
@@ -100,7 +109,55 @@ func (a *createTriggerAction) execute(ctx context.Context) error {
 }
 
 func buildFunction(cfg triggerConfig) (string, error) {
+	cfg.Columns = namedColumns(cfg.Columns, cfg.SQL)
 	return executeTemplate("function", templates.Function, cfg)
+}
+
+// PinnedPattern is the LIKE pattern of a search_path pinned to one of the
+// schema's version schemas.
+func (c triggerConfig) PinnedPattern() string {
+	return strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`).Replace(c.SchemaName) + `\_%`
+}
+
+// namedColumns returns the columns whose name appears in one of the
+// expressions. The function declares a variable for each, read from the row,
+// so one it never reads must not be declared: another migration may rename
+// or drop that column while the function is live. The match is by text, so
+// it can keep a column the expressions do not read, never drop one they do.
+func namedColumns(columns map[string]*schema.Column, expressions []string) map[string]*schema.Column {
+	named := make(map[string]*schema.Column, len(columns))
+	for name, column := range columns {
+		if slices.ContainsFunc(expressions, func(e string) bool { return namesIdentifier(e, name) }) {
+			named[name] = column
+		}
+	}
+	return named
+}
+
+// namesIdentifier reports whether expression contains name as a whole
+// identifier, in any letter case.
+func namesIdentifier(expression, name string) bool {
+	if name == "" {
+		return false
+	}
+	expression, name = strings.ToLower(expression), strings.ToLower(name)
+	for from := 0; ; {
+		i := strings.Index(expression[from:], name)
+		if i < 0 {
+			return false
+		}
+		start, end := from+i, from+i+len(name)
+		if (start == 0 || !isIdentifierByte(expression[start-1])) &&
+			(end == len(expression) || !isIdentifierByte(expression[end])) {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+func isIdentifierByte(b byte) bool {
+	return b == '_' || b == '$' || b >= 0x80 ||
+		(b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 func buildTrigger(cfg triggerConfig) (string, error) {
@@ -113,9 +170,6 @@ func executeTemplate(name, content string, cfg triggerConfig) (string, error) {
 		Funcs(template.FuncMap{
 			"ql": pq.QuoteLiteral,
 			"qi": pq.QuoteIdentifier,
-			// pgroll's own columns come and go under a live function, and no
-			// `up` or `down` expression names one.
-			"internal": func(name string) bool { return strings.HasPrefix(name, "_pgroll_") },
 		}).
 		Parse(content))
 
@@ -132,12 +186,21 @@ func executeTemplate(name, content string, cfg triggerConfig) (string, error) {
 // concurrently-deferred migrations operating on the same (table, col)
 // from clobbering each other's trigger functions, which is what would
 // happen with the legacy unscoped name.
+//
+// Postgres cuts an identifier at 63 bytes, which would drop the scope and
+// part of the column from a long name, so a name that long carries a digest
+// of the table and column instead.
 func TriggerFunctionName(scope, tableName, columnName string) string {
-	base := "_pgroll_trigger_" + tableName + "_" + columnName
-	if scope == "" {
-		return base
+	const prefix, maxIdentifier = "_pgroll_trigger_", 63
+	suffix := ""
+	if scope != "" {
+		suffix = "_" + scope
 	}
-	return base + "_" + scope
+	if name := prefix + tableName + "_" + columnName + suffix; len(name) <= maxIdentifier {
+		return name
+	}
+	sum := sha256.Sum256([]byte(tableName + "\x00" + columnName))
+	return prefix + hex.EncodeToString(sum[:12]) + suffix
 }
 
 // TriggerName returns the per-migration name of the trigger for a given
@@ -166,53 +229,4 @@ func OrderedTriggerName(direction TriggerDirection, position, index int, functio
 	}
 	sum := sha256.Sum256([]byte(functionName))
 	return fmt.Sprintf("_pgroll_trigger_%s_%03d_%s", key, min(max(index, 0), 999), hex.EncodeToString(sum[:8]))
-}
-
-// RetargetTrigger renames the column a trigger fills and rebuilds the trigger
-// function to write it under its new name, in one transaction, so no write
-// sees the function and the column disagree. trigger.PhysicalColumn is the
-// new name. A re-run after the rename has landed only rebuilds the function.
-// The rebuilt function follows the train's target and leaves the backfill
-// marker alone: the backfill is over by the time a trigger is kept.
-func RetargetTrigger(ctx context.Context, conn db.DB, schemaName, scope string, trigger OperationTrigger, from string) error {
-	cfg := triggerConfig{
-		Name:           trigger.Name,
-		Direction:      trigger.Direction,
-		Columns:        trigger.Columns,
-		SchemaName:     schemaName,
-		TableName:      trigger.TableName,
-		PhysicalColumn: trigger.PhysicalColumn,
-		TargetFunction: TrainTargetFunction,
-		SQL:            []string{trigger.SQL},
-		MigrationScope: scope,
-	}
-	if sql := cfg.SQL[0]; len(sql) > 0 && sql[0] != '(' {
-		cfg.SQL[0] = "(" + sql + ")"
-	}
-	funcSQL, err := buildFunction(cfg)
-	if err != nil {
-		return err
-	}
-
-	return conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		var pending bool
-		if err := tx.QueryRowContext(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM pg_attribute
-				WHERE attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
-				AND attname = $3 AND NOT attisdropped)`,
-			schemaName, trigger.TableName, from).Scan(&pending); err != nil {
-			return err
-		}
-		if pending {
-			if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-				pq.QuoteIdentifier(trigger.TableName),
-				pq.QuoteIdentifier(from),
-				pq.QuoteIdentifier(trigger.PhysicalColumn))); err != nil {
-				return err
-			}
-		}
-		_, err := tx.ExecContext(ctx, funcSQL)
-		return err
-	})
 }

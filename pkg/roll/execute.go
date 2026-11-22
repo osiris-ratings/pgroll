@@ -142,6 +142,8 @@ func (m *Roll) replayPending(ctx context.Context, s *schema.Schema, exclude []st
 	// names that this migration soft-deleted), then for each migration's
 	// soft-deletes, fold the physical entry back to the un-prefixed key
 	// so the replay can find it.
+	type softDeleted struct{ name, key string }
+	recreated := map[string][]softDeleted{}
 	for _, dm := range deferred {
 		dmScope := migrations.MigrationScopeFor(dm.Name)
 		suffix := "_pgroll_del_"
@@ -160,7 +162,13 @@ func (m *Roll) replayPending(ctx context.Context, s *schema.Schema, exclude []st
 				continue
 			}
 			orig := strings.TrimSuffix(rest, scopeTail)
+			if k == orig {
+				continue // folded back earlier in this loop
+			}
 			if _, exists := s.Tables[orig]; exists {
+				// A later migration created a table with the dropped one's
+				// name. The drop's replay must not take it for its own.
+				recreated[dm.Name] = append(recreated[dm.Name], softDeleted{name: orig, key: k})
 				continue
 			}
 			s.Tables[orig] = t
@@ -171,10 +179,29 @@ func (m *Roll) replayPending(ctx context.Context, s *schema.Schema, exclude []st
 	// Replay each deferred migration's Start with its own scope set on
 	// the schema, so naming helpers inside op.Start produce identifiers
 	// matching what's physically present in the database.
+	// Up to the drop's replay the name means the dropped table, to the drop
+	// and to every migration before it; afterwards, the recreated one.
+	newer := map[string]*schema.Table{}
+	for _, dropped := range recreated {
+		for _, d := range dropped {
+			if _, seen := newer[d.name]; seen {
+				continue
+			}
+			newer[d.name] = s.Tables[d.name]
+			s.Tables[d.name] = s.Tables[d.key]
+			delete(s.Tables, d.key)
+		}
+	}
 	for _, dm := range deferred {
 		s.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 		if err := dm.UpdateVirtualSchema(ctx, s); err != nil {
 			return nil, fmt.Errorf("unable to apply deferred virtual schema for %q: %w", dm.Name, err)
+		}
+		for _, d := range recreated[dm.Name] {
+			if table, ok := newer[d.name]; ok {
+				s.Tables[d.name] = table
+				delete(newer, d.name)
+			}
 		}
 	}
 	// Reset to empty so subsequent helper calls don't accidentally use
@@ -306,13 +333,20 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
 	// An earlier migration of a train projects no schema of its own; the new
 	// revision pins the train's last one. The train's triggers read it from
-	// one function, so a train resumed with a different last migration
-	// re-keys the triggers already installed.
-	if o.trainTarget != nil {
+	// one function, so a Start that changes what the new revision pins (a
+	// train resumed with a different last migration, or a migration started
+	// alone on top of a train that stopped part-way) re-keys the triggers
+	// already installed.
+	followsTarget := o.trainTarget != nil
+	if followsTarget {
 		versionSchemaName = VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())
-		if err := m.setTrainTarget(ctx, versionSchemaName); err != nil {
+	}
+	if followsTarget || (!o.skipVersionSchema && !m.disableVersionSchemas) {
+		retargeted, err := m.retargetTrain(ctx, versionSchemaName)
+		if err != nil {
 			return nil, err
 		}
+		followsTarget = followsTarget || retargeted
 	}
 
 	// Reread the latest schema as validation may have updated the schema object
@@ -339,7 +373,7 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 		return nil, fmt.Errorf("unable to read the migrations still expanded: %w", err)
 	}
 	job.Position = len(unsealed)
-	if o.trainTarget != nil {
+	if followsTarget {
 		job.TargetFunction = backfill.TrainTargetFunction
 	}
 	for _, op := range migration.Operations {
@@ -378,6 +412,13 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 		}
 		if startOp.BackfillTask != nil {
 			job.AddTask(startOp.BackfillTask)
+		}
+	}
+
+	// The function exists only while a trigger reads it.
+	if followsTarget && job.HasTriggers() {
+		if err := m.setTrainTarget(ctx, versionSchemaName); err != nil {
+			return nil, err
 		}
 	}
 
@@ -437,10 +478,6 @@ func (m *Roll) ensureViews(ctx context.Context, schema *schema.Schema, mig *migr
 type completeOptions struct {
 	skipSchemaDrop bool
 	deferComplete  bool
-
-	// The train's last migration, when this Complete is for an earlier one;
-	// see WithTriggersKeptFor.
-	trainTarget *migrations.Migration
 }
 
 // CompleteOption is a functional option for the Complete method.
@@ -454,14 +491,6 @@ type CompleteOption func(*completeOptions)
 // also defers the operations themselves.
 func WithSkipSchemaDrop() CompleteOption {
 	return func(o *completeOptions) { o.skipSchemaDrop = true }
-}
-
-// WithTriggersKeptFor completes an earlier migration of a train inline while
-// keeping the triggers the previous revision's writes need, keyed on the
-// version schema of the train's last migration. The train's contraction
-// removes them.
-func WithTriggersKeptFor(final *migrations.Migration) CompleteOption {
-	return func(o *completeOptions) { o.trainTarget = final }
 }
 
 // WithDeferComplete returns a CompleteOption that records the migration as
@@ -575,11 +604,6 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	// never touch what they reference, and onComplete raw SQL runs in place,
 	// with the views checked and rebuilt after it (see drainDeferredMigration).
 	if !o.skipSchemaDrop {
-		// Before the drain, which can drop a column a kept trigger reads.
-		if err := m.retireKeptTriggers(ctx); err != nil {
-			return err
-		}
-
 		queued, err := m.state.DeferredCompletes(ctx, m.schema)
 		if err != nil {
 			return fmt.Errorf("unable to query deferred completes: %w", err)
@@ -642,12 +666,7 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	refreshViews := false
 	var actions []migrations.DBAction
 	for _, op := range migration.Operations {
-		var opActions []migrations.DBAction
-		if keeper, ok := op.(migrations.TrainTriggerKeeper); ok && o.trainTarget != nil {
-			opActions, err = keeper.CompleteKeepingTriggers(m.logger, m.pgConn, currentSchema)
-		} else {
-			opActions, err = op.Complete(m.logger, m.pgConn, currentSchema)
-		}
+		opActions, err := op.Complete(m.logger, m.pgConn, currentSchema)
 		if err != nil {
 			return fmt.Errorf("unable to collect actions for complete operation: %w", err)
 		}
@@ -658,21 +677,9 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		}
 	}
 
-	if o.trainTarget != nil {
-		if err := m.setTrainTarget(ctx, VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())); err != nil {
-			return err
-		}
-	}
-
 	coordinator := migrations.NewCoordinator(actions)
 	if err := coordinator.ExecuteWithRecovery(ctx, m.viewConflictRecovery(guard, migration)); err != nil {
 		return fmt.Errorf("unable to execute complete operation: %w", err)
-	}
-
-	if o.trainTarget != nil {
-		if err := m.rebuildKeptTriggers(ctx, migration); err != nil {
-			return err
-		}
 	}
 
 	// Check the live views against the schema they now project, before the
@@ -717,42 +724,40 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 	return nil
 }
 
-// setTrainTarget points the train's triggers at versionSchema.
+// setTrainTarget points the train's triggers at versionSchema. Every role
+// that writes a table calls the function through the table's triggers.
 func (m *Roll) setTrainTarget(ctx context.Context, versionSchema string) error {
-	_, err := m.pgConn.ExecContext(ctx, fmt.Sprintf(
-		"CREATE OR REPLACE FUNCTION %s.%s() RETURNS text LANGUAGE sql STABLE AS %s",
-		pq.QuoteIdentifier(m.schema),
-		pq.QuoteIdentifier(backfill.TrainTargetFunction),
-		pq.QuoteLiteral("SELECT "+pq.QuoteLiteral(versionSchema)+"::text"),
-	))
-	if err != nil {
-		return fmt.Errorf("unable to set the train's target schema: %w", err)
+	function := pq.QuoteIdentifier(m.schema) + "." + pq.QuoteIdentifier(backfill.TrainTargetFunction)
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE OR REPLACE FUNCTION %s() RETURNS text LANGUAGE sql STABLE AS %s",
+			function, pq.QuoteLiteral("SELECT "+pq.QuoteLiteral(versionSchema)+"::text")),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION %s() TO PUBLIC", function),
+	} {
+		if _, err := m.pgConn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("unable to set the train's target schema: %w", err)
+		}
 	}
 	return nil
 }
 
-// retargetTrain points a train's remaining triggers at versionSchema, when a
-// train is in flight.
-func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) error {
+// retargetTrain points a train's remaining triggers at versionSchema, and
+// reports whether a train with triggers is in flight.
+func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) (bool, error) {
 	exists, err := m.queryBool(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 			WHERE n.nspname = $1 AND p.proname = $2)`,
 		m.schema, backfill.TrainTargetFunction)
 	if err != nil || !exists {
-		return err
+		return false, err
 	}
-	return m.setTrainTarget(ctx, versionSchema)
+	return true, m.setTrainTarget(ctx, versionSchema)
 }
 
 // dropTrainTargetIfUnused removes the train's target function once no
 // trigger function is left to call it.
 func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
-	inUse, err := m.queryBool(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%')`,
-		m.schema)
+	inUse, err := m.hasTriggerFunctions(ctx)
 	if err != nil || inUse {
 		return err
 	}
@@ -761,55 +766,14 @@ func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
 	return err
 }
 
-// retireKeptTriggers removes the triggers that the train's inline-completed
-// migrations kept for the previous revision (WithTriggersKeptFor). The train
-// is the unsealed window; contraction ends it.
-func (m *Roll) retireKeptTriggers(ctx context.Context) error {
-	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
-	if err != nil {
-		return err
-	}
-	for _, record := range unsealed {
-		if !record.Done || record.CompleteDeferred {
-			continue
-		}
-		scope := migrations.MigrationScopeFor(record.Migration.Name)
-		for _, op := range record.Migration.Operations {
-			keeper, ok := op.(migrations.TrainTriggerKeeper)
-			if !ok {
-				continue
-			}
-			if err := migrations.NewCoordinator(keeper.RetireTriggers(m.pgConn, scope)).Execute(ctx); err != nil {
-				return fmt.Errorf("unable to retire the triggers of %q: %w", record.Migration.Name, err)
-			}
-		}
-	}
-	return nil
-}
-
-// rebuildKeptTriggers rebuilds the triggers migration kept, now that all of
-// its operations have completed and its columns carry their final names.
-func (m *Roll) rebuildKeptTriggers(ctx context.Context, migration *migrations.Migration) error {
-	var actions []migrations.DBAction
-	var sch *schema.Schema
-	for _, op := range migration.Operations {
-		keeper, ok := op.(migrations.TrainTriggerKeeper)
-		if !ok {
-			continue
-		}
-		if sch == nil {
-			var err error
-			if sch, err = m.readSchemaWithDeferredExcluding(ctx, migration.Name); err != nil {
-				return fmt.Errorf("unable to read schema: %w", err)
-			}
-			sch.MigrationScope = migrations.MigrationScopeFor(migration.Name)
-		}
-		actions = append(actions, keeper.RebuildKeptTriggers(m.pgConn, sch)...)
-	}
-	if err := migrations.NewCoordinator(actions).Execute(ctx); err != nil {
-		return fmt.Errorf("unable to rebuild the triggers %q keeps: %w", migration.Name, err)
-	}
-	return nil
+// hasTriggerFunctions reports whether any migration's trigger function is
+// installed in the schema.
+func (m *Roll) hasTriggerFunctions(ctx context.Context) (bool, error) {
+	return m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%')`,
+		m.schema)
 }
 
 // Rollback will revert the changes made by the migration
@@ -933,10 +897,21 @@ func (m *Roll) applyDeferredRenames(ctx context.Context, s *schema.Schema, exclu
 		// to match readSchemaWithDeferred's discipline.
 		s.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 		for _, op := range dm.Operations {
-			switch op.(type) {
+			switch op := op.(type) {
 			case *migrations.OpRenameTable, *migrations.OpRenameColumn:
 				if _, err := op.Start(ctx, migrations.NewNoopLogger(), fake, s); err != nil {
 					return fmt.Errorf("unable to replay deferred rename from %q: %w", dm.Name, err)
+				}
+			case *migrations.OpAddColumn:
+				// A deferred column can be in the snapshot under its
+				// temporary name only, and a later operation names it by its
+				// own.
+				op.AdoptStartedColumn(s)
+			case *migrations.OpDropColumn:
+				// The column is still there physically, and a later
+				// add_column of the same name starts beside it.
+				if table := s.GetTable(op.Table); table != nil {
+					table.RemoveColumn(op.Column)
 				}
 			}
 		}
@@ -1151,6 +1126,9 @@ func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migrati
 	if err := m.reviveFromSnapshot(ctx, dm, drainSchema, false); err != nil {
 		return err
 	}
+	if err := m.resolveTablesDroppedLater(ctx, drainSchema, dm); err != nil {
+		return err
+	}
 	drainSchema.MigrationScope = migrations.MigrationScopeFor(dm.Name)
 
 	var actions []migrations.DBAction
@@ -1170,6 +1148,48 @@ func (m *Roll) applyDeferredComplete(ctx context.Context, dm *migrations.Migrati
 		return fmt.Errorf("unable to execute deferred complete %q: %w", dm.Name, err)
 	}
 
+	return nil
+}
+
+// resolveTablesDroppedLater keys, in s, each table a later migration of the
+// train drops under the name dm knew it by. The drop renamed the table at
+// its Start, and the name may since belong to a table created after dm.
+func (m *Roll) resolveTablesDroppedLater(ctx context.Context, s *schema.Schema, dm *migrations.Migration) error {
+	queued, err := m.state.DeferredCompletes(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to query deferred completes: %w", err)
+	}
+	at := slices.IndexFunc(queued, func(q *migrations.Migration) bool { return q.Name == dm.Name })
+	if at < 0 {
+		return nil
+	}
+	later := queued[at+1:]
+	active, err := m.state.IsActiveMigrationPeriod(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to determine active migration period: %w", err)
+	}
+	if active {
+		leaf, err := m.state.GetActiveMigration(ctx, m.schema)
+		if err != nil {
+			return fmt.Errorf("unable to get active migration: %w", err)
+		}
+		later = append(slices.Clone(later), leaf)
+	}
+
+	resolved := map[string]bool{}
+	for _, q := range later {
+		scope := migrations.MigrationScopeFor(q.Name)
+		for _, op := range q.Operations {
+			drop, ok := op.(*migrations.OpDropTable)
+			if !ok || resolved[drop.Name] {
+				continue
+			}
+			if dropped, ok := s.Tables[migrations.DeletionName(scope, drop.Name)]; ok {
+				s.Tables[drop.Name] = dropped
+				resolved[drop.Name] = true
+			}
+		}
+	}
 	return nil
 }
 

@@ -197,24 +197,6 @@ func (m *RawMigration) SelectedBy(t string) bool {
 	return slices.Contains(m.Targets, t)
 }
 
-// TrainTriggerKeeper is implemented by operations that complete inline in the
-// middle of a train but whose triggers the previous revision's writes still
-// need until the train contracts.
-type TrainTriggerKeeper interface {
-	// CompleteKeepingTriggers returns the Complete actions with the trigger
-	// kept.
-	CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error)
-
-	// RebuildKeptTriggers returns the actions that rebuild the kept triggers
-	// against s, read once every operation of the migration has completed.
-	RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction
-
-	// RetireTriggers returns the actions that remove what
-	// CompleteKeepingTriggers kept for the migration with this scope. They
-	// are safe to run when nothing was kept.
-	RetireTriggers(conn db.DB, scope string) []DBAction
-}
-
 // VersionSchemaName returns the version schema name for the migration.
 // It defaults to the migration name if no version schema is set.
 func (m *Migration) VersionSchemaName() string {
@@ -338,6 +320,19 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	// the next layer's Start duplicates the column — deferring it loses
 	// earlier layers' constraints at drain time. Post-complete revert is
 	// handled via its RollbackCompleted implementation instead.
+	return false
+}
+
+// FillsPreviousRevisionWrites reports whether completing this migration
+// would drop a trigger the previous revision's writes need: an add column
+// whose `up` fills the column. A train that rolls a fleet defers it to the
+// contraction, and raw SQL later in that train cannot name the column.
+func (m *Migration) FillsPreviousRevisionWrites() bool {
+	for _, op := range m.Operations {
+		if add, ok := op.(*OpAddColumn); ok && add.fillsPreviousRevisionWrites() {
+			return true
+		}
+	}
 	return false
 }
 

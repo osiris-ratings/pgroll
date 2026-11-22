@@ -416,6 +416,9 @@ func TestContractionLiveSchemaSurvivesEveryFault(t *testing.T) {
 							t.Parallel()
 							withFixture(t, func(mig *roll.Roll, db *sql.DB) {
 								live, views := applyCase(t, mig, db, c, p)
+								// Columns added with `up` wait for the contraction
+								// under their temporary names.
+								pending := orphanedDuplicates(t, db)
 
 								ctx, cancel := context.WithCancel(context.Background())
 								defer cancel()
@@ -431,7 +434,7 @@ func TestContractionLiveSchemaSurvivesEveryFault(t *testing.T) {
 									"after a fault at statement %d of %d (%s); contraction returned %v",
 									n, k, fc.fired, faultErr,
 								))
-								assert.Empty(t, orphanedDuplicates(t, db), "a duplicator tail left half done "+
+								assert.Subset(t, pending, orphanedDuplicates(t, db), "a duplicator tail left half done "+
 									"after a fault at statement %d of %d (%s)", n, k, fc.fired)
 
 								require.NoError(t, pgrollComplete(context.Background(), mig),

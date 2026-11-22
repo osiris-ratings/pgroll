@@ -343,11 +343,11 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 		if err := m.Start(ctx, inv, cfg, WithoutVersionSchema(), target); err != nil {
 			return nil, fmt.Errorf("unable to start inverse migration %q: %w", inv.Name, err)
 		}
-		completeOpts := []CompleteOption{WithSkipSchemaDrop(), WithTriggersKeptFor(last)}
-		if inv.CompleteMustBeDeferred() {
-			completeOpts = []CompleteOption{WithDeferComplete()}
+		completeOpt := WithSkipSchemaDrop()
+		if DefersCompleteInTrain(inv, o.expandOnly && !m.disableVersionSchemas) {
+			completeOpt = WithDeferComplete()
 		}
-		if err := m.Complete(ctx, completeOpts...); err != nil {
+		if err := m.Complete(ctx, completeOpt); err != nil {
 			return nil, fmt.Errorf("unable to complete inverse migration %q: %w", inv.Name, err)
 		}
 	}

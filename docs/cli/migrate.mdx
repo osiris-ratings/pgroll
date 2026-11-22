@@ -42,7 +42,7 @@ will cause the command to fail if more than one unapplied migration is detected.
 
 ## An Open Train
 
-`pgroll migrate` and `pgroll start` refuse to run when earlier migrations are applied but not contracted, nothing is in progress, and the latest migration's version schema exists. Applications running on that schema would be a third revision beside the previous deployment's and the new one's, and the triggers of the migrations still expanded can tell only two apart.
+`pgroll migrate` and `pgroll start` refuse to run when earlier migrations are applied but not contracted, one of them still has a trigger installed, nothing is in progress, and the latest migration's version schema exists. Applications running on that schema would be a third revision beside the previous deployment's and the new one's, and the triggers of the migrations still expanded can tell only two apart.
 
 A bounded `pgroll revert --to` leaves this state. Run `pgroll complete` to contract the open migrations first, or `pgroll revert` to undo them.
 

@@ -38,10 +38,7 @@ func TestBuildFunction(t *testing.T) {
     LANGUAGE PLPGSQL
     AS $$
     DECLARE
-      "id" "public"."reviews"."id"%TYPE := NEW."id";
       "product" "public"."reviews"."product"%TYPE := NEW."product";
-      "review" "public"."reviews"."review"%TYPE := NEW."review";
-      "username" "public"."reviews"."username"%TYPE := NEW."username";
       latest_schema text;
       search_path text;
     BEGIN
@@ -84,10 +81,8 @@ func TestBuildFunction(t *testing.T) {
     LANGUAGE PLPGSQL
     AS $$
     DECLARE
-      "id" "public"."reviews"."id"%TYPE := NEW."id";
       "product" "public"."reviews"."product"%TYPE := NEW."product";
       "review" "public"."reviews"."review"%TYPE := NEW."review";
-      "username" "public"."reviews"."username"%TYPE := NEW."username";
       latest_schema text;
       search_path text;
     BEGIN
@@ -128,10 +123,6 @@ func TestBuildFunction(t *testing.T) {
     LANGUAGE PLPGSQL
     AS $$
     DECLARE
-      "id" "public"."reviews"."id"%TYPE := NEW."id";
-      "product" "public"."reviews"."product"%TYPE := NEW."product";
-      "review" "public"."reviews"."review"%TYPE := NEW."review";
-      "username" "public"."reviews"."username"%TYPE := NEW."username";
       latest_schema text;
       search_path text;
     BEGIN
@@ -172,11 +163,7 @@ func TestBuildFunction(t *testing.T) {
     LANGUAGE PLPGSQL
     AS $$
     DECLARE
-      "id" "public"."reviews"."id"%TYPE := NEW."id";
-      "product" "public"."reviews"."product"%TYPE := NEW."product";
       "rating" "public"."reviews"."_pgroll_new_rating"%TYPE := NEW."_pgroll_new_rating";
-      "review" "public"."reviews"."review"%TYPE := NEW."review";
-      "username" "public"."reviews"."username"%TYPE := NEW."username";
       latest_schema text;
       search_path text;
     BEGIN
@@ -237,4 +224,63 @@ func TestBuildTrigger(t *testing.T) {
 			assert.Equal(t, tc.expected, sql)
 		})
 	}
+}
+
+func TestNamesIdentifier(t *testing.T) {
+	for _, tc := range []struct {
+		expression, name string
+		want             bool
+	}{
+		{"tin IS NOT NULL", "tin", true},
+		{"TIN IS NOT NULL", "tin", true},
+		{`COALESCE("Status", 'x')`, "Status", true},
+		{"(SELECT s.id FROM s WHERE s.id = session_id)", "session_id", true},
+		{"(SELECT s.id FROM s WHERE s.id = session_id)", "session", false},
+		{`NEW."_pgroll_new_review"`, "review", false},
+		{"x + 1", "_pgroll_needs_backfill_abc", false},
+		{"lower(x)", "", false},
+	} {
+		assert.Equal(t, tc.want, namesIdentifier(tc.expression, tc.name), "%q in %q", tc.name, tc.expression)
+	}
+}
+
+func TestBuildFunctionKeepingUnpinnedWrites(t *testing.T) {
+	sql, err := buildFunction(triggerConfig{
+		Name:                "triggerName",
+		Direction:           TriggerDirectionUp,
+		Columns:             map[string]*schema.Column{"x": {Name: "x"}, "a": {Name: "a"}},
+		SchemaName:          "my_app",
+		TargetFunction:      TrainTargetFunction,
+		TableName:           "w",
+		PhysicalColumn:      "a",
+		NeedsBackfillColumn: NeedsBackfillColumnName("abc"),
+		KeepsUnpinnedWrites: true,
+		SQL:                 []string{"(x + 1)"},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, `CREATE OR REPLACE FUNCTION "triggerName"()
+    RETURNS TRIGGER
+    LANGUAGE PLPGSQL
+    AS $$
+    DECLARE
+      "x" "my_app"."w"."x"%TYPE := NEW."x";
+      latest_schema text;
+      search_path text;
+    BEGIN
+      SELECT current_setting
+        INTO search_path
+        FROM current_setting('search_path');
+
+      IF search_path != "my_app"."_pgroll_train_target"() THEN
+        IF search_path LIKE  E'my\\_app\\_%'
+          OR (TG_OP = 'INSERT' AND NEW."a" IS NULL)
+          OR (TG_OP = 'UPDATE' AND NEW."_pgroll_needs_backfill_abc" IS NOT FALSE) THEN
+          NEW."a" = (x + 1);
+        END IF;
+        NEW."_pgroll_needs_backfill_abc" = false;
+      END IF;
+
+      RETURN NEW;
+    END; $$
+`, sql)
 }

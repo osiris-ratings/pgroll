@@ -293,10 +293,12 @@ func migrateCmd() *cobra.Command {
 			//     blocked by the prev-prod version schema's views (DROP/
 			//     RENAME of user-facing identifiers, OnComplete=true raw
 			//     SQL). Their actions queue and replay at final Complete
-			//     after the prev-prod schema is dropped.
-			//   - WithSkipSchemaDrop for additive migrations (add column/
-			//     index/constraint, create table, alter column, regular
-			//     raw SQL). Their Completes touch only pgroll-internal
+			//     after the prev-prod schema is dropped. So do the actions
+			//     of an add column whose `up` fills the column for the
+			//     previous revision's writes, while a fleet rolls: its
+			//     Complete drops the trigger those writes need.
+			//   - WithSkipSchemaDrop for the other additive migrations (add
+			//     column/index/constraint, create table, regular raw SQL). Their Completes touch only pgroll-internal
 			//     temp names and trigger machinery, which prev-prod views
 			//     don't reference — running inline is safer than deferring
 			//     because it avoids cross-migration interactions on shared
@@ -315,23 +317,22 @@ func migrateCmd() *cobra.Command {
 			// train tells the revisions apart by the last one. With
 			// --complete nothing is pinned and the triggers go inline.
 			final := migs[len(migs)-1]
+			rolling := !complete && m.UseVersionSchema()
 			trainOpts := []migrationOption{satisfiedDeps}
-			if !complete {
+			if rolling {
 				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
 			}
 			for _, mig := range migs[:len(migs)-1] {
-				completeOpts := []migrationOption{AsCompleteOption(roll.WithSkipSchemaDrop())}
-				if !complete {
-					completeOpts = append(completeOpts, AsCompleteOption(roll.WithTriggersKeptFor(final)))
-				}
-				if mig.CompleteMustBeDeferred() {
-					completeOpts = []migrationOption{AsCompleteOption(roll.WithDeferComplete())}
+				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
+				if roll.DefersCompleteInTrain(mig, rolling) {
+					completeOpt = AsCompleteOption(roll.WithDeferComplete())
 				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
-					append(append([]migrationOption{
+					append([]migrationOption{
 						AsStartOption(roll.WithoutVersionSchema()),
-					}, trainOpts...), completeOpts...)...,
+						completeOpt,
+					}, trainOpts...)...,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}

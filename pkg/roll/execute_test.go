@@ -2217,7 +2217,7 @@ func simulateMigrate(t *testing.T, mig *roll.Roll, ms []*migrations.Migration) {
 		require.NoError(t, mig.Start(ctx, m, cfg, roll.WithoutVersionSchema()),
 			"intermediate %d %q Start", i, m.Name)
 		opt := roll.WithSkipSchemaDrop()
-		if m.CompleteMustBeDeferred() {
+		if roll.DefersCompleteInTrain(m, true) {
 			opt = roll.WithDeferComplete()
 		}
 		require.NoError(t, mig.Complete(ctx, opt),

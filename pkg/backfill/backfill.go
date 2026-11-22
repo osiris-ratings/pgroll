@@ -125,6 +125,7 @@ func (j *Job) AddTask(t *Task) {
 				LatestSchema:        j.latestSchema,
 				TargetFunction:      j.TargetFunction,
 				SQL:                 []string{trigger.SQL},
+				KeepsUnpinnedWrites: trigger.KeepsUnpinnedWrites,
 				NeedsBackfillColumn: NeedsBackfillColumnName(j.migrationScope),
 				MigrationScope:      j.migrationScope,
 			}
@@ -164,6 +165,11 @@ func New(conn db.DB, c *Config, scope string) *Backfill {
 	}
 
 	return b
+}
+
+// HasTriggers reports whether the job installs any trigger.
+func (j *Job) HasTriggers() bool {
+	return len(j.triggers) > 0
 }
 
 // CreateTriggers creates the triggers for the tables before starting the backfill.

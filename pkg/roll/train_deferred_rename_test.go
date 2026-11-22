@@ -212,9 +212,10 @@ func TestTrainDeferredRenameThenInlineDependents(t *testing.T) {
 		{
 			name: "add_not_null_column",
 			op: &migrations.OpAddColumn{
-				Table:  "onboarding_templates",
-				Up:     "'us'",
-				Column: migrations.Column{Name: "region", Type: "text", Nullable: false},
+				Table: "onboarding_templates",
+				// `up` repeats a volatile default, so the column completes inline.
+				Up:     "md5(random()::text)",
+				Column: migrations.Column{Name: "region", Type: "text", Nullable: false, Default: ptr("md5(random()::text)")},
 			},
 			verifyPre: func(t *testing.T, db *sql.DB) {
 				require.Contains(t, columnNames(t, db, cSchema, "onboarding_configurations"), "region")

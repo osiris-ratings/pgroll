@@ -9,9 +9,9 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
     DECLARE
       {{- $schemaName := .SchemaName  }}
       {{- $tableName := .TableName  }}
-      {{ range $name, $col := .Columns }}{{ if not (internal $name) }} 
+      {{ range $name, $col := .Columns }} 
       {{- $name | qi }} {{ $schemaName | qi }}.{{ $tableName | qi}}.{{ $col.Name | qi }}%TYPE := NEW.{{ $col.Name | qi }};
-      {{ end }}{{ end -}}
+      {{ end -}}
       latest_schema text;
       search_path text;
     BEGIN
@@ -20,12 +20,19 @@ const Function = `CREATE OR REPLACE FUNCTION {{ .Name | qi }}()
         FROM current_setting('search_path');
 
       IF search_path {{- if eq .Direction "up" }} != {{- else }} = {{- end }} {{ if .TargetFunction }}{{ .SchemaName | qi }}.{{ .TargetFunction | qi }}(){{ else }}{{ .LatestSchema | ql }}{{ end }} THEN
-      {{- $physicalColumn := .PhysicalColumn | qi  }}{{ range $s := .SQL }}
+      {{- $physicalColumn := .PhysicalColumn | qi  }}
+      {{- if .KeepsUnpinnedWrites }}
+        IF search_path LIKE {{ .PinnedPattern | ql }}
+          OR (TG_OP = 'INSERT' AND NEW.{{ $physicalColumn }} IS NULL)
+          OR (TG_OP = 'UPDATE' AND NEW.{{ .NeedsBackfillColumn | qi }} IS NOT FALSE) THEN
+        {{- range $s := .SQL }}
+          NEW.{{ $physicalColumn  }} = {{ $s }};
+        {{- end }}
+        END IF;
+      {{- else }}{{ range $s := .SQL }}
         NEW.{{ $physicalColumn  }} = {{ $s }};
-      {{- end }}
-      {{- if .NeedsBackfillColumn }}
+      {{- end }}{{ end }}
         NEW.{{ .NeedsBackfillColumn | qi }} = false;
-      {{- end }}
       END IF;
 
       RETURN NEW;

@@ -4,6 +4,7 @@ package migrations
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -125,14 +126,60 @@ func NewRenameTableAction(conn db.DB, from, to string) *renameTableAction {
 
 func (a *renameTableAction) ID() string { return a.id }
 
+// Execute renames the table and, in the same transaction, the table in the
+// trigger functions pgroll has on it: they declare their variables by the
+// table's name, and the previous revision keeps writing through them.
 func (a *renameTableAction) Execute(ctx context.Context) error {
-	// Already idempotent on re-run: the IF EXISTS guards the source table, so a
-	// rename a previous interrupted `complete` already applied (source gone)
-	// no-ops cleanly.
-	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME TO %s",
-		pq.QuoteIdentifier(a.from),
-		pq.QuoteIdentifier(a.to)))
-	return err
+	return a.conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		functions, err := a.triggerFunctions(ctx, tx)
+		if err != nil {
+			return err
+		}
+		// Already idempotent on re-run: the IF EXISTS guards the source table,
+		// so a rename a previous interrupted `complete` already applied (source
+		// gone) no-ops cleanly.
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME TO %s",
+			pq.QuoteIdentifier(a.from),
+			pq.QuoteIdentifier(a.to))); err != nil {
+			return err
+		}
+		for _, definition := range functions {
+			if _, err := tx.ExecContext(ctx, definition); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// triggerFunctions returns the definitions of pgroll's trigger functions on
+// the table, with the table renamed in them.
+func (a *renameTableAction) triggerFunctions(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT replace(pg_get_functiondef(p.oid),
+			format('"%s"."%s".', replace(n.nspname, '"', '""'), replace($1, '"', '""')),
+			format('"%s"."%s".', replace(n.nspname, '"', '""'), replace($2, '"', '""')))
+		FROM pg_trigger t
+		JOIN pg_proc p ON p.oid = t.tgfoid
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE t.tgrelid = to_regclass(quote_ident($1))
+		AND NOT t.tgisinternal
+		AND p.proname LIKE '\_pgroll\_trigger\_%'`, a.from, a.to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var definitions []string
+	for rows.Next() {
+		var definition string
+		if err := rows.Scan(&definition); err != nil {
+			return nil, err
+		}
+		definitions = append(definitions, definition)
+	}
+	return definitions, rows.Err()
 }
 
 // renameColumnAction is a DBAction that renames a column in a table.

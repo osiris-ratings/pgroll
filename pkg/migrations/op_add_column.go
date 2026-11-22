@@ -39,14 +39,22 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		fastPathDefault = v
 	}
 
-	action, err := addColumn(conn, scope, *o, table, fastPathDefault)
+	started := o.startedName(scope, table)
+	// A check is written against the column's own name, and rewritten when
+	// the column starts under another.
+	var rewritten []string
+	if started != o.Column.Name {
+		rewritten = []string{o.Column.Name}
+	}
+
+	action, err := addColumn(conn, started, *o, table, fastPathDefault)
 	if err != nil {
 		return nil, err
 	}
 	dbActions := []DBAction{action}
 
 	if o.Column.Comment != nil {
-		dbActions = append(dbActions, NewCommentColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Comment))
+		dbActions = append(dbActions, NewCommentColumnAction(conn, table.Name, started, o.Column.Comment))
 	}
 
 	// If the column is `NOT NULL` and there is no default value (either because
@@ -63,7 +71,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				table.Name,
 				NotNullConstraintName(o.Column.Name),
 				fmt.Sprintf("%s IS NOT NULL", o.Column.Name),
-				[]string{o.Column.Name},
+				rewritten,
 				skipInherit,
 				skipValidate,
 			))
@@ -77,7 +85,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				table.Name,
 				o.Column.Check.Name,
 				o.Column.Check.Constraint,
-				[]string{o.Column.Name},
+				rewritten,
 				skipInherit,
 				skipValidate,
 			))
@@ -90,7 +98,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				s.Name,
 				UniqueIndexName(o.Column.Name),
 				table,
-				TemporaryName(scope, o.Column.Name),
+				started,
 			))
 	}
 
@@ -112,17 +120,65 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				Direction:      backfill.TriggerDirectionUp,
 				Columns:        table.Columns,
 				TableName:      table.Name,
-				PhysicalColumn: TemporaryName(scope, o.Column.Name),
+				PhysicalColumn: started,
 				SQL:            o.Up,
+				// Under its own name the column is visible on the table.
+				KeepsUnpinnedWrites: started == o.Column.Name,
 			},
 		)
 	}
 
 	tmpColumn := toSchemaColumn(o.Column)
-	tmpColumn.Name = TemporaryName(scope, o.Column.Name)
+	tmpColumn.Name = started
 	table.AddColumn(o.Column.Name, tmpColumn)
 
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
+}
+
+// fillsPreviousRevisionWrites reports whether the previous revision's writes
+// need the column's `up` trigger. An `up` that only repeats the column's
+// default does not: the default fills those writes once the column completes.
+func (o *OpAddColumn) fillsPreviousRevisionWrites() bool {
+	if o.Up == "" {
+		return false
+	}
+	return !o.Column.HasDefault() || o.Up != *o.Column.Default
+}
+
+// startedName returns the physical name the column has from Start until
+// Complete. A column that fills the previous revision's writes waits for the
+// train's contraction, and SQL later in the train names it, so it starts
+// under its own name. It takes the temporary name when another column still
+// has that name physically: one an earlier operation drops or renames, which
+// is then deleted or keyed otherwise in table. Start, and every replay of it
+// over a schema read before or after it ran, make the same choice.
+func (o *OpAddColumn) startedName(scope string, table *schema.Table) string {
+	temporary := TemporaryName(scope, o.Column.Name)
+	if !o.fillsPreviousRevisionWrites() {
+		return temporary
+	}
+	for key, column := range table.Columns {
+		if column.Name == temporary {
+			return temporary
+		}
+		if column.Name == o.Column.Name && (key != o.Column.Name || column.Deleted) {
+			return temporary
+		}
+	}
+	return o.Column.Name
+}
+
+// AdoptStartedColumn keys the column Start added under its own name in a
+// schema read from the database, where it still has its temporary name.
+func (o *OpAddColumn) AdoptStartedColumn(s *schema.Schema) {
+	table := s.GetTable(o.Table)
+	if table == nil {
+		return
+	}
+	started := table.PhysicalColumn(TemporaryName(s.MigrationScope, o.Column.Name))
+	if started != nil && table.GetColumn(o.Column.Name) == nil {
+		table.AddColumn(o.Column.Name, started)
+	}
 }
 
 func toSchemaColumn(c Column) *schema.Column {
@@ -153,109 +209,13 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	dbActions := append(
-		[]DBAction{NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name)},
-		o.RetireTriggers(conn, scope)...,
-	)
-	dbActions = append(dbActions, NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)))
-
-	return o.settleActions(conn, table, scope, dbActions), nil
-}
-
-// CompleteKeepingTriggers completes the column but keeps its `up` trigger, so
-// a later migration in the train can name the column while the previous
-// revision's writes are still filled.
-func (o *OpAddColumn) CompleteKeepingTriggers(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
-	if o.Up == "" {
-		return o.Complete(l, conn, s)
-	}
-	l.LogOperationComplete(o)
-	scope := s.MigrationScope
-
-	table := s.GetTable(o.Table)
-	if table == nil {
-		return nil, TableDoesNotExistError{Name: o.Table}
-	}
-
-	// The migration's other operations rename or drop their own temporary
-	// columns around this one, so the function names none of them until
-	// RebuildKeptTriggers.
-	temporary := TemporaryName(scope, o.Column.Name)
-	columns := make(map[string]*schema.Column, len(table.Columns))
-	for name, column := range table.Columns {
-		switch {
-		case column.Name == temporary:
-			renamed := *column
-			renamed.Name = o.Column.Name
-			columns[o.Column.Name] = &renamed
-		case !strings.HasPrefix(column.Name, "_pgroll_"):
-			columns[name] = column
-		}
-	}
-
+	// The rename is a no-op for a column that started under its own name.
 	dbActions := []DBAction{
-		o.keptTrigger(conn, s, table.Name, columns, temporary),
+		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name),
+		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
 
-	return o.settleActions(conn, table, scope, dbActions), nil
-}
-
-// RebuildKeptTriggers rebuilds the kept trigger so its `up` can name every
-// column the table ends the migration with.
-func (o *OpAddColumn) RebuildKeptTriggers(conn db.DB, s *schema.Schema) []DBAction {
-	table := s.GetTable(o.Table)
-	if o.Up == "" || table == nil {
-		return nil
-	}
-	return []DBAction{o.keptTrigger(conn, s, table.Name, table.Columns, "")}
-}
-
-func (o *OpAddColumn) keptTrigger(conn db.DB, s *schema.Schema, tableName string, columns map[string]*schema.Column, from string) DBAction {
-	return &retargetTriggerAction{
-		conn:       conn,
-		schemaName: s.Name,
-		scope:      s.MigrationScope,
-		from:       from,
-		trigger: backfill.OperationTrigger{
-			Name:           backfill.TriggerName(s.MigrationScope, o.Table, o.Column.Name),
-			Direction:      backfill.TriggerDirectionUp,
-			Columns:        columns,
-			TableName:      tableName,
-			PhysicalColumn: o.Column.Name,
-			SQL:            o.Up,
-		},
-	}
-}
-
-// RetireTriggers drops the column's trigger function, and its trigger with
-// it. The function is named for the table as Start saw it, so a rename or
-// drop of the table later in the train does not hide it.
-func (o *OpAddColumn) RetireTriggers(conn db.DB, scope string) []DBAction {
-	return []DBAction{
-		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
-	}
-}
-
-type retargetTriggerAction struct {
-	conn       db.DB
-	schemaName string
-	scope      string
-	from       string
-	trigger    backfill.OperationTrigger
-}
-
-func (a *retargetTriggerAction) ID() string {
-	return fmt.Sprintf("retarget_trigger_%s", a.trigger.Name)
-}
-
-func (a *retargetTriggerAction) Execute(ctx context.Context) error {
-	return backfill.RetargetTrigger(ctx, a.conn, a.schemaName, a.scope, a.trigger, a.from)
-}
-
-// settleActions appends what gives the renamed column its final constraints
-// and default.
-func (o *OpAddColumn) settleActions(conn db.DB, table *schema.Table, scope string, dbActions []DBAction) []DBAction {
 	if !o.Column.IsNullable() && o.Column.Default == nil {
 		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
 	}
@@ -273,7 +233,13 @@ func (o *OpAddColumn) settleActions(conn db.DB, table *schema.Table, scope strin
 
 	// If the column has a DEFAULT that could not be set using the fast-path
 	// optimization, set it here.
-	column := table.GetColumn(TemporaryName(scope, o.Column.Name))
+	column := table.PhysicalColumn(TemporaryName(scope, o.Column.Name))
+	if column == nil {
+		column = table.PhysicalColumn(o.Column.Name)
+	}
+	if column == nil {
+		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column.Name}
+	}
 	if o.Column.HasDefault() && column.Default == nil {
 		dbActions = append(dbActions, NewSetDefaultValueAction(conn, table.Name, o.Column.Name, *o.Column.Default))
 
@@ -283,7 +249,7 @@ func (o *OpAddColumn) settleActions(conn db.DB, table *schema.Table, scope strin
 		}
 	}
 
-	return dbActions
+	return dbActions, nil
 }
 
 func (o *OpAddColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBAction, error) {
@@ -360,13 +326,13 @@ func (o *OpAddColumn) Validate(ctx context.Context, s *schema.Schema) error {
 	// Update the schema to ensure that the new column is visible to validation of
 	// subsequent operations.
 	table.AddColumn(o.Column.Name, &schema.Column{
-		Name: TemporaryName(s.MigrationScope, o.Column.Name),
+		Name: o.startedName(s.MigrationScope, table),
 	})
 
 	return nil
 }
 
-func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPathDefault bool) (DBAction, error) {
+func addColumn(conn db.DB, started string, o OpAddColumn, t *schema.Table, fastPathDefault bool) (DBAction, error) {
 	// don't add non-nullable columns with no default directly
 	// they are handled by:
 	// - adding the column as nullable
@@ -410,7 +376,7 @@ func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPat
 	}
 
 	// Capture the canonical (final) NOT NULL constraint name *before* the
-	// column is renamed to its in-flight temp form. Naming the inline NOT NULL
+	// column takes its in-flight name. Naming the inline NOT NULL
 	// constraint explicitly stops PostgreSQL 17+ from auto-deriving the name
 	// from the temp column name, which would fossilize the temp token in
 	// pg_constraint after the column is renamed back at Complete.
@@ -419,7 +385,7 @@ func addColumn(conn db.DB, scope string, o OpAddColumn, t *schema.Table, fastPat
 		notNullName = CanonicalNotNullName(t.Name, o.Column.Name)
 	}
 
-	o.Column.Name = TemporaryName(scope, o.Column.Name)
+	o.Column.Name = started
 
 	withPK := true
 	return NewAddColumnAction(conn, t.Name, o.Column, withPK, notNullName), nil

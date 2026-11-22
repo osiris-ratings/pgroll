@@ -57,7 +57,6 @@ func TestRevertSealed(t *testing.T) {
 				Operations: migrations.Operations{
 					&migrations.OpAddColumn{
 						Table:  "users",
-						Up:     "18",
 						Column: migrations.Column{Name: "age", Type: "integer", Nullable: true},
 					},
 				},

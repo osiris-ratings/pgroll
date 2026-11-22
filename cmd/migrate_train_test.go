@@ -164,7 +164,8 @@ func TestMigrateRefusesANewTrainOnAReopenedOne(t *testing.T) {
 			write("00_base", "CREATE TABLE u (id integer PRIMARY KEY)", "DROP TABLE u")
 			require.NoError(t, migrate("--complete"))
 
-			write("01_one", "COMMENT ON TABLE u IS 'one'", "COMMENT ON TABLE u IS NULL")
+			// The open train needs a trigger for a third revision to confuse.
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "01_one.yaml"), []byte(addColumnWithUp), 0o600))
 			write("02_two", "COMMENT ON TABLE u IS 'two'", "COMMENT ON TABLE u IS 'one'")
 			require.NoError(t, migrate())
 
@@ -214,17 +215,17 @@ func TestAnOpenTrainWithAMaterializedLeafNeedsLeafUnpinned(t *testing.T) {
 			write("00_base", "CREATE TABLE u (id integer PRIMARY KEY)", "DROP TABLE u")
 			require.NoError(t, migrate("--complete"))
 
-			write("01_one", "COMMENT ON TABLE u IS 'one'", "COMMENT ON TABLE u IS NULL")
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "01_one.yaml"), []byte(addColumnWithUp), 0o600))
 			two := write("02_two", "COMMENT ON TABLE u IS 'two'", "COMMENT ON TABLE u IS 'one'")
 
 			// The train stops after its first migration.
 			one, err := migrations.ReadMigration(os.DirFS(dir), "01_one.yaml")
 			require.NoError(t, err)
 			require.NoError(t, m.Start(ctx, one, backfill.NewConfig(), roll.WithoutVersionSchema()))
-			require.NoError(t, m.Complete(ctx, roll.WithSkipSchemaDrop()))
+			require.NoError(t, m.Complete(ctx, roll.WithDeferComplete()))
 
 			// Its leaf is then materialized.
-			sc, err := m.State().ReadSchema(ctx, m.Schema())
+			sc, err := m.SchemaWithDeferred(ctx)
 			require.NoError(t, err)
 			require.NoError(t, m.Materialize(ctx, "01_one", sc))
 
@@ -238,3 +239,13 @@ func TestAnOpenTrainWithAMaterializedLeafNeedsLeafUnpinned(t *testing.T) {
 			require.NoError(t, migrate("--leaf-unpinned"))
 		})
 }
+
+const addColumnWithUp = `operations:
+  - add_column:
+      table: u
+      up: "1"
+      column:
+        name: v
+        type: integer
+        nullable: true
+`

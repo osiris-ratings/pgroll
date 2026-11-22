@@ -58,6 +58,8 @@ add_column:
 
 The `up` SQL is used when a row is added to the old version of the table (ie, without the new column). In the new version of the table, the row's value for the new column is determined by the `up` SQL expression. The `up` SQL can be omitted if the new column is nullable or has a `DEFAULT` defined.
 
+When `pgroll migrate` applies several migrations and leaves the last one active, an earlier `add_column` with `up` keeps filling the column until `pgroll complete`, like the last one does. Its column has its final name from the start, so later migrations of the same run can name it in SQL; its `NOT NULL`, `check` and `unique` are enforced as constraints from the start and become the column's own on `pgroll complete`. An `up` that only repeats a volatile `default` is the exception: that column is completed as soon as it is backfilled.
+
 Default values are subject to the usual rules for quoting SQL expressions. In particular, string literals should be surrounded with single quotes.
 
 **NOTE:** As a special case, the `up` field can be omitted when adding `smallserial`, `serial` and `bigserial` columns.

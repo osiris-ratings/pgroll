@@ -23,16 +23,32 @@ func applyExpandOnlyTrain(t *testing.T, mig *roll.Roll, train []*migrations.Migr
 	ctx := context.Background()
 
 	final := train[len(train)-1]
-	target := roll.WithTrainTarget(final)
 	for _, m := range train[:len(train)-1] {
-		require.NoError(t, mig.Start(ctx, m, backfill.NewConfig(), roll.WithoutVersionSchema(), target))
-		if m.CompleteMustBeDeferred() {
-			require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
-		} else {
-			require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop(), roll.WithTriggersKeptFor(final)))
-		}
+		applyMidTrain(t, mig, m, final)
 	}
-	require.NoError(t, mig.Start(ctx, final, backfill.NewConfig(), target))
+	require.NoError(t, mig.Start(ctx, final, backfill.NewConfig(), trainStartOptions(mig, final)...))
+}
+
+// applyMidTrain applies one earlier migration of a train whose last
+// migration is final.
+func applyMidTrain(t *testing.T, mig *roll.Roll, m, final *migrations.Migration) {
+	t.Helper()
+	ctx := context.Background()
+
+	opts := append([]roll.StartOption{roll.WithoutVersionSchema()}, trainStartOptions(mig, final)...)
+	require.NoError(t, mig.Start(ctx, m, backfill.NewConfig(), opts...))
+	if roll.DefersCompleteInTrain(m, mig.UseVersionSchema()) {
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
+	} else {
+		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
+	}
+}
+
+func trainStartOptions(mig *roll.Roll, final *migrations.Migration) []roll.StartOption {
+	if !mig.UseVersionSchema() {
+		return nil
+	}
+	return []roll.StartOption{roll.WithTrainTarget(final)}
 }
 
 // execAs runs one statement as a pod pinned to the given version schema.
@@ -197,8 +213,8 @@ func TestTrainNonFinalAddColumnKeepsBackfillingPreviousRevision(t *testing.T) {
 		require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO w (id, x) VALUES (2, 20)`),
 			"the previous revision cannot write the new column; up must fill it")
 		require.NoError(t, execAs(t, db, targetSchema, `INSERT INTO w (id, x, a) VALUES (3, 30, 99)`))
-		require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 2`))
-		require.Equal(t, 99, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 3`),
+		require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 2`))
+		require.Equal(t, 99, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 3`),
 			"the new revision's own value is kept")
 
 		require.NoError(t, mig.Complete(ctx))

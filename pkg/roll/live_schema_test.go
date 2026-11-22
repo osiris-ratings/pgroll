@@ -39,7 +39,7 @@ func applyAdditiveTrain(t *testing.T, mig *roll.Roll, train []*migrations.Migrat
 			continue
 		}
 		require.NoError(t, mig.Start(ctx, m, backfill.NewConfig(), roll.WithoutVersionSchema()))
-		if m.CompleteMustBeDeferred() {
+		if roll.DefersCompleteInTrain(m, true) {
 			require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
 		} else {
 			require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))

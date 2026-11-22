@@ -32,7 +32,7 @@ func applyDelayedContractionTrain(t *testing.T, mig *roll.Roll, train []*migrati
 			continue
 		}
 		require.NoError(t, mig.Start(ctx, m, backfill.NewConfig(), roll.WithoutVersionSchema()))
-		if m.CompleteMustBeDeferred() {
+		if roll.DefersCompleteInTrain(m, true) {
 			require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
 		} else {
 			require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop()))
@@ -80,7 +80,6 @@ func TestRevertRestoresPreviousDeployment(t *testing.T) {
 				Operations: migrations.Operations{
 					&migrations.OpAddColumn{
 						Table:  "users",
-						Up:     "18",
 						Column: migrations.Column{Name: "age", Type: "integer", Nullable: true},
 					},
 				},

@@ -45,8 +45,8 @@ func rawSQL(name, up, down string) *migrations.Migration {
 	}
 }
 
-// Reverting a train before it contracts removes the triggers it kept.
-func TestTrainRevertRemovesKeptTriggers(t *testing.T) {
+// Reverting a train before it contracts removes its triggers.
+func TestTrainRevertRemovesItsTriggers(t *testing.T) {
 	t.Parallel()
 
 	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {

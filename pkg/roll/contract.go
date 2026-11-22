@@ -63,11 +63,7 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_
 		// sealed, whether stranded by an older binary's crash between drain
 		// and stamp, or legitimately open (e.g. a train re-opened by a
 		// bounded revert). `pgroll complete` means "finish this deployment",
-		// so the stamp is always intended. The unsealed window names the
-		// train, so its kept triggers go first.
-		if err := m.retireKeptTriggers(ctx); err != nil {
-			return 0, 0, err
-		}
+		// so the stamp is always intended.
 		stamped, err := m.state.MarkSealed(ctx, m.schema)
 		if err != nil {
 			return 0, 0, err
@@ -211,11 +207,7 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_
 	// Seal at intent: stamp the whole deployment (deferred and inline rows
 	// alike) BEFORE any contraction DDL runs. From this point `pgroll revert`
 	// refuses every row, so no crash window below can present a physically-
-	// contracted row as losslessly revertible. The unsealed window names the
-	// train, so its kept triggers go first.
-	if err := m.retireKeptTriggers(ctx); err != nil {
-		return 0, 0, err
-	}
+	// contracted row as losslessly revertible.
 	if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 		return 0, 0, err
 	}

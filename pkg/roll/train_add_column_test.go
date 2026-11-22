@@ -54,8 +54,10 @@ func TestTrainAddColumnWithASiblingAddColumn(t *testing.T) {
 				})
 				require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO w (id, x) VALUES (2, 20)`))
 				require.NoError(t, execAs(t, db, targetSchema, `INSERT INTO w (id, x, a, b) VALUES (3, 30, 99, 98)`))
-				require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 2`))
+				require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 2`))
 				require.NoError(t, mig.Complete(ctx))
+				require.Equal(t, 21, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 2`))
+				require.Equal(t, 99, *intPtr(db, t, `SELECT a FROM public.w WHERE id = 3`))
 				require.Zero(t, pgrollLeftovers(t, db))
 			})
 		})
@@ -104,7 +106,7 @@ func TestTrainWritesDuringContraction(t *testing.T) {
 		})
 }
 
-// A table renamed later in the train still has its kept trigger retired.
+// A table renamed later in the train still has the column's trigger removed.
 func TestTrainAddColumnThenRenameTable(t *testing.T) {
 	t.Parallel()
 
@@ -122,7 +124,7 @@ func TestTrainAddColumnThenRenameTable(t *testing.T) {
 	})
 }
 
-// A contraction refused because the train never finished leaves the kept
+// A contraction refused because the train never finished leaves the
 // triggers in place: the previous revision is still the one running.
 func TestTrainRefusedContractionKeepsTheTriggers(t *testing.T) {
 	t.Parallel()
@@ -142,7 +144,7 @@ func TestTrainRefusedContractionKeepsTheTriggers(t *testing.T) {
 		}
 		require.NoError(t, mig.Start(ctx, addColumn("01_add_a", "a", "x + 1"), backfill.NewConfig(),
 			roll.WithoutVersionSchema(), roll.WithTrainTarget(final)))
-		require.NoError(t, mig.Complete(ctx, roll.WithSkipSchemaDrop(), roll.WithTriggersKeptFor(final)))
+		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
 		require.NoError(t, mig.Start(ctx, deferred, backfill.NewConfig(),
 			roll.WithoutVersionSchema(), roll.WithTrainTarget(final)))
 		require.NoError(t, mig.Complete(ctx, roll.WithDeferComplete()))
