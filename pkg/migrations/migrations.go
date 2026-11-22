@@ -373,11 +373,16 @@ func (m *Migration) UpdateVirtualSchema(ctx context.Context, s *schema.Schema) e
 	return nil
 }
 
-// AddsColumnsUnderOwnNames reports whether the migration's add columns that
-// fill the previous revision's writes may start under their own names. The
-// other operations of a migration find a column it adds by its temporary
-// name, so only a migration of add columns, indexes and new tables qualifies.
+// AddsColumnsUnderOwnNames reports whether the columns the migration adds
+// start under their own names. A migration that fills the previous
+// revision's writes waits for its train's contraction, and SQL later in the
+// train names its columns. The other operations of a migration find a column
+// it adds by its temporary name, so only a migration of add columns, indexes
+// and new tables qualifies.
 func (m *Migration) AddsColumnsUnderOwnNames() bool {
+	if !m.FillsPreviousRevisionWrites() {
+		return false
+	}
 	for _, op := range m.Operations {
 		switch op.(type) {
 		case *OpAddColumn, *OpCreateIndex, *OpCreateTable:

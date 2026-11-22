@@ -728,3 +728,45 @@ func TestAddColumnsWithUpAndAConstraintOnThemInOneMigration(t *testing.T) {
 		})
 	})
 }
+
+// A migration adds one column with `up` and others without. It waits for
+// the train's contraction as a whole, so a later migration names any of its
+// columns, and a generated default is not generated twice.
+func TestTrainLaterSQLNamesEveryColumnOfAWaitingMigration(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		baseW(t, mig)
+		yes, uuid := "true", "gen_random_uuid()"
+		applyExpandOnlyTrain(t, mig, []*migrations.Migration{
+			{Name: "01_add_three", Operations: migrations.Operations{
+				&migrations.OpAddColumn{Table: "w", Up: "x + 1", Column: migrations.Column{Name: "a", Type: "integer", Nullable: false}},
+				&migrations.OpAddColumn{Table: "w", Column: migrations.Column{Name: "speaks", Type: "boolean", Nullable: false, Default: &yes}},
+				&migrations.OpAddColumn{Table: "w", Up: uuid, Column: migrations.Column{Name: "public_id", Type: "uuid", Nullable: false, Default: &uuid}},
+			}},
+			rawSQL("02_backfill", `UPDATE w SET speaks = false WHERE x > 5`, `SELECT 1`),
+			{Name: "03_index", Operations: migrations.Operations{&migrations.OpCreateIndex{
+				Name: "ix_w_speaking", Table: "w", Columns: []migrations.IndexField{{Column: "a"}}, Predicate: "speaks",
+			}}},
+			laterIndex("w", "x"),
+		})
+
+		read := func(id int) string {
+			var v string
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT public_id FROM public_09_later.w WHERE id = $1`, id).Scan(&v))
+			return v
+		}
+		handedOut := read(1)
+		require.NoError(t, execAs(t, db, previousSchema, `UPDATE w SET x = x + 1 WHERE id = 1`))
+		require.Equal(t, handedOut, read(1), "the generated value survives the previous revision's update")
+		require.Equal(t, 12, *intPtr(db, t, `SELECT a FROM public_09_later.w WHERE id = 1`))
+
+		require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO w (id, x) VALUES (2, 20)`))
+		require.NotEmpty(t, read(2), "the previous revision's insert gets a generated value")
+
+		require.NoError(t, mig.Complete(ctx))
+		require.Equal(t, handedOut, read(1))
+		require.Zero(t, pgrollLeftovers(t, db))
+	})
+}

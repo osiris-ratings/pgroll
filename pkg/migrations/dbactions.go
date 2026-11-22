@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 
+	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/schema"
 )
@@ -131,7 +132,7 @@ func (a *renameTableAction) ID() string { return a.id }
 // table's name, and the previous revision keeps writing through them.
 func (a *renameTableAction) Execute(ctx context.Context) error {
 	return a.conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		functions, err := a.triggerFunctions(ctx, tx)
+		functions, err := triggerFunctionsOn(ctx, tx, a.from)
 		if err != nil {
 			return err
 		}
@@ -143,43 +144,59 @@ func (a *renameTableAction) Execute(ctx context.Context) error {
 			pq.QuoteIdentifier(a.to))); err != nil {
 			return err
 		}
-		for _, definition := range functions {
-			if _, err := tx.ExecContext(ctx, definition); err != nil {
-				return err
-			}
-		}
-		return nil
+		return functions.redefine(ctx, tx, func(schemaName string) *strings.Replacer {
+			return strings.NewReplacer(
+				pq.QuoteIdentifier(schemaName)+"."+pq.QuoteIdentifier(a.from)+".",
+				pq.QuoteIdentifier(schemaName)+"."+pq.QuoteIdentifier(a.to)+".")
+		})
 	})
 }
 
-// triggerFunctions returns the definitions of pgroll's trigger functions on
-// the table, with the table renamed in them.
-func (a *renameTableAction) triggerFunctions(ctx context.Context, tx *sql.Tx) ([]string, error) {
+// triggerFunctions are the definitions of pgroll's trigger functions on one
+// table, read before a rename the functions must follow.
+type triggerFunctions struct {
+	schemaName  string
+	definitions []string
+}
+
+func triggerFunctionsOn(ctx context.Context, tx *sql.Tx, table string) (triggerFunctions, error) {
+	var found triggerFunctions
 	rows, err := tx.QueryContext(ctx, `
-		SELECT DISTINCT replace(pg_get_functiondef(p.oid),
-			format('"%s"."%s".', replace(n.nspname, '"', '""'), replace($1, '"', '""')),
-			format('"%s"."%s".', replace(n.nspname, '"', '""'), replace($2, '"', '""')))
+		SELECT DISTINCT n.nspname, pg_get_functiondef(p.oid)
 		FROM pg_trigger t
 		JOIN pg_proc p ON p.oid = t.tgfoid
 		JOIN pg_class c ON c.oid = t.tgrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE t.tgrelid = to_regclass(quote_ident($1))
+		WHERE t.tgrelid = to_regclass($1)
 		AND NOT t.tgisinternal
-		AND p.proname LIKE '\_pgroll\_trigger\_%'`, a.from, a.to)
+		AND p.proname LIKE '\_pgroll\_trigger\_%'`, pq.QuoteIdentifier(table))
 	if err != nil {
-		return nil, err
+		return found, err
 	}
 	defer rows.Close()
 
-	var definitions []string
 	for rows.Next() {
 		var definition string
-		if err := rows.Scan(&definition); err != nil {
-			return nil, err
+		if err := rows.Scan(&found.schemaName, &definition); err != nil {
+			return found, err
 		}
-		definitions = append(definitions, definition)
+		found.definitions = append(found.definitions, definition)
 	}
-	return definitions, rows.Err()
+	return found, rows.Err()
+}
+
+// redefine replaces each function with its definition as rewrite leaves it.
+func (f triggerFunctions) redefine(ctx context.Context, tx *sql.Tx, rewrite func(schemaName string) *strings.Replacer) error {
+	for _, definition := range f.definitions {
+		rewritten := rewrite(f.schemaName).Replace(definition)
+		if rewritten == definition {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, rewritten); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // renameColumnAction is a DBAction that renames a column in a table.
@@ -214,6 +231,9 @@ func NewRenameColumnAction(conn db.DB, table, from, to string) *renameColumnActi
 
 func (a *renameColumnAction) ID() string { return a.id }
 
+// Execute renames the column and, in the same transaction, the column in the
+// trigger functions pgroll has on the table: a function of a later migration
+// reads the column by the name it had when that migration started.
 func (a *renameColumnAction) Execute(ctx context.Context) error {
 	// Idempotent re-run guard (see catalog.go): RENAME COLUMN has no native
 	// column-level IF EXISTS, so a re-run after an interrupted `complete` would
@@ -230,11 +250,25 @@ func (a *renameColumnAction) Execute(ctx context.Context) error {
 		}
 	}
 
-	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME COLUMN %s TO %s",
-		pq.QuoteIdentifier(a.table),
-		pq.QuoteIdentifier(a.from),
-		pq.QuoteIdentifier(a.to)))
-	return err
+	return a.conn.WithRetryableTransaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		functions, err := triggerFunctionsOn(ctx, tx, a.table)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME COLUMN %s TO %s",
+			pq.QuoteIdentifier(a.table),
+			pq.QuoteIdentifier(a.from),
+			pq.QuoteIdentifier(a.to))); err != nil {
+			return err
+		}
+		from, to := pq.QuoteIdentifier(a.from), pq.QuoteIdentifier(a.to)
+		return functions.redefine(ctx, tx, func(string) *strings.Replacer {
+			return strings.NewReplacer(
+				"."+from+"%TYPE", "."+to+"%TYPE",
+				"NEW."+from, "NEW."+to,
+				"OLD."+from, "OLD."+to)
+		})
+	})
 }
 
 // alreadyRenamed reports whether the source column is gone while the target is
@@ -395,9 +429,56 @@ func (a *dropFunctionAction) Execute(ctx context.Context) error {
 	for idx, fn := range a.functions {
 		functions[idx] = pq.QuoteIdentifier(fn)
 	}
-	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s CASCADE",
-		strings.Join(functions, ",")))
-	return err
+	if _, err := a.conn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s CASCADE",
+		strings.Join(functions, ","))); err != nil {
+		return err
+	}
+	return a.dropTruncated(ctx)
+}
+
+// dropTruncated drops the functions an earlier build created for the same
+// migration under names Postgres cut at 63 bytes, where this build uses a
+// digest (see backfill.TriggerFunctionName). The cut removed the migration's
+// scope from the name, so the function is recognized by the backfill marker
+// it sets.
+func (a *dropFunctionAction) dropTruncated(ctx context.Context) error {
+	for _, fn := range a.functions {
+		scope, ok := backfill.DigestedTriggerFunctionScope(fn)
+		if !ok {
+			continue
+		}
+		rows, err := a.conn.QueryContext(ctx, `
+			SELECT p.proname
+			FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = current_schema()
+			AND p.proname LIKE '\_pgroll\_trigger\_%'
+			AND octet_length(p.proname) = 63
+			AND p.prosrc LIKE '%' || quote_ident($1) || '%'`,
+			backfill.NeedsBackfillColumnName(scope))
+		if err != nil || rows == nil {
+			return err
+		}
+		var truncated []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return err
+			}
+			truncated = append(truncated, pq.QuoteIdentifier(name))
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(truncated) == 0 {
+			continue
+		}
+		if _, err := a.conn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s CASCADE",
+			strings.Join(truncated, ","))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // createIndexAction builds an index. On a table that existed before the

@@ -57,8 +57,22 @@ func materializeCmd() *cobra.Command {
 			}
 
 			// A train that stopped part-way has migrations waiting for its
-			// contraction; the leaf projects what they changed.
-			sc, err := m.SchemaWithDeferred(ctx)
+			// contraction; the leaf, and anything after it, projects what
+			// they changed. An earlier version named with --version projects
+			// the tables as they are.
+			readSchema := m.SchemaWithDeferred
+			if versionOverride != "" && migrationsDir == "" {
+				leaf, err := m.LeafVersionSchema(ctx)
+				if err != nil {
+					return err
+				}
+				if versionOverride != leaf {
+					readSchema = func(ctx context.Context) (*schema.Schema, error) {
+						return m.State().ReadSchema(ctx, m.Schema())
+					}
+				}
+			}
+			sc, err := readSchema(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to read live schema: %w", err)
 			}

@@ -22,6 +22,20 @@ import (
 //
 // Re-running with the same version is safe: ensureViews uses
 // CREATE SCHEMA IF NOT EXISTS and CREATE OR REPLACE VIEW.
+// LeafVersionSchema returns the version name of the latest migration in the
+// schema's history, or "" when there is none.
+func (m *Roll) LeafVersionSchema(ctx context.Context) (string, error) {
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil || latest == nil {
+		return "", err
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return "", err
+	}
+	return leaf.VersionSchemaName(), nil
+}
+
 // SchemaWithDeferred returns the schema as the migrations applied so far
 // leave it, with what the ones still waiting for a contraction changed.
 func (m *Roll) SchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
@@ -45,18 +59,11 @@ func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schem
 
 	// A fleet can now pin the leaf of a train that stopped part-way, so the
 	// train's triggers follow it.
-	latest, err := m.state.LatestMigration(ctx, m.schema)
+	leaf, err := m.LeafVersionSchema(ctx)
 	if err != nil {
 		return fmt.Errorf("materialize: %w", err)
 	}
-	if latest == nil {
-		return nil
-	}
-	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
-	if err != nil {
-		return fmt.Errorf("materialize: %w", err)
-	}
-	if leaf.VersionSchemaName() != version {
+	if leaf != version {
 		return nil
 	}
 	if _, err := m.retargetTrain(ctx, VersionedSchemaName(m.schema, version)); err != nil {

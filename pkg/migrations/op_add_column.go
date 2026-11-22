@@ -122,8 +122,11 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 				TableName:      table.Name,
 				PhysicalColumn: started,
 				SQL:            o.Up,
-				// Under its own name the column is visible on the table.
-				KeepsUnpinnedWrites: started == o.Column.Name,
+				Fills:          o.Column.Name,
+				// An `up` that repeats the default generates a value once.
+				OnlyFillsNull: !o.fillsPreviousRevisionWrites(),
+				// Under its own name a later migration can write the column.
+				KeepsMigrationWrites: started == o.Column.Name && o.fillsPreviousRevisionWrites(),
 			},
 		)
 	}
@@ -146,16 +149,15 @@ func (o *OpAddColumn) fillsPreviousRevisionWrites() bool {
 }
 
 // startedName returns the physical name the column has from Start until
-// Complete. A column that fills the previous revision's writes waits for the
-// train's contraction, and SQL later in the train names it, so it starts
-// under its own name when its migration allows (s.OwnNamedColumns). It takes
-// the temporary name when another column still has that name physically:
+// Complete: its own when its migration's columns start that way
+// (s.OwnNamedColumns), else the temporary one. It also takes the temporary
+// name when another column still has that name physically:
 // one an earlier migration drops or renames, which is then deleted or keyed
 // otherwise in table. Start, and every replay of it over a schema read
 // before or after it ran, make the same choice.
 func (o *OpAddColumn) startedName(s *schema.Schema, table *schema.Table) string {
 	temporary := TemporaryName(s.MigrationScope, o.Column.Name)
-	if !s.OwnNamedColumns || !o.fillsPreviousRevisionWrites() {
+	if !s.OwnNamedColumns {
 		return temporary
 	}
 	// Replayed over a schema read after Start: the column is there, and a
@@ -269,8 +271,12 @@ func (o *OpAddColumn) Rollback(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column.Name}
 	}
 
+	// An earlier build started the column under its temporary name even
+	// where this one reads its own, so both go; the second is absent
+	// otherwise, or a sibling's duplicate that goes with this migration.
 	return []DBAction{
 		NewDropColumnAction(conn, table.Name, column.Name),
+		NewDropColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name)),
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}, nil
@@ -325,6 +331,19 @@ func (o *OpAddColumn) Validate(ctx context.Context, s *schema.Schema) error {
 
 	if o.Column.IsPrimaryKey() {
 		return errors.New("adding primary key columns is not supported")
+	}
+
+	// The index a unique column builds is named for the column alone and
+	// created IF NOT EXISTS, so one still held by another table's column
+	// would leave this one without an index.
+	if o.Column.Unique {
+		for _, other := range s.Tables {
+			if _, taken := other.Indexes[UniqueIndexName(o.Column.Name)]; taken {
+				return InvalidMigrationError{Reason: fmt.Sprintf(
+					"unique column %q on %q: index %q is still in use by table %q until its migration completes",
+					o.Column.Name, o.Table, UniqueIndexName(o.Column.Name), other.Name)}
+			}
+		}
 	}
 
 	// Update the schema to ensure that the new column is visible to validation of

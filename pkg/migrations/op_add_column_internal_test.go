@@ -15,7 +15,6 @@ func TestAddColumnStartedName(t *testing.T) {
 
 	const scope = "0123abcd"
 	temporary := TemporaryName(scope, "a")
-	volatile := "gen_random_uuid()"
 	fills := &OpAddColumn{Table: "t", Up: "x + 1", Column: Column{Name: "a", Type: "integer"}}
 
 	for name, tc := range map[string]struct {
@@ -24,13 +23,14 @@ func TestAddColumnStartedName(t *testing.T) {
 		mixed   bool
 		want    string
 	}{
-		"without up": {
-			op:   &OpAddColumn{Table: "t", Column: Column{Name: "a", Type: "integer"}},
-			want: temporary,
+		"its migration fills nothing": {
+			op:    &OpAddColumn{Table: "t", Column: Column{Name: "a", Type: "integer"}},
+			mixed: true,
+			want:  temporary,
 		},
-		"up repeats the default": {
-			op:   &OpAddColumn{Table: "t", Up: volatile, Column: Column{Name: "a", Type: "uuid", Default: &volatile}},
-			want: temporary,
+		"without up, beside a column that fills": {
+			op:   &OpAddColumn{Table: "t", Column: Column{Name: "a", Type: "integer"}},
+			want: "a",
 		},
 		"up fills the column":                          {op: fills, want: "a"},
 		"in a migration with other kinds of operation": {op: fills, mixed: true, want: temporary},

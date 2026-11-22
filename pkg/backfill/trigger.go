@@ -42,8 +42,10 @@ type triggerConfig struct {
 	TargetFunction      string
 	SQL                 []string
 	NeedsBackfillColumn string
-	// KeepsUnpinnedWrites: see OperationTrigger.
-	KeepsUnpinnedWrites bool
+	// Fills, OnlyFillsNull and KeepsMigrationWrites: see OperationTrigger.
+	Fills                string
+	OnlyFillsNull        bool
+	KeepsMigrationWrites bool
 	// MigrationScope is the per-migration suffix used when naming the
 	// marker column. Empty scope produces the legacy unscoped marker.
 	MigrationScope string
@@ -56,14 +58,22 @@ type OperationTrigger struct {
 	TableName      string
 	PhysicalColumn string
 	SQL            string
-	// KeepsUnpinnedWrites is for a column that sessions on the migrated
-	// schema itself can already name: pgroll's own, running a later
-	// migration, or anything else not pinned to a version schema. Their
-	// write keeps the value it gave the column. The expression still fills
-	// an insert that gave none and a row the backfill had not reached: the
-	// stored marker says so, which a sibling trigger of the same migration
-	// may already have cleared on the new row.
-	KeepsUnpinnedWrites bool
+	// Fills is the name of the column an add column's trigger fills, by
+	// which a sibling's expression can read it.
+	Fills string
+	// OnlyFillsNull is for an expression that generates a value rather than
+	// deriving one: it never replaces a value the row has.
+	OnlyFillsNull bool
+	// KeepsMigrationWrites is for a column sessions on the table can already
+	// name. An UPDATE that changes the column keeps its value, whoever makes
+	// it. A write from pgroll's own session, running a later migration,
+	// also keeps a value it inserts, and the expression fills only an insert
+	// that gave none and a row the backfill had not reached. The stored
+	// marker says so; a sibling trigger of the same migration may have
+	// cleared the new row's. Every other write gets the expression as
+	// before, and a write of the new revision marks its row as needing no
+	// backfill.
+	KeepsMigrationWrites bool
 }
 
 type createTriggerAction struct {
@@ -115,11 +125,12 @@ func buildFunction(cfg triggerConfig) (string, error) {
 	return executeTemplate("function", templates.Function, cfg)
 }
 
-// PinnedPattern is the LIKE pattern of a search_path pinned to one of the
-// schema's version schemas.
-func (c triggerConfig) PinnedPattern() string {
-	return strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`).Replace(c.SchemaName) + `\_%`
-}
+// MigrationApplicationName is the application_name of the session pgroll
+// runs migrations in.
+const MigrationApplicationName = "pgroll"
+
+// MigrationSession is MigrationApplicationName, for the function template.
+func (c triggerConfig) MigrationSession() string { return MigrationApplicationName }
 
 // namedColumns returns the columns whose name appears in one of the
 // expressions. The function declares a variable for each, read from the row,
@@ -203,6 +214,21 @@ func TriggerFunctionName(scope, tableName, columnName string) string {
 	}
 	sum := sha256.Sum256([]byte(tableName + "\x00" + columnName))
 	return prefix + hex.EncodeToString(sum[:12]) + suffix
+}
+
+// DigestedTriggerFunctionScope returns the migration scope of a trigger
+// function name that carries a digest, and whether name is one.
+func DigestedTriggerFunctionScope(name string) (string, bool) {
+	const prefix, digest, scope = "_pgroll_trigger_", 24, 8
+	if len(name) != len(prefix)+digest+1+scope || !strings.HasPrefix(name, prefix) || name[len(prefix)+digest] != '_' {
+		return "", false
+	}
+	for _, c := range name[len(prefix):len(prefix)+digest] + name[len(name)-scope:] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return name[len(name)-scope:], true
 }
 
 // TriggerName returns the per-migration name of the trigger for a given

@@ -116,18 +116,20 @@ func (j *Job) AddTask(t *Task) {
 			// If the trigger does not exist, create a new trigger config
 			// No need to rewrite the SQL here, as it is the first time we are adding it.
 			j.triggers[trigger.Name] = triggerConfig{
-				Name:                trigger.Name,
-				Direction:           trigger.Direction,
-				Columns:             trigger.Columns,
-				SchemaName:          j.schemaName,
-				TableName:           trigger.TableName,
-				PhysicalColumn:      trigger.PhysicalColumn,
-				LatestSchema:        j.latestSchema,
-				TargetFunction:      j.TargetFunction,
-				SQL:                 []string{trigger.SQL},
-				KeepsUnpinnedWrites: trigger.KeepsUnpinnedWrites,
-				NeedsBackfillColumn: NeedsBackfillColumnName(j.migrationScope),
-				MigrationScope:      j.migrationScope,
+				Name:                 trigger.Name,
+				Direction:            trigger.Direction,
+				Columns:              trigger.Columns,
+				SchemaName:           j.schemaName,
+				TableName:            trigger.TableName,
+				PhysicalColumn:       trigger.PhysicalColumn,
+				LatestSchema:         j.latestSchema,
+				TargetFunction:       j.TargetFunction,
+				SQL:                  []string{trigger.SQL},
+				Fills:                trigger.Fills,
+				OnlyFillsNull:        trigger.OnlyFillsNull,
+				KeepsMigrationWrites: trigger.KeepsMigrationWrites,
+				NeedsBackfillColumn:  NeedsBackfillColumnName(j.migrationScope),
+				MigrationScope:       j.migrationScope,
 			}
 		}
 	}
@@ -172,11 +174,40 @@ func (j *Job) HasTriggers() bool {
 	return len(j.triggers) > 0
 }
 
+// firingOrder returns the job's trigger functions in the order their
+// triggers fire: by name, except that a trigger whose expression reads a
+// column another one fills on the same table comes after it.
+func (j *Job) firingOrder() []string {
+	names := slices.Sorted(maps.Keys(j.triggers))
+	order := make([]string, 0, len(names))
+	placed := make(map[string]bool, len(names))
+	var place func(name string)
+	place = func(name string) {
+		if placed[name] {
+			return
+		}
+		placed[name] = true
+		reader := j.triggers[name]
+		for _, other := range names {
+			filler := j.triggers[other]
+			if filler.Fills == "" || filler.TableName != reader.TableName || filler.Direction != reader.Direction {
+				continue
+			}
+			if slices.ContainsFunc(reader.SQL, func(e string) bool { return namesIdentifier(e, filler.Fills) }) {
+				place(other)
+			}
+		}
+		order = append(order, name)
+	}
+	for _, name := range names {
+		place(name)
+	}
+	return order
+}
+
 // CreateTriggers creates the triggers for the tables before starting the backfill.
 func (bf *Backfill) CreateTriggers(ctx context.Context, j *Job) error {
-	// In function-name order, which is the order one migration's triggers
-	// fire in.
-	for index, name := range slices.Sorted(maps.Keys(j.triggers)) {
+	for index, name := range j.firingOrder() {
 		trigger := j.triggers[name]
 		trigger.TriggerName = OrderedTriggerName(trigger.Direction, j.Position, index, trigger.Name)
 		a := &createTriggerAction{

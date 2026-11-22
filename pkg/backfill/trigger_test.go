@@ -244,18 +244,18 @@ func TestNamesIdentifier(t *testing.T) {
 	}
 }
 
-func TestBuildFunctionKeepingUnpinnedWrites(t *testing.T) {
+func TestBuildFunctionKeepingMigrationWrites(t *testing.T) {
 	sql, err := buildFunction(triggerConfig{
-		Name:                "triggerName",
-		Direction:           TriggerDirectionUp,
-		Columns:             map[string]*schema.Column{"x": {Name: "x"}, "a": {Name: "a"}},
-		SchemaName:          "my_app",
-		TargetFunction:      TrainTargetFunction,
-		TableName:           "w",
-		PhysicalColumn:      "a",
-		NeedsBackfillColumn: NeedsBackfillColumnName("abc"),
-		KeepsUnpinnedWrites: true,
-		SQL:                 []string{"(x + 1)"},
+		Name:                 "triggerName",
+		Direction:            TriggerDirectionUp,
+		Columns:              map[string]*schema.Column{"x": {Name: "x"}, "a": {Name: "a"}},
+		SchemaName:           "my_app",
+		TargetFunction:       TrainTargetFunction,
+		TableName:            "w",
+		PhysicalColumn:       "a",
+		NeedsBackfillColumn:  NeedsBackfillColumnName("abc"),
+		KeepsMigrationWrites: true,
+		SQL:                  []string{"(x + 1)"},
 	})
 	assert.NoError(t, err)
 	assert.Equal(t, `CREATE OR REPLACE FUNCTION "triggerName"()
@@ -273,16 +273,23 @@ func TestBuildFunctionKeepingUnpinnedWrites(t *testing.T) {
         FROM current_setting('search_path');
 
       IF search_path != "my_app"."_pgroll_train_target"() THEN
-        IF search_path LIKE  E'my\\_app\\_%' THEN
-          _pgroll_fill := true;
-        ELSIF TG_OP = 'INSERT' THEN
-          _pgroll_fill := NEW."a" IS NULL;
+        IF TG_OP = 'UPDATE' THEN
+          _pgroll_fill := NEW."a" IS NOT DISTINCT FROM OLD."a";
         ELSE
-          _pgroll_fill := OLD."_pgroll_needs_backfill_abc" IS NOT FALSE;
+          _pgroll_fill := true;
+        END IF;
+        IF current_setting('application_name') = 'pgroll' THEN
+          IF TG_OP = 'UPDATE' THEN
+            _pgroll_fill := _pgroll_fill AND OLD."_pgroll_needs_backfill_abc" IS NOT FALSE;
+          ELSE
+            _pgroll_fill := NEW."a" IS NULL;
+          END IF;
         END IF;
         IF _pgroll_fill THEN
           NEW."a" = (x + 1);
         END IF;
+        NEW."_pgroll_needs_backfill_abc" = false;
+      ELSE
         NEW."_pgroll_needs_backfill_abc" = false;
       END IF;
 

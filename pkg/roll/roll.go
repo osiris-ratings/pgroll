@@ -10,6 +10,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/db"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/state"
@@ -22,7 +23,7 @@ const (
 
 	// applicationName is the Postgres application_name set on the connection
 	// used by the the Roll instance
-	applicationName = "pgroll"
+	applicationName = backfill.MigrationApplicationName
 )
 
 var (
