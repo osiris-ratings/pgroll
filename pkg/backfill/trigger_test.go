@@ -266,15 +266,21 @@ func TestBuildFunctionKeepingUnpinnedWrites(t *testing.T) {
       "x" "my_app"."w"."x"%TYPE := NEW."x";
       latest_schema text;
       search_path text;
+      _pgroll_fill boolean;
     BEGIN
       SELECT current_setting
         INTO search_path
         FROM current_setting('search_path');
 
       IF search_path != "my_app"."_pgroll_train_target"() THEN
-        IF search_path LIKE  E'my\\_app\\_%'
-          OR (TG_OP = 'INSERT' AND NEW."a" IS NULL)
-          OR (TG_OP = 'UPDATE' AND NEW."_pgroll_needs_backfill_abc" IS NOT FALSE) THEN
+        IF search_path LIKE  E'my\\_app\\_%' THEN
+          _pgroll_fill := true;
+        ELSIF TG_OP = 'INSERT' THEN
+          _pgroll_fill := NEW."a" IS NULL;
+        ELSE
+          _pgroll_fill := OLD."_pgroll_needs_backfill_abc" IS NOT FALSE;
+        END IF;
+        IF _pgroll_fill THEN
           NEW."a" = (x + 1);
         END IF;
         NEW."_pgroll_needs_backfill_abc" = false;

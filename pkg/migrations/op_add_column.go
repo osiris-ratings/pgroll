@@ -39,7 +39,7 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		fastPathDefault = v
 	}
 
-	started := o.startedName(scope, table)
+	started := o.startedName(s, table)
 	// A check is written against the column's own name, and rewritten when
 	// the column starts under another.
 	var rewritten []string
@@ -148,20 +148,23 @@ func (o *OpAddColumn) fillsPreviousRevisionWrites() bool {
 // startedName returns the physical name the column has from Start until
 // Complete. A column that fills the previous revision's writes waits for the
 // train's contraction, and SQL later in the train names it, so it starts
-// under its own name. It takes the temporary name when another column still
-// has that name physically: one an earlier operation drops or renames, which
-// is then deleted or keyed otherwise in table. Start, and every replay of it
-// over a schema read before or after it ran, make the same choice.
-func (o *OpAddColumn) startedName(scope string, table *schema.Table) string {
-	temporary := TemporaryName(scope, o.Column.Name)
-	if !o.fillsPreviousRevisionWrites() {
+// under its own name when its migration allows (s.OwnNamedColumns). It takes
+// the temporary name when another column still has that name physically:
+// one an earlier migration drops or renames, which is then deleted or keyed
+// otherwise in table. Start, and every replay of it over a schema read
+// before or after it ran, make the same choice.
+func (o *OpAddColumn) startedName(s *schema.Schema, table *schema.Table) string {
+	temporary := TemporaryName(s.MigrationScope, o.Column.Name)
+	if !s.OwnNamedColumns || !o.fillsPreviousRevisionWrites() {
 		return temporary
 	}
-	for key, column := range table.Columns {
-		if column.Name == temporary {
-			return temporary
-		}
-		if column.Name == o.Column.Name && (key != o.Column.Name || column.Deleted) {
+	// Replayed over a schema read after Start: the column is there, and a
+	// column with the temporary name is a later operation's duplicate of it.
+	if own := table.Columns[o.Column.Name]; own != nil && !own.Deleted && own.Name == o.Column.Name {
+		return o.Column.Name
+	}
+	for _, column := range table.Columns {
+		if column.Name == o.Column.Name || column.Name == temporary {
 			return temporary
 		}
 	}
@@ -209,9 +212,10 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 		return nil, TableDoesNotExistError{Name: o.Table}
 	}
 
-	// The rename is a no-op for a column that started under its own name.
+	// A column that started under its own name has nothing to rename, and
+	// another operation may have duplicated it under the temporary one.
 	dbActions := []DBAction{
-		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name),
+		NewRenameColumnAction(conn, table.Name, TemporaryName(scope, o.Column.Name), o.Column.Name).UnlessTargetExists(),
 		NewDropFunctionAction(conn, backfill.TriggerFunctionName(scope, o.Table, o.Column.Name)),
 		NewDropColumnAction(conn, table.Name, backfill.NeedsBackfillColumnName(scope)),
 	}
@@ -326,7 +330,7 @@ func (o *OpAddColumn) Validate(ctx context.Context, s *schema.Schema) error {
 	// Update the schema to ensure that the new column is visible to validation of
 	// subsequent operations.
 	table.AddColumn(o.Column.Name, &schema.Column{
-		Name: o.startedName(s.MigrationScope, table),
+		Name: o.startedName(s, table),
 	})
 
 	return nil

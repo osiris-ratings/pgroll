@@ -365,6 +365,7 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	// migrations.
 	scope := migrations.MigrationScopeFor(migration.Name)
 	newSchema.MigrationScope = scope
+	newSchema.OwnNamedColumns = migration.AddsColumnsUnderOwnNames()
 
 	// execute operations
 	job := backfill.NewJob(m.schema, versionSchemaName, scope)

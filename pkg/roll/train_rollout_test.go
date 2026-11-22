@@ -667,3 +667,64 @@ func TestTrainAddColumnWithDefaultAndDerivedUpIsBackfilled(t *testing.T) {
 		assert.True(t, filled, "a row the previous revision inserts")
 	})
 }
+
+// One migration adds two columns with `up` and puts a foreign key on them,
+// which duplicates them under the names they would have started with.
+func TestAddColumnsWithUpAndAConstraintOnThemInOneMigration(t *testing.T) {
+	t.Parallel()
+
+	rekey := func(name string) *migrations.Migration {
+		return &migrations.Migration{Name: name, Operations: migrations.Operations{
+			&migrations.OpAddColumn{Table: "h", Up: "(SELECT p.id FROM p WHERE p.acct = owner)", Column: migrations.Column{Name: "p_id", Type: "integer", Nullable: false}},
+			&migrations.OpAddColumn{Table: "h", Up: "(SELECT p.lane FROM p WHERE p.acct = owner)", Column: migrations.Column{Name: "lane", Type: "integer", Nullable: false}},
+			&migrations.OpCreateConstraint{
+				Name: "fk_h_p_lane", Table: "h", Type: "foreign_key", Columns: []string{"p_id", "lane"},
+				References: &migrations.TableForeignKeyReference{Table: "p", Columns: []string{"id", "lane"}},
+				Up:         map[string]string{"p_id": "p_id", "lane": "lane"},
+				Down:       map[string]string{"p_id": "p_id", "lane": "lane"},
+			},
+			&migrations.OpDropColumn{Table: "h", Column: "owner", Down: "(SELECT p.acct FROM p WHERE p.id = p_id)"},
+		}}
+	}
+	const base = `CREATE TABLE p (id integer PRIMARY KEY, lane integer, acct integer UNIQUE, UNIQUE (id, lane));
+		CREATE TABLE h (id integer PRIMARY KEY, owner integer NOT NULL);
+		INSERT INTO p VALUES (1, 100, 7);
+		INSERT INTO h VALUES (1, 7)`
+	check := func(t *testing.T, db *sql.DB) {
+		t.Helper()
+		require.Equal(t, 100, *intPtr(db, t, `SELECT lane FROM public.h WHERE id = 1`))
+		require.Zero(t, pgrollLeftovers(t, db))
+		var notNull bool
+		require.NoError(t, db.QueryRowContext(context.Background(), `
+			SELECT bool_and(attnotnull) FROM pg_attribute
+			WHERE attrelid = 'public.h'::regclass AND attname IN ('p_id', 'lane')`).Scan(&notNull))
+		require.True(t, notNull, "both columns end NOT NULL")
+	}
+
+	t.Run("on its own", func(t *testing.T) {
+		t.Parallel()
+		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, mig.Start(ctx, baseMigration(base), backfill.NewConfig()))
+			require.NoError(t, mig.Complete(ctx))
+			require.NoError(t, mig.Start(ctx, rekey("09_later"), backfill.NewConfig()))
+			require.NoError(t, mig.Complete(ctx))
+			check(t, db)
+		})
+	})
+	t.Run("mid-train", func(t *testing.T) {
+		t.Parallel()
+		testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+			ctx := context.Background()
+			require.NoError(t, mig.Start(ctx, baseMigration(base), backfill.NewConfig()))
+			require.NoError(t, mig.Complete(ctx))
+			applyExpandOnlyTrain(t, mig, []*migrations.Migration{rekey("01_rekey"), rawSQL("09_later", `SELECT 1`, `SELECT 1`)})
+			require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO p (id, lane, acct) VALUES (2, 200, 8)`))
+			require.NoError(t, execAs(t, db, previousSchema, `INSERT INTO h (id, owner) VALUES (2, 8)`))
+			require.NoError(t, execAs(t, db, targetSchema, `INSERT INTO h (id, p_id, lane) VALUES (3, 1, 100)`))
+			require.NoError(t, mig.Complete(ctx))
+			require.Equal(t, 200, *intPtr(db, t, `SELECT lane FROM public.h WHERE id = 2`))
+			check(t, db)
+		})
+	})
+}

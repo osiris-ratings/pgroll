@@ -259,6 +259,7 @@ func (m *Migration) Validate(ctx context.Context, s *schema.Schema) error {
 		}
 	}
 
+	s.OwnNamedColumns = m.AddsColumnsUnderOwnNames()
 	for _, op := range m.Operations {
 		err := op.Validate(ctx, s)
 		if err != nil {
@@ -363,10 +364,26 @@ func (m *Migration) UpdateVirtualSchema(ctx context.Context, s *schema.Schema) e
 
 	// Run `Start` on each operation using the fake DB. Updates will be made to
 	// the in-memory schema `s` without touching the physical database.
+	s.OwnNamedColumns = m.AddsColumnsUnderOwnNames()
 	for _, op := range m.Operations {
 		if _, err := op.Start(ctx, NewNoopLogger(), db, s); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// AddsColumnsUnderOwnNames reports whether the migration's add columns that
+// fill the previous revision's writes may start under their own names. The
+// other operations of a migration find a column it adds by its temporary
+// name, so only a migration of add columns, indexes and new tables qualifies.
+func (m *Migration) AddsColumnsUnderOwnNames() bool {
+	for _, op := range m.Operations {
+		switch op.(type) {
+		case *OpAddColumn, *OpCreateIndex, *OpCreateTable:
+		default:
+			return false
+		}
+	}
+	return true
 }

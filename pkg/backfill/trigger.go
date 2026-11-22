@@ -60,7 +60,9 @@ type OperationTrigger struct {
 	// schema itself can already name: pgroll's own, running a later
 	// migration, or anything else not pinned to a version schema. Their
 	// write keeps the value it gave the column. The expression still fills
-	// an insert that gave none and a row the backfill has not reached.
+	// an insert that gave none and a row the backfill had not reached: the
+	// stored marker says so, which a sibling trigger of the same migration
+	// may already have cleared on the new row.
 	KeepsUnpinnedWrites bool
 }
 

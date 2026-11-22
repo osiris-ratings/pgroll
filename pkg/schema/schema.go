@@ -42,6 +42,11 @@ type Schema struct {
 	// Excluded from JSON so it doesn't leak into resulting_schema.
 	MigrationScope string `json:"-"`
 
+	// OwnNamedColumns says the migration being started or replayed over this
+	// schema may add a column under its own name rather than a temporary
+	// one; see migrations.Migration.AddsColumnsUnderOwnNames. Not persisted.
+	OwnNamedColumns bool `json:"-"`
+
 	// shadowed holds soft-deleted tables whose virtual name a RenameTable
 	// took over, so the name's rollback can restore them.
 	shadowed map[string][]*Table

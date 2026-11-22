@@ -189,6 +189,17 @@ type renameColumnAction struct {
 	table string
 	from  string
 	to    string
+
+	// unlessTargetExists: see UnlessTargetExists.
+	unlessTargetExists bool
+}
+
+// UnlessTargetExists makes the rename a no-op when the table already has a
+// column with the new name: the column was created under it, and the old
+// name, if present, is another operation's column.
+func (a *renameColumnAction) UnlessTargetExists() *renameColumnAction {
+	a.unlessTargetExists = true
+	return a
 }
 
 func NewRenameColumnAction(conn db.DB, table, from, to string) *renameColumnAction {
@@ -212,6 +223,11 @@ func (a *renameColumnAction) Execute(ctx context.Context) error {
 	// on a missing source column when the table exists).
 	if a.alreadyRenamed(ctx) {
 		return nil
+	}
+	if a.unlessTargetExists {
+		if exists, _, err := columnExists(ctx, a.conn, a.table, a.to); err == nil && exists {
+			return nil
+		}
 	}
 
 	_, err := a.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE IF EXISTS %s RENAME COLUMN %s TO %s",
