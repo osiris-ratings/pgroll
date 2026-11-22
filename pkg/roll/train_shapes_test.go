@@ -763,7 +763,7 @@ func TestTrainShapeSealedRevertOfDropColumn(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. The known cost: raw SQL later in the train that names the column.
+// 8. Raw SQL later in the train that names the column.
 // ---------------------------------------------------------------------------
 
 func TestTrainShapeRawSQLNamingNewColumn(t *testing.T) {
@@ -822,7 +822,7 @@ func TestTrainShapeRevertOfATrainThePreviousBuildApplied(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Comparisons: what the base build already does with a deferred shape.
+// 10. Shapes that were deferred before an add_column with `up` was.
 // ---------------------------------------------------------------------------
 
 // A migration that mixes an add_column with `up` and a drop_column is
@@ -894,8 +894,8 @@ func TestTrainShapeAddColumnCheckWithoutUpMidTrain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. The prior review's findings, ported to the proposal's lifecycle (no
-//     kept triggers: the add_column is deferred instead).
+// 11. An unfinished or refused contraction, version schemas disabled, and
+//     long names.
 // ---------------------------------------------------------------------------
 
 // Prior finding 5: `pgroll complete` on a train that stopped after its first
