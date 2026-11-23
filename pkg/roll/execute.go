@@ -253,6 +253,10 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return ErrExistingSchemaWithoutHistory
 	}
 
+	if err := m.refuseBesideUnorderedTriggers(ctx); err != nil {
+		return err
+	}
+
 	m.logger.LogMigrationStart(migration)
 
 	if err := m.Validate(ctx, migration); err != nil {
@@ -304,6 +308,23 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 	// but ops need to know the name in advance in order to construct backfill
 	// triggers.
 	versionSchemaName := VersionedSchemaName(m.schema, migration.VersionSchemaName())
+	// An earlier migration of a train projects no schema of its own; the new
+	// revision pins the train's last one. The train's triggers read it from
+	// one function, so a Start that changes what the new revision pins (a
+	// train resumed with a different last migration, or a migration started
+	// alone on top of a train that stopped part-way) re-keys the triggers
+	// already installed.
+	followsTarget := o.trainTarget != nil
+	if followsTarget {
+		versionSchemaName = VersionedSchemaName(m.schema, o.trainTarget.VersionSchemaName())
+	}
+	if followsTarget || (!o.skipVersionSchema && !m.disableVersionSchemas) {
+		retargeted, err := m.retargetTrain(ctx, versionSchemaName)
+		if err != nil {
+			return nil, err
+		}
+		followsTarget = followsTarget || retargeted
+	}
 
 	// Reread the latest schema as validation may have updated the schema object
 	// in memory. Use the deferred-aware helper so this migration's operations
@@ -324,6 +345,14 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 
 	// execute operations
 	job := backfill.NewJob(m.schema, versionSchemaName, scope)
+	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the migrations still expanded: %w", err)
+	}
+	job.Position = len(unsealed)
+	if followsTarget {
+		job.TargetFunction = backfill.TrainTargetFunction
+	}
 	for _, op := range migration.Operations {
 		startOp, err := op.Start(ctx, m.logger, m.pgConn, newSchema)
 		if err != nil {
@@ -360,6 +389,13 @@ func (m *Roll) startDDLOperations(ctx context.Context, migration *migrations.Mig
 		}
 		if startOp.BackfillTask != nil {
 			job.AddTask(startOp.BackfillTask)
+		}
+	}
+
+	// The function exists only while a trigger reads it.
+	if followsTarget && job.HasTriggers() {
+		if err := m.setTrainTarget(ctx, versionSchemaName); err != nil {
+			return nil, err
 		}
 	}
 
@@ -655,11 +691,139 @@ func (m *Roll) Complete(ctx context.Context, opts ...CompleteOption) (err error)
 		if _, err := m.state.MarkSealed(ctx, m.schema); err != nil {
 			return err
 		}
+		if err := m.dropTrainTargetIfUnused(ctx); err != nil {
+			return err
+		}
 	}
 
 	m.logger.LogMigrationComplete(migration)
 
 	return nil
+}
+
+// setTrainTarget points the train's triggers at versionSchema. Every role
+// that writes a table calls the function through the table's triggers.
+func (m *Roll) setTrainTarget(ctx context.Context, versionSchema string) error {
+	function := pq.QuoteIdentifier(m.schema) + "." + pq.QuoteIdentifier(backfill.TrainTargetFunction)
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE OR REPLACE FUNCTION %s() RETURNS text LANGUAGE sql STABLE AS %s",
+			function, pq.QuoteLiteral("SELECT "+pq.QuoteLiteral(versionSchema)+"::text")),
+		fmt.Sprintf("GRANT EXECUTE ON FUNCTION %s() TO PUBLIC", function),
+	} {
+		if _, err := m.pgConn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("unable to set the train's target schema: %w", err)
+		}
+	}
+	return nil
+}
+
+// retargetTrain points a train's remaining triggers at versionSchema, and
+// reports whether a train with triggers is in flight.
+func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) (bool, error) {
+	exists, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2)`,
+		m.schema, backfill.TrainTargetFunction)
+	if err != nil || !exists {
+		return false, err
+	}
+	return true, m.setTrainTarget(ctx, versionSchema)
+}
+
+// PinnedTrainTarget returns the version schema the installed triggers of a
+// train follow, when that schema exists: sessions on it are the ones the
+// triggers take for the new revision. It returns "" when no train's triggers
+// are installed or the schema they follow was never projected.
+func (m *Roll) PinnedTrainTarget(ctx context.Context) (string, error) {
+	installed, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2)`,
+		m.schema, backfill.TrainTargetFunction)
+	if err != nil || !installed {
+		return "", err
+	}
+	// The name comes back only when a schema of that name exists.
+	rows, err := m.pgConn.QueryContext(ctx, fmt.Sprintf(
+		"SELECT nspname FROM pg_namespace WHERE nspname = %s.%s()",
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+	if err != nil {
+		return "", fmt.Errorf("unable to read the train's target: %w", err)
+	}
+	defer rows.Close()
+	var name string
+	if rows.Next() {
+		if err := rows.Scan(&name); err != nil {
+			return "", err
+		}
+	}
+	return name, rows.Err()
+}
+
+// dropTrainTargetIfUnused removes the train's target function once no
+// trigger function is left to call it.
+func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
+	inUse, err := m.hasTriggerFunctions(ctx)
+	if err != nil || inUse {
+		return err
+	}
+	_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s()",
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+	return err
+}
+
+// ErrUnorderedTriggers is returned by Start when triggers an earlier build
+// of pgroll installed are still in place.
+var ErrUnorderedTriggers = errors.New("triggers installed by an earlier pgroll build are still in place")
+
+// refuseBesideUnorderedTriggers refuses a Start while a trigger named the
+// way earlier builds named them (after its function) is installed. A new
+// migration's triggers are named for their place in the train, and the two
+// kinds of name do not sort into the order a write must cross them in.
+func (m *Roll) refuseBesideUnorderedTriggers(ctx context.Context) error {
+	rows, err := m.pgConn.QueryContext(ctx, `
+		SELECT t.tgname || ' on ' || c.relname
+		FROM pg_trigger t
+		JOIN pg_proc p ON p.oid = t.tgfoid
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		AND NOT t.tgisinternal
+		AND p.proname LIKE '\_pgroll\_trigger\_%'
+		AND t.tgname !~ '^_pgroll_trigger_[az][0-9]{4}_[0-9]{3}_[0-9a-f]{16}$'
+		ORDER BY 1
+		LIMIT 1`, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to look for triggers of an earlier build: %w", err)
+	}
+	defer rows.Close()
+
+	var found sql.NullString
+	if err := db.ScanFirstValue(rows, &found); err != nil {
+		return fmt.Errorf("unable to look for triggers of an earlier build: %w", err)
+	}
+	if !found.Valid {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: %s. Finish the deployment that installed it with `pgroll complete`, or undo it with "+
+			"`pgroll revert`, before starting a migration with this build; a train that stopped "+
+			"part-way is resumed with the build that started it",
+		ErrUnorderedTriggers, found.String)
+}
+
+// hasTriggerFunctions reports whether any migration's trigger function is
+// installed in the schema.
+func (m *Roll) hasTriggerFunctions(ctx context.Context) (bool, error) {
+	// A function no trigger calls cannot fire, whoever left it behind.
+	return m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_trigger t
+			JOIN pg_proc p ON p.oid = t.tgfoid
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%' AND NOT t.tgisinternal)`,
+		m.schema)
 }
 
 // Rollback will revert the changes made by the migration
@@ -690,7 +854,7 @@ func (m *Roll) Rollback(ctx context.Context) error {
 
 	m.logger.LogMigrationRollbackComplete(migration)
 
-	return nil
+	return m.dropTrainTargetIfUnused(ctx)
 }
 
 // dropVersionSchema deletes the migration's version schema and its views, if

@@ -195,6 +195,11 @@
       "example": "",
       "flags": [
         {
+          "name": "leaf-unpinned",
+          "description": "point the triggers of applied, uncontracted migrations at the materialized schema although the version schema they follow exists; only when no workload is pinned to that schema",
+          "default": "false"
+        },
+        {
           "name": "migrations",
           "description": "Optional directory of migration files; unapplied migrations are replayed in memory before projecting views",
           "default": ""
@@ -239,6 +244,11 @@
         {
           "name": "expect-one",
           "description": "Abort if there is more than one migration to be applied",
+          "default": "false"
+        },
+        {
+          "name": "leaf-unpinned",
+          "description": "start on top of an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
           "default": "false"
         },
         {
@@ -444,6 +454,11 @@
           "name": "complete",
           "shorthand": "c",
           "description": "Mark the migration as complete",
+          "default": "false"
+        },
+        {
+          "name": "leaf-unpinned",
+          "description": "start on top of an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
           "default": "false"
         },
         {

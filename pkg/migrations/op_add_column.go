@@ -125,6 +125,12 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 }
 
+// upRepeatsDefault reports whether `up` is the column's default as written,
+// so that it yields what the default does for a row with no value yet.
+func (o *OpAddColumn) upRepeatsDefault() bool {
+	return o.Column.HasDefault() && strings.TrimSpace(o.Up) == strings.TrimSpace(*o.Column.Default)
+}
+
 func toSchemaColumn(c Column) *schema.Column {
 	tmpColumn := &schema.Column{
 		Name:     c.Name,

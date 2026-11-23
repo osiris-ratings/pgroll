@@ -21,7 +21,7 @@ import (
 )
 
 func startCmd() *cobra.Command {
-	var complete bool
+	var complete, leafUnpinned bool
 	var batchSize int
 	var batchDelay time.Duration
 
@@ -51,6 +51,21 @@ func startCmd() *cobra.Command {
 				return nil
 			}
 
+			if !complete {
+				if err := refuseOnOpenTrain(ctx, m, leafUnpinned); err != nil {
+					return err
+				}
+			}
+			if !complete && !leafUnpinned && m.UseVersionSchema() {
+				migration, err := migrations.ReadMigration(os.DirFS(filepath.Dir(fileName)), filepath.Base(fileName))
+				if err != nil {
+					return err
+				}
+				if err := refuseMovingAPinnedTarget(ctx, m, migration.VersionSchemaName()); err != nil {
+					return err
+				}
+			}
+
 			c := backfill.NewConfig(
 				backfill.WithBatchSize(batchSize),
 				backfill.WithBatchDelay(batchDelay),
@@ -63,6 +78,7 @@ func startCmd() *cobra.Command {
 	startCmd.Flags().IntVar(&batchSize, "backfill-batch-size", backfill.DefaultBatchSize, "Number of rows backfilled in each batch")
 	startCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	startCmd.Flags().BoolVarP(&complete, "complete", "c", false, "Mark the migration as complete")
+	startCmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, leafUnpinnedUsage)
 	startCmd.Flags().BoolP("skip-validation", "s", false, "skip migration validation")
 
 	viper.BindPFlag("SKIP_VALIDATION", startCmd.Flags().Lookup("skip-validation"))

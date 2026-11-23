@@ -20,7 +20,7 @@ import (
 func materializeCmd() *cobra.Command {
 	var migrationsDir string
 	var versionOverride string
-	var yes bool
+	var yes, leafUnpinned bool
 
 	cmd := &cobra.Command{
 		Use:   "materialize",
@@ -56,11 +56,6 @@ func materializeCmd() *cobra.Command {
 				return materializeActive(ctx, m, migrationsDir, versionOverride, yes)
 			}
 
-			sc, err := m.State().ReadSchema(ctx, m.Schema())
-			if err != nil {
-				return fmt.Errorf("failed to read live schema: %w", err)
-			}
-
 			var parsedMigs []*migrations.Migration
 			if migrationsDir != "" {
 				info, err := os.Stat(migrationsDir)
@@ -78,16 +73,54 @@ func materializeCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("failed to parse migrations: %w", err)
 				}
-				for _, mig := range parsedMigs {
-					if err := mig.UpdateVirtualSchema(ctx, sc); err != nil {
-						return fmt.Errorf("failed to project migration %q in memory: %w", mig.Name, err)
+			}
+
+			// A train that stopped part-way has migrations waiting for its
+			// contraction. The schema the new revision pins (the leaf's, or
+			// a later one fast-forwarded through unapplied migrations)
+			// projects what they changed, and the train's triggers follow
+			// it. An earlier version named with --version projects the
+			// tables as they are, for the previous revision.
+			readSchema := m.SchemaWithDeferred
+			materializeOpts := []roll.MaterializeOption{roll.WithNewRevisionPinned(), roll.WithUnprojectableTablesAsTheyAre()}
+			pinnedByNewRevision := true
+			switch {
+			case len(parsedMigs) > 0:
+				// No applied migration projected this schema, so a table
+				// it cannot build is an error.
+				materializeOpts = []roll.MaterializeOption{roll.WithNewRevisionPinned()}
+			case versionOverride != "":
+				leaf, err := m.LeafVersionSchema(ctx)
+				if err != nil {
+					return err
+				}
+				if versionOverride != leaf {
+					readSchema = func(ctx context.Context) (*schema.Schema, error) {
+						return m.State().ReadSchema(ctx, m.Schema())
 					}
+					materializeOpts = nil
+					pinnedByNewRevision = false
+				}
+			}
+			sc, err := readSchema(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to read live schema: %w", err)
+			}
+			for _, mig := range parsedMigs {
+				if err := mig.UpdateVirtualSchema(ctx, sc); err != nil {
+					return fmt.Errorf("failed to project migration %q in memory: %w", mig.Name, err)
 				}
 			}
 
 			version, err := resolveMaterializeVersion(ctx, m, parsedMigs, versionOverride)
 			if err != nil {
 				return err
+			}
+
+			if pinnedByNewRevision && !leafUnpinned {
+				if err := refuseMovingAPinnedTarget(ctx, m, version); err != nil {
+					return err
+				}
 			}
 
 			if err := printMaterializePreFlight(m, sc, version, parsedMigs, os.Stdout); err != nil {
@@ -102,7 +135,7 @@ func materializeCmd() *cobra.Command {
 			}
 
 			sp, _ := pterm.DefaultSpinner.WithText(fmt.Sprintf("Materializing %q...", roll.VersionedSchemaName(m.Schema(), version))).Start()
-			if err := m.Materialize(ctx, version, sc); err != nil {
+			if err := m.Materialize(ctx, version, sc, materializeOpts...); err != nil {
 				sp.Fail(fmt.Sprintf("Failed to materialize: %s", err))
 				return err
 			}
@@ -114,6 +147,8 @@ func materializeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&migrationsDir, "migrations", "", "Optional directory of migration files; unapplied migrations are replayed in memory before projecting views")
 	cmd.Flags().StringVar(&versionOverride, "version", "", "Override the version name (default: derived from --migrations or pgroll state)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
+	cmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, "point the triggers of applied, uncontracted migrations at the materialized schema although the "+
+		"version schema they follow exists; only when no workload is pinned to that schema")
 
 	return cmd
 }

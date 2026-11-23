@@ -312,6 +312,9 @@ func (m *Roll) Revert(ctx context.Context, opts ...RevertOption) ([]RevertTarget
 		if err := m.ensureLeafVersionSchema(ctx); err != nil {
 			return nil, fmt.Errorf("unable to materialize version schema for the new leaf: %w", err)
 		}
+		if err := m.dropTrainTargetIfUnused(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	return targets, nil
@@ -339,6 +342,10 @@ func (m *Roll) ensureLeafVersionSchema(ctx context.Context) error {
 		return err
 	}
 	want := VersionedSchemaName(m.schema, leaf.VersionSchemaName())
+	// The revisions now pin the new leaf: what is left of the train follows.
+	if _, err := m.retargetTrain(ctx, want); err != nil {
+		return err
+	}
 	existing, err := m.ExistingVersionSchemas(ctx)
 	if err != nil {
 		return err
@@ -433,4 +440,42 @@ func (m *Roll) rollbackCompletedOperations(ctx context.Context, migration *migra
 		}
 	}
 	return nil
+}
+
+// ReopenedTrainLeaf returns the name of the history leaf when a train is
+// open on it with triggers and a version schema a fleet can pin: a trigger
+// of an earlier migration is still installed and the leaf's version schema
+// is present. A bounded revert leaves that, and so do materializing the leaf
+// of a train that stopped part-way and a contraction that stopped between
+// two of its migrations. It returns "" otherwise, including for a train that
+// stopped part-way and was left alone, whose leaf has no version schema, and
+// for a contraction that stopped before sealing, which has no trigger left.
+// Callers ask only when nothing is in progress.
+//
+// A new train started in that state would give the open one's triggers a
+// third revision to tell apart, which they cannot do.
+func (m *Roll) ReopenedTrainLeaf(ctx context.Context) (string, error) {
+	if m.disableVersionSchemas {
+		return "", nil
+	}
+	triggers, err := m.hasTriggerFunctions(ctx)
+	if err != nil || !triggers {
+		return "", err
+	}
+	latest, err := m.state.LatestMigration(ctx, m.schema)
+	if err != nil || latest == nil {
+		return "", err
+	}
+	leaf, err := m.state.GetMigration(ctx, m.schema, *latest)
+	if err != nil {
+		return "", err
+	}
+	existing, err := m.ExistingVersionSchemas(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !slices.Contains(existing, VersionedSchemaName(m.schema, leaf.VersionSchemaName())) {
+		return "", nil
+	}
+	return leaf.Name, nil
 }
