@@ -4,7 +4,9 @@ package roll
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/schema"
@@ -42,7 +44,26 @@ func (m *Roll) SchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
 	return m.readSchemaWithDeferred(ctx)
 }
 
-func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schema) error {
+// MaterializeOption is a functional option for Materialize.
+type MaterializeOption func(*materializeOptions)
+
+type materializeOptions struct{ pinnedByNewRevision bool }
+
+// WithNewRevisionPinned says the materialized schema is the one the new
+// revision pins, projected with what the migrations waiting for a
+// contraction changed (SchemaWithDeferred). The triggers of a train in
+// flight then follow it: they and the views must agree on which revision a
+// session on that schema is.
+func WithNewRevisionPinned() MaterializeOption {
+	return func(o *materializeOptions) { o.pinnedByNewRevision = true }
+}
+
+func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schema, opts ...MaterializeOption) error {
+	var o materializeOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	if version == "" {
 		return fmt.Errorf("materialize: version name must not be empty")
 	}
@@ -54,20 +75,48 @@ func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schem
 
 	mig := &migrations.Migration{Name: version}
 	if err := m.ensureViews(ctx, sc, mig); err != nil {
-		return fmt.Errorf("materialize: %w", err)
+		if !o.pinnedByNewRevision {
+			return fmt.Errorf("materialize: %w", err)
+		}
+		// A contraction that stopped between a migration's last statement
+		// and the clearing of its flag leaves a table the projection cannot
+		// describe. Such a table is projected as it is, the way a contraction
+		// restores its live views (see restoreLiveViews).
+		if err := m.ensureViewsFallingBack(ctx, sc, mig); err != nil {
+			return fmt.Errorf("materialize: %w", err)
+		}
 	}
 
-	// A fleet can now pin the leaf of a train that stopped part-way, so the
-	// train's triggers follow it.
-	leaf, err := m.LeafVersionSchema(ctx)
-	if err != nil {
-		return fmt.Errorf("materialize: %w", err)
-	}
-	if leaf != version {
+	if !o.pinnedByNewRevision {
 		return nil
 	}
 	if _, err := m.retargetTrain(ctx, VersionedSchemaName(m.schema, version)); err != nil {
 		return fmt.Errorf("materialize: %w", err)
 	}
 	return nil
+}
+
+// ensureViewsFallingBack creates version's views from sc, and from the
+// tables as they are for each one sc cannot build.
+func (m *Roll) ensureViewsFallingBack(ctx context.Context, sc *schema.Schema, mig *migrations.Migration) error {
+	physical, err := m.state.ReadSchema(ctx, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to read schema: %w", err)
+	}
+	var errs []error
+	for name, table := range sc.Tables {
+		if table == nil || table.Deleted || strings.HasPrefix(table.Name, "_pgroll_del_") {
+			continue
+		}
+		err := m.ensureView(ctx, mig.VersionSchemaName(), name, table)
+		if err != nil {
+			if alt := physical.GetTable(name); alt != nil && !strings.HasPrefix(alt.Name, "_pgroll_del_") {
+				err = m.ensureView(ctx, mig.VersionSchemaName(), name, alt)
+			}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("view %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }

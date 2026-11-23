@@ -841,14 +841,25 @@ func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
 // last migration, an add column whose `up` fills the column for the
 // previous revision's writes. Completing it drops the trigger that does the
 // filling, and the previous revision keeps writing until `pgroll complete`.
+// A table the run itself creates has no previous revision writing it.
 // Nothing has been applied when it refuses.
 func refuseEarlyCompleteOfAFill(migs []*migrations.Migration) error {
-	for _, mig := range migs[:len(migs)-1] {
-		if mig.CompleteMustBeDeferred() {
-			continue // waits for `pgroll complete`, its trigger with it
+	created := map[string]bool{}
+	for i, mig := range migs[:len(migs)-1] {
+		var fill *migrations.OpAddColumn
+		for _, op := range mig.Operations {
+			if create, ok := op.(*migrations.OpCreateTable); ok {
+				created[create.Name] = true
+			}
 		}
-		fill := mig.FillOfPreviousRevisionWrites()
-		if fill == nil {
+		for _, add := range mig.FillsOfPreviousRevisionWrites() {
+			if !created[add.Table] {
+				fill = add
+				break
+			}
+		}
+		// A migration that waits for `pgroll complete` keeps its trigger.
+		if fill == nil || mig.CompleteMustBeDeferred() {
 			continue
 		}
 		return fmt.Errorf(
@@ -857,7 +868,7 @@ func refuseEarlyCompleteOfAFill(migs []*migrations.Migration) error {
 				"before `pgroll complete` would stop the filling while the previous revision still "+
 				"writes. Apply up to it first (`pgroll migrate --to %[1]s`), finish that deployment "+
 				"with `pgroll complete`, then run again. With no previous revision running, use --complete",
-			mig.Name, fill.Column.Name, fill.Table, len(migs)-1-slices.Index(migs, mig),
+			mig.Name, fill.Column.Name, fill.Table, len(migs)-1-i,
 		)
 	}
 	return nil

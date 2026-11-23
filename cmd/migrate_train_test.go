@@ -220,7 +220,7 @@ func TestAnOpenTrainWithAMaterializedLeafNeedsLeafUnpinned(t *testing.T) {
 			// Its leaf is then materialized.
 			sc, err := m.SchemaWithDeferred(ctx)
 			require.NoError(t, err)
-			require.NoError(t, m.Materialize(ctx, "01_one", sc))
+			require.NoError(t, m.Materialize(ctx, "01_one", sc, roll.WithNewRevisionPinned()))
 
 			require.ErrorContains(t, migrate(), "--leaf-unpinned")
 
@@ -311,6 +311,77 @@ operations:
 			require.NoError(t, complete.ExecuteContext(ctx))
 			require.NoError(t, migrate())
 			require.NoError(t, m.Complete(ctx))
+		})
+}
+
+// A table the run itself creates has no previous revision writing it, and an
+// `up` that repeats the column's default has nothing to add to it, so
+// neither is refused.
+// Not parallel: the command reads its connection from process-wide flags.
+func TestMigrateAppliesAFillNoPreviousRevisionNeeds(t *testing.T) {
+	testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+		func(_ *roll.Roll, connStr string, db *sql.DB) {
+			ctx := context.Background()
+			viper.Set("PG_URL", connStr)
+			viper.Set("SCHEMA", "public")
+			viper.Set("STATE_SCHEMA", "pgroll")
+			viper.Set("LOCK_TIMEOUT", 500)
+			viper.Set("USE_VERSION_SCHEMA", true)
+			t.Cleanup(viper.Reset)
+
+			dir := t.TempDir()
+			write := func(name, body string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name+".yaml"), []byte(body), 0o600))
+			}
+			migrate := func(args ...string) error {
+				c := migrateCmd()
+				c.SetArgs(append([]string{dir}, args...))
+				c.SilenceUsage, c.SilenceErrors = true, true
+				return c.ExecuteContext(ctx)
+			}
+			write("00_base", "operations:\n  - sql:\n      up: CREATE TABLE w (id integer PRIMARY KEY, x integer)\n      down: DROP TABLE w\n")
+			require.NoError(t, migrate("--complete"))
+
+			write("01_new_table", `
+operations:
+  - create_table:
+      name: notes
+      columns:
+        - name: id
+          type: integer
+          pk: true
+`)
+			write("02_add_to_new_table", `
+operations:
+  - add_column:
+      table: notes
+      up: id + 1
+      column:
+        name: a
+        type: integer
+        nullable: true
+`)
+			write("03_add_with_default", `
+operations:
+  - add_column:
+      table: w
+      up: COALESCE(kind, 'liens')
+      column:
+        name: kind
+        type: text
+        nullable: false
+        default: "'liens'"
+`)
+			write("04_comment", "operations:\n  - sql:\n      up: COMMENT ON TABLE w IS 'four'\n      down: COMMENT ON TABLE w IS NULL\n")
+			require.NoError(t, migrate())
+
+			conn, err := db.Conn(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.ExecContext(ctx, `SET search_path TO public_00_base`)
+			require.NoError(t, err)
+			_, err = conn.ExecContext(ctx, `INSERT INTO w (id, x) VALUES (1, 10)`)
+			require.NoError(t, err, "the previous revision's write takes the column's default")
 		})
 }
 

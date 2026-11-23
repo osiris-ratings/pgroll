@@ -253,6 +253,10 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		return ErrExistingSchemaWithoutHistory
 	}
 
+	if err := m.refuseBesideUnorderedTriggers(ctx); err != nil {
+		return err
+	}
+
 	m.logger.LogMigrationStart(migration)
 
 	if err := m.Validate(ctx, migration); err != nil {
@@ -737,6 +741,46 @@ func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {
 	_, err = m.pgConn.ExecContext(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s.%s()",
 		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
 	return err
+}
+
+// ErrUnorderedTriggers is returned by Start when triggers an earlier build
+// of pgroll installed are still in place.
+var ErrUnorderedTriggers = errors.New("triggers installed by an earlier pgroll build are still in place")
+
+// refuseBesideUnorderedTriggers refuses a Start while a trigger named the
+// way earlier builds named them (after its function) is installed. A new
+// migration's triggers are named for their place in the train, and the two
+// kinds of name do not sort into the order a write must cross them in.
+func (m *Roll) refuseBesideUnorderedTriggers(ctx context.Context) error {
+	rows, err := m.pgConn.QueryContext(ctx, `
+		SELECT t.tgname || ' on ' || c.relname
+		FROM pg_trigger t
+		JOIN pg_proc p ON p.oid = t.tgfoid
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		AND NOT t.tgisinternal
+		AND p.proname LIKE '\_pgroll\_trigger\_%'
+		AND t.tgname !~ '^_pgroll_trigger_[az][0-9]{4}_[0-9]{3}_[0-9a-f]{16}$'
+		ORDER BY 1
+		LIMIT 1`, m.schema)
+	if err != nil {
+		return fmt.Errorf("unable to look for triggers of an earlier build: %w", err)
+	}
+	defer rows.Close()
+
+	var found sql.NullString
+	if err := db.ScanFirstValue(rows, &found); err != nil {
+		return fmt.Errorf("unable to look for triggers of an earlier build: %w", err)
+	}
+	if !found.Valid {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: %s. Finish the deployment that installed it with `pgroll complete`, or undo it with "+
+			"`pgroll revert`, before starting a migration with this build; a train that stopped "+
+			"part-way is resumed with the build that started it",
+		ErrUnorderedTriggers, found.String)
 }
 
 // hasTriggerFunctions reports whether any migration's trigger function is

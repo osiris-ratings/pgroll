@@ -443,26 +443,19 @@ func (m *Roll) rollbackCompletedOperations(ctx context.Context, migration *migra
 }
 
 // ReopenedTrainLeaf returns the name of the history leaf when a train is
-// open on it with triggers and a version schema a fleet can pin: migrations
-// applied and not yet contracted, a trigger of theirs still installed, and
-// the leaf's version schema present. A bounded revert leaves that, and so
-// does materializing the leaf of a train that stopped part-way. It returns
-// "" otherwise, including for a train that stopped part-way and was left
-// alone, whose leaf has no version schema, and for a contraction that
-// stopped before sealing, which has no trigger left. Callers ask only when
-// nothing is in progress.
+// open on it with triggers and a version schema a fleet can pin: a trigger
+// of an earlier migration is still installed and the leaf's version schema
+// is present. A bounded revert leaves that, and so do materializing the leaf
+// of a train that stopped part-way and a contraction that stopped between
+// two of its migrations. It returns "" otherwise, including for a train that
+// stopped part-way and was left alone, whose leaf has no version schema, and
+// for a contraction that stopped before sealing, which has no trigger left.
+// Callers ask only when nothing is in progress.
 //
 // A new train started in that state would give the open one's triggers a
 // third revision to tell apart, which they cannot do.
 func (m *Roll) ReopenedTrainLeaf(ctx context.Context) (string, error) {
 	if m.disableVersionSchemas {
-		return "", nil
-	}
-	unsealed, err := m.state.UnsealedMigrations(ctx, m.schema)
-	if err != nil {
-		return "", err
-	}
-	if !slices.ContainsFunc(unsealed, func(r *state.MigrationRecord) bool { return r.Done }) {
 		return "", nil
 	}
 	triggers, err := m.hasTriggerFunctions(ctx)

@@ -57,10 +57,13 @@ func materializeCmd() *cobra.Command {
 			}
 
 			// A train that stopped part-way has migrations waiting for its
-			// contraction; the leaf, and anything after it, projects what
-			// they changed. An earlier version named with --version projects
-			// the tables as they are.
+			// contraction. The schema the new revision pins (the leaf's, or
+			// a later one with --migrations) projects what they changed, and
+			// the train's triggers follow it. An earlier version named with
+			// --version projects the tables as they are, for the previous
+			// revision.
 			readSchema := m.SchemaWithDeferred
+			materializeOpts := []roll.MaterializeOption{roll.WithNewRevisionPinned()}
 			if versionOverride != "" && migrationsDir == "" {
 				leaf, err := m.LeafVersionSchema(ctx)
 				if err != nil {
@@ -70,6 +73,7 @@ func materializeCmd() *cobra.Command {
 					readSchema = func(ctx context.Context) (*schema.Schema, error) {
 						return m.State().ReadSchema(ctx, m.Schema())
 					}
+					materializeOpts = nil
 				}
 			}
 			sc, err := readSchema(ctx)
@@ -118,7 +122,7 @@ func materializeCmd() *cobra.Command {
 			}
 
 			sp, _ := pterm.DefaultSpinner.WithText(fmt.Sprintf("Materializing %q...", roll.VersionedSchemaName(m.Schema(), version))).Start()
-			if err := m.Materialize(ctx, version, sc); err != nil {
+			if err := m.Materialize(ctx, version, sc, materializeOpts...); err != nil {
 				sp.Fail(fmt.Sprintf("Failed to materialize: %s", err))
 				return err
 			}

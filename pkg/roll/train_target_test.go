@@ -147,7 +147,7 @@ func TestTrainMaterializedLeafOfAPartialTrainRekeysTheTriggers(t *testing.T) {
 		// `pgroll materialize`, as cmd/materialize.go does with nothing active.
 		sc, err := mig.SchemaWithDeferred(ctx)
 		require.NoError(t, err)
-		require.NoError(t, mig.Materialize(ctx, "02_comment", sc))
+		require.NoError(t, mig.Materialize(ctx, "02_comment", sc, roll.WithNewRevisionPinned()))
 
 		reopened, err := mig.ReopenedTrainLeaf(ctx)
 		require.NoError(t, err)
@@ -281,4 +281,34 @@ func laterIndexNamed(name, table, column string) *migrations.Migration {
 	m := laterIndex(table, column)
 	m.Name = name
 	return m
+}
+
+// A build that named a trigger after its function left one installed. A new
+// migration's triggers are named for their place in the train, and the two
+// do not sort into the order a write must cross them in, so Start refuses.
+func TestStartRefusesBesideTriggersOfAnEarlierBuild(t *testing.T) {
+	t.Parallel()
+
+	testutils.WithMigratorAndConnectionToContainer(t, func(mig *roll.Roll, db *sql.DB) {
+		ctx := context.Background()
+		startBase(t, mig, baseUV)
+		applyMidTrain(t, mig, checkV("01_check_v"), laterIndex("u", "id"))
+
+		// As the earlier build named it.
+		var function, trigger string
+		require.NoError(t, db.QueryRowContext(ctx, `
+			SELECT p.proname, t.tgname FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+			WHERE t.tgrelid = 'public.u'::regclass AND NOT t.tgisinternal ORDER BY t.tgname LIMIT 1`).Scan(&function, &trigger))
+		_, err := db.ExecContext(ctx, `ALTER TRIGGER "`+trigger+`" ON public.u RENAME TO "`+function+`"`)
+		require.NoError(t, err)
+
+		err = mig.Start(ctx, rawSQL("02_comment", `COMMENT ON TABLE u IS 'x'`, `SELECT 1`), backfill.NewConfig())
+		require.ErrorIs(t, err, roll.ErrUnorderedTriggers)
+		require.ErrorContains(t, err, function)
+
+		// Undoing the deployment that installed it clears the way.
+		_, err = mig.Revert(ctx)
+		require.NoError(t, err)
+		require.NoError(t, mig.Start(ctx, rawSQL("02_comment", `COMMENT ON TABLE u IS 'x'`, `SELECT 1`), backfill.NewConfig()))
+	})
 }

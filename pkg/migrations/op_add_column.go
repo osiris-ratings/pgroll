@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/xataio/pgroll/internal/defaults"
@@ -124,6 +125,36 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 }
+
+// upRepeatsDefault reports whether `up` yields what the column's default
+// does for a row that has no value yet: the default itself, with or without
+// a cast, or COALESCE(<column>, <default>).
+func (o *OpAddColumn) upRepeatsDefault() bool {
+	if !o.Column.HasDefault() {
+		return false
+	}
+	normalize := func(e string) string {
+		e = strings.TrimSpace(e)
+		for strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") {
+			e = strings.TrimSpace(e[1 : len(e)-1])
+		}
+		return castSuffix.ReplaceAllString(e, "")
+	}
+	want := normalize(*o.Column.Default)
+	up := normalize(o.Up)
+	if up == want {
+		return true
+	}
+	if m := coalesceOfColumn.FindStringSubmatch(up); m != nil && strings.EqualFold(strings.Trim(m[1], `"`), o.Column.Name) {
+		return normalize(m[2]) == want
+	}
+	return false
+}
+
+var (
+	castSuffix       = regexp.MustCompile(`(?i)(::\s*[a-z_][a-z0-9_.]*(\s*\[\s*\])*)+$`)
+	coalesceOfColumn = regexp.MustCompile(`(?is)^coalesce\(\s*("?[a-z_][a-z0-9_]*"?)\s*,(.*)\)$`)
+)
 
 func toSchemaColumn(c Column) *schema.Column {
 	tmpColumn := &schema.Column{

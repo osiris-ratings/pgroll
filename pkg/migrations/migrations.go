@@ -323,21 +323,19 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
-// FillOfPreviousRevisionWrites returns the migration's first add column
-// whose `up` fills the column for the previous revision's writes, or nil.
-// An `up` that only repeats the column's default is not one: the default
-// fills those writes once the column completes.
-func (m *Migration) FillOfPreviousRevisionWrites() *OpAddColumn {
+// FillsOfPreviousRevisionWrites returns the migration's add columns whose
+// `up` fills the column for the previous revision's writes: completing one
+// drops the trigger that does it. An `up` that repeats the column's default
+// is not one, since the default fills those writes once the column
+// completes.
+func (m *Migration) FillsOfPreviousRevisionWrites() []*OpAddColumn {
+	var fills []*OpAddColumn
 	for _, op := range m.Operations {
-		add, ok := op.(*OpAddColumn)
-		if !ok || add.Up == "" {
-			continue
-		}
-		if !add.Column.HasDefault() || add.Up != *add.Column.Default {
-			return add
+		if add, ok := op.(*OpAddColumn); ok && add.Up != "" && !add.upRepeatsDefault() {
+			fills = append(fills, add)
 		}
 	}
-	return nil
+	return fills
 }
 
 // CompleteRunsRawSQL reports whether this migration's Complete runs
