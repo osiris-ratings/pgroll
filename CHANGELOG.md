@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A baseline folds in a set of migrations, not a point in apply order.**
+  History rows were hidden by `created_at` and files were skipped by name, so
+  `pgroll rebaseline` had to refuse any database whose apply order disagreed
+  with name order across the anchor. Live databases always disagree: a
+  back-dated migration lands after newer-named ones, and two environments
+  batch their deploys differently. Both cuts are now by name:
+  - `SchemaHistory` hides the rows named at or before the latest baseline,
+    and `LatestBaseline` is the baseline whose name sorts last. Names compare
+    under the C collation, as filenames do. Inferred rows are hidden up to
+    the newest folded row.
+  - `pgroll baseline` and `pgroll stamp --type baseline` refuse a name that
+    sorts before a migration already applied.
+  - `pgroll start` and `pgroll migrate` refuse a migration named at or
+    before the baseline: it would be folded in the moment it was recorded.
+  - Inverse migrations a sealed revert creates (`revert_<name>`) are never
+    folded, whatever the baseline is named.
+
+### Added
+
+- **A fold set for `pgroll rebaseline`.** `<baseline>.folds`, beside the
+  baseline file, lists the migrations the baseline folds in: one per line, a
+  name and optionally its comma-separated targets. With it, `rebaseline`
+  checks the database against the set and ignores apply order: every listed
+  migration `--target` selects must be applied and contracted, and no row at
+  or below the anchor may be missing from the list. A database that never
+  applied a deleted migration is now refused by name; before, nothing
+  noticed. `--target` takes effect. A directory without the file keeps the
+  previous check, name order agreeing with apply order. The set is
+  cumulative: it reaches back to the oldest baseline a database may still
+  be on. A database built from the truncated directory, which ran the
+  baseline file itself, is not asked for rows it never needed.
+
+- **A revert floor.** With apply order free, a folded migration can sit
+  above a kept one. `revert --to` a migration applied before a folded one is
+  refused: the folded migration cannot be inverted, and the kept one's
+  snapshot is not the schema beneath what follows. `revert --to <baseline>`
+  stops at the newest folded row and leaves kept migrations applied before
+  it in place. `pgroll plan` converges on the same row.
+
+### Fixed
+
+- **`pgroll plan` when the database's last migration is the baseline.** A
+  pending migration reported `diverged: true`, and with nothing pending
+  `in_sync` was false. The same now holds for a leaf folded into the
+  baseline: it stands for the baseline, so the first is a plain apply and
+  the second is in sync.
+- **`pgroll migrate`'s pre-flight reads the real leaf.** It took the newest
+  visible history row for the leaf, so a folded leaf produced a RECOVERY
+  warning about a version schema that was dropped on purpose.
+
 ## [0.16.2-baselayer.27] - 2026-11-23
 
 ## [0.16.2-baselayer.27] - 2026-11-08

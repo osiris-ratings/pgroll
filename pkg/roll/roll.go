@@ -28,6 +28,9 @@ const (
 var (
 	ErrMismatchedMigration          = fmt.Errorf("remote migration does not match local migration")
 	ErrExistingSchemaWithoutHistory = fmt.Errorf("schema has existing tables but no migration history - baseline required")
+	// ErrMigrationBelowBaseline is returned when a migration to start is
+	// named at or before the baseline, which would fold it in on arrival.
+	ErrMigrationBelowBaseline = fmt.Errorf("migration is folded into the baseline")
 )
 
 type Roll struct {

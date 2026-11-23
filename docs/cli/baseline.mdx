@@ -16,7 +16,7 @@ Use `pgroll baseline` when:
 - You want to consolidate a long migration history into a clean starting point
 
 The command requires two arguments:
-1. `version` - The version name for the baseline (e.g., "01_initial_schema")
+1. `version` - The version name for the baseline (e.g., "01_initial_schema"). A baseline folds in every migration named at or before it, so on a database that already has migration history the name must sort after every applied migration; `pgroll baseline` refuses one that does not
 2. `target directory` - The directory where the placeholder migration file will be written
 
 Optional flags:

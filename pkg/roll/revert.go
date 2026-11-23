@@ -73,6 +73,29 @@ func WithRevertTo(name string) RevertOption {
 	return func(o *revertOptions) { o.to = name }
 }
 
+// revertBoundary returns the row a revert to `to` stops at. That is `to`
+// itself, except when `to` names the baseline: reverting to the baseline
+// means reverting everything applied on top of what it folds in, and the row
+// beneath all of that is the floor (state.BaselineFloor), which is not the
+// baseline row when a folded migration was applied after it.
+func (m *Roll) revertBoundary(ctx context.Context, to string) (string, error) {
+	baseline, err := m.state.LatestBaseline(ctx, m.schema)
+	if err != nil {
+		return "", err
+	}
+	if baseline == nil || baseline.Name != to {
+		return to, nil
+	}
+	floor, err := m.state.BaselineFloor(ctx, m.schema)
+	if err != nil {
+		return "", err
+	}
+	if floor == nil {
+		return to, nil
+	}
+	return floor.Name, nil
+}
+
 // RevertTargets computes the revertible window: the contiguous unsealed
 // suffix of history, walked parent-ward from the leaf, newest first. The
 // window is the deployment in flight — contraction (`pgroll complete`, or
@@ -229,6 +252,10 @@ func (m *Roll) RevertPlan(ctx context.Context, opts ...RevertOption) ([]RevertTa
 	}
 
 	if o.to != "" {
+		o.to, err = m.revertBoundary(ctx, o.to)
+		if err != nil {
+			return nil, err
+		}
 		// Target inside the window: keep it, revert everything newer.
 		for i, t := range targets {
 			if t.Name == o.to {

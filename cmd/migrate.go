@@ -528,15 +528,24 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 	//
 	// Trivially in sync when version schemas are disabled: there is no
 	// projection to be missing.
+	// The leaf is read from state, not taken as the last row of `history`:
+	// the last migration applied may be folded into the baseline, and the
+	// newest visible row's projection was dropped long ago.
 	stateInSync := true
+	leafName, leafVersion := "", ""
 	if m.UseVersionSchema() && len(history) > 0 {
-		leaf := history[len(history)-1].Migration
-		leafVersion := leaf.VersionSchema
-		if leafVersion == "" {
-			leafVersion = leaf.Name
+		latest, err := m.State().LatestMigration(ctx, m.Schema())
+		if err != nil {
+			return "", fmt.Errorf("reading latest migration: %w", err)
 		}
-		want := prefix + leafVersion
-		stateInSync = slices.Contains(liveSchemas, want)
+		if latest != nil {
+			leaf, err := m.State().GetMigration(ctx, m.Schema(), *latest)
+			if err != nil {
+				return "", fmt.Errorf("reading latest migration: %w", err)
+			}
+			leafName, leafVersion = leaf.Name, leaf.VersionSchemaName()
+			stateInSync = slices.Contains(liveSchemas, prefix+leafVersion)
+		}
 	}
 
 	state := classifyCycle(activePeriod, otherBackends, remainingCount, appliedCount, stateInSync, expandComplete)
@@ -677,15 +686,10 @@ func printMigratePreFlight(ctx context.Context, m *roll.Roll, migrationsDir stri
 		}
 		applies(names)
 
-		if state == cycleRecovery && len(history) > 0 {
-			leaf := history[len(history)-1].Migration
-			leafVersion := leaf.VersionSchema
-			if leafVersion == "" {
-				leafVersion = leaf.Name
-			}
+		if state == cycleRecovery && leafName != "" {
 			fmt.Fprintln(out)
 			fmt.Fprintf(out, "    %s history is at %s, but %s is not deployed.\n",
-				pterm.FgYellow.Sprint("⚠"), leaf.Name, prefix+leafVersion)
+				pterm.FgYellow.Sprint("⚠"), leafName, prefix+leafVersion)
 			fmt.Fprintln(out, pterm.FgYellow.Sprint("    Its projection was dropped or never created; `pgroll materialize` rebuilds it."))
 		}
 	}

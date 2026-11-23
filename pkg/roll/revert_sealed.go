@@ -99,8 +99,17 @@ func (m *Roll) planSealedSegment(ctx context.Context, to, through string) (*Seal
 		return nil, fmt.Errorf("unable to read schema history: %w", err)
 	}
 
-	// Locate the boundary. SchemaHistory is post-baseline ascending; the
-	// baseline itself is also a legal boundary (revert everything since).
+	floor, err := m.state.BaselineFloor(ctx, m.schema)
+	if err != nil {
+		return nil, err
+	}
+	to, err = m.revertBoundary(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+
+	// Locate the boundary: a row the baseline does not fold in, or the floor
+	// beneath them all (revert everything since).
 	boundaryIdx := -1
 	for i, h := range history {
 		if h.Migration.Name == to {
@@ -108,32 +117,50 @@ func (m *Roll) planSealedSegment(ctx context.Context, to, through string) (*Seal
 			break
 		}
 	}
-	if boundaryIdx == -1 {
-		baseline, err := m.state.LatestBaseline(ctx, m.schema)
-		if err != nil {
-			return nil, err
+
+	// Only rows applied after the floor can be reverted. A row applied
+	// before it has folded migrations above it whose files are gone: they
+	// cannot be inverted, and the row's snapshot is not the schema beneath
+	// whatever came after them.
+	var segment []state.HistoryEntry
+	switch {
+	case boundaryIdx >= 0:
+		if floor != nil && !history[boundaryIdx].CreatedAt.After(floor.CreatedAt) {
+			return nil, fmt.Errorf(
+				"history above %q is not contiguous: %q was applied after it and is folded into "+
+					"the baseline, so it cannot be reverted; the oldest state a revert can restore "+
+					"is the one after %q", to, floor.Name, floor.Name,
+			)
 		}
-		if baseline == nil || baseline.Name != to {
-			return nil, fmt.Errorf("migration %q not found in history", to)
+		segment = history[boundaryIdx+1:]
+	case floor != nil && floor.Name == to:
+		for i, h := range history {
+			if h.CreatedAt.After(floor.CreatedAt) {
+				segment = history[i:]
+				break
+			}
 		}
+	default:
+		return nil, fmt.Errorf("migration %q not found in history", to)
 	}
 
-	segment := history[boundaryIdx+1:]
 	if through != "" {
+		// The window's lower boundary is the boundary itself: nothing
+		// sealed lies between them.
+		if through == to {
+			return nil, nil
+		}
 		throughIdx := -1
-		for i, h := range history {
+		for i, h := range segment {
 			if h.Migration.Name == through {
 				throughIdx = i
 				break
 			}
 		}
 		if throughIdx == -1 {
-			return nil, fmt.Errorf("migration %q not found in history", through)
-		}
-		if throughIdx <= boundaryIdx {
 			return nil, fmt.Errorf("migration %q is not above the boundary %q", through, to)
 		}
-		segment = history[boundaryIdx+1 : throughIdx+1]
+		segment = segment[:throughIdx+1]
 	}
 	if len(segment) == 0 {
 		return nil, nil // already at the boundary
@@ -270,6 +297,10 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 	for _, opt := range opts {
 		opt(&o)
 	}
+	to, err := m.revertBoundary(ctx, to)
+	if err != nil {
+		return nil, err
+	}
 	// Resume: a partial inverse train from an interrupted run is unsealed
 	// (and only ever contains engine-synthesized RevertOf rows) — undo it
 	// and start over.
@@ -383,9 +414,18 @@ func (m *Roll) FinishPendingSealedRevert(ctx context.Context) (*SealedRevertPlan
 	if err != nil {
 		return nil, err
 	}
+	floor, err := m.state.BaselineFloor(ctx, m.schema)
+	if err != nil {
+		return nil, err
+	}
 	reverted := make(map[string]bool)
 	boundary := ""
 	for i := len(history) - 1; i >= 0; i-- {
+		// A row applied before the floor is beneath anything a revert
+		// could have undone: the boundary is the floor.
+		if floor != nil && !history[i].CreatedAt.After(floor.CreatedAt) {
+			break
+		}
 		raw := history[i].Migration
 		mig, err := migrations.ParseMigration(&raw)
 		if err != nil {
@@ -402,14 +442,10 @@ func (m *Roll) FinishPendingSealedRevert(ctx context.Context) (*SealedRevertPlan
 		break
 	}
 	if boundary == "" {
-		baseline, err := m.state.LatestBaseline(ctx, m.schema)
-		if err != nil {
-			return nil, err
-		}
-		if baseline == nil {
+		if floor == nil {
 			return nil, fmt.Errorf("cannot finish the pending revert: no boundary found beneath the inverse train")
 		}
-		boundary = baseline.Name
+		boundary = floor.Name
 	}
 	return m.finishSealedRevert(ctx, boundary)
 }
