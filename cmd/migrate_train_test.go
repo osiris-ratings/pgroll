@@ -365,7 +365,7 @@ operations:
 operations:
   - add_column:
       table: w
-      up: COALESCE(kind, 'liens')
+      up: "'liens'"
       column:
         name: kind
         type: text

@@ -229,8 +229,8 @@ func migrateCmd() *cobra.Command {
 
 			// With --complete nothing is pinned, and the run contracts the
 			// open train along with its own.
-			if !complete && !leafUnpinned {
-				if err := refuseOnOpenTrain(ctx, m); err != nil {
+			if !complete {
+				if err := refuseOnOpenTrain(ctx, m, leafUnpinned); err != nil {
 					return err
 				}
 			}
@@ -321,13 +321,14 @@ func migrateCmd() *cobra.Command {
 				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
 			}
 			if rolling {
-				unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema())
-				if err != nil {
-					return fmt.Errorf("unable to read the uncontracted migrations: %w", err)
+				if !leafUnpinned {
+					if err := refuseMovingAPinnedTarget(ctx, m, final.VersionSchemaName()); err != nil {
+						return err
+					}
 				}
-				uncontracted := make([]*migrations.Migration, 0, len(unsealed))
-				for _, rec := range slices.Backward(unsealed) {
-					uncontracted = append(uncontracted, rec.Migration)
+				uncontracted, err := uncontractedWithNoFleetOnTheLeaf(ctx, m)
+				if err != nil {
+					return err
 				}
 				if err := refuseEarlyCompleteOfAFill(uncontracted, migs); err != nil {
 					return err
@@ -819,7 +820,7 @@ const leafUnpinnedUsage = "start on top of an applied, uncontracted train whose 
 // applied and not contracted while its leaf's version schema exists. A fleet
 // on that schema is a third revision beside the previous deployment's and
 // the new train's, and the open train's triggers tell only two apart.
-func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
+func refuseOnOpenTrain(ctx context.Context, m *roll.Roll, leafUnpinned bool) error {
 	// A migration in progress has its own refusal, further on.
 	active, err := m.State().IsActiveMigrationPeriod(ctx, m.Schema())
 	if err != nil {
@@ -828,19 +829,29 @@ func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
 	if active {
 		return nil
 	}
-	leaf, contracted, err := openTrainLeaf(ctx, m)
-	if err != nil || leaf == "" {
-		return err
+	leaf, err := m.ReopenedTrainLeaf(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to check for an open train: %w", err)
 	}
-	if contracted {
+	if leaf == "" {
+		return nil
+	}
+	unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema())
+	if err != nil {
+		return fmt.Errorf("unable to read the uncontracted migrations: %w", err)
+	}
+	// Triggers no uncontracted migration owns would follow the new train
+	// and rewrite its writes, whoever is pinned where.
+	if len(unsealed) == 0 {
 		return fmt.Errorf(
-			"cannot start beside the triggers of an earlier migration: every migration is contracted, "+
-				"yet trigger functions are installed and version schema %[1]q exists. Run `pgroll "+
-				"complete` to finish a contraction that stopped part-way. If it finds nothing to finish, "+
-				"the triggers belong to a migration removed from history (`pgroll prune`): drop them, "+
-				"or re-run with --leaf-unpinned if no workload is pinned to %[1]q",
-			roll.VersionedSchemaName(m.Schema(), leaf),
+			"cannot start beside the triggers of an earlier migration: every migration is contracted, " +
+				"yet trigger functions are installed. Run `pgroll complete` to finish a contraction " +
+				"that stopped part-way. If it finds nothing to finish, the triggers belong to a " +
+				"migration removed from history (`pgroll prune`): drop them and their functions first",
 		)
+	}
+	if leafUnpinned {
+		return nil
 	}
 	return fmt.Errorf(
 		"cannot start on top of an open train: migration %[1]q is applied and not contracted, nothing "+
@@ -852,22 +863,52 @@ func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
 	)
 }
 
-// openTrainLeaf returns the leaf whose version schema exists while trigger
-// functions are installed, and whether every migration is contracted all
-// the same.
-func openTrainLeaf(ctx context.Context, m *roll.Roll) (leaf string, contracted bool, err error) {
-	leaf, err = m.ReopenedTrainLeaf(ctx)
-	if err != nil || leaf == "" {
-		if err != nil {
-			err = fmt.Errorf("unable to check for an open train: %w", err)
-		}
-		return "", false, err
+// refuseMovingAPinnedTarget refuses to point an open train's triggers at
+// another version schema while the one they follow exists. Sessions on that
+// schema are the new revision to those triggers; once they follow another,
+// the same sessions are the previous revision and their writes are rewritten.
+func refuseMovingAPinnedTarget(ctx context.Context, m *roll.Roll, version string) error {
+	pinned, err := m.PinnedTrainTarget(ctx)
+	if err != nil {
+		return err
+	}
+	to := roll.VersionedSchemaName(m.Schema(), version)
+	if pinned == "" || pinned == to {
+		return nil
+	}
+	return fmt.Errorf(
+		"the triggers of the applied, uncontracted migrations follow version schema %[1]q, which exists, "+
+			"and this would point them at %[2]q: writes made through %[1]q would then be rewritten as "+
+			"the previous revision's. Run `pgroll complete` to contract first. If no workload is pinned "+
+			"to %[1]q, re-run with --leaf-unpinned",
+		pinned, to,
+	)
+}
+
+// uncontractedWithNoFleetOnTheLeaf returns the applied migrations not yet
+// contracted, oldest first, when the latest of them has no version schema:
+// no fleet can then be running on what they changed.
+func uncontractedWithNoFleetOnTheLeaf(ctx context.Context, m *roll.Roll) ([]*migrations.Migration, error) {
+	leaf, err := m.LeafVersionSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the latest migration: %w", err)
+	}
+	existing, err := m.ExistingVersionSchemas(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if leaf != "" && slices.Contains(existing, roll.VersionedSchemaName(m.Schema(), leaf)) {
+		return nil, nil
 	}
 	unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema())
 	if err != nil {
-		return "", false, fmt.Errorf("unable to read the uncontracted migrations: %w", err)
+		return nil, fmt.Errorf("unable to read the uncontracted migrations: %w", err)
 	}
-	return leaf, len(unsealed) == 0, nil
+	uncontracted := make([]*migrations.Migration, 0, len(unsealed))
+	for _, rec := range slices.Backward(unsealed) {
+		uncontracted = append(uncontracted, rec.Migration)
+	}
+	return uncontracted, nil
 }
 
 // refuseEarlyCompleteOfAFill refuses a run that would complete, before its

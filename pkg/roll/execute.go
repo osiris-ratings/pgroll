@@ -731,6 +731,36 @@ func (m *Roll) retargetTrain(ctx context.Context, versionSchema string) (bool, e
 	return true, m.setTrainTarget(ctx, versionSchema)
 }
 
+// PinnedTrainTarget returns the version schema the installed triggers of a
+// train follow, when that schema exists: sessions on it are the ones the
+// triggers take for the new revision. It returns "" when no train's triggers
+// are installed or the schema they follow was never projected.
+func (m *Roll) PinnedTrainTarget(ctx context.Context) (string, error) {
+	installed, err := m.queryBool(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname = $2)`,
+		m.schema, backfill.TrainTargetFunction)
+	if err != nil || !installed {
+		return "", err
+	}
+	// The name comes back only when a schema of that name exists.
+	rows, err := m.pgConn.QueryContext(ctx, fmt.Sprintf(
+		"SELECT nspname FROM pg_namespace WHERE nspname = %s.%s()",
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+	if err != nil {
+		return "", fmt.Errorf("unable to read the train's target: %w", err)
+	}
+	defer rows.Close()
+	var name string
+	if rows.Next() {
+		if err := rows.Scan(&name); err != nil {
+			return "", err
+		}
+	}
+	return name, rows.Err()
+}
+
 // dropTrainTargetIfUnused removes the train's target function once no
 // trigger function is left to call it.
 func (m *Roll) dropTrainTargetIfUnused(ctx context.Context) error {

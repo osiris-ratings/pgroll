@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/xataio/pgroll/internal/defaults"
@@ -126,39 +125,11 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 	return &StartResult{Actions: dbActions, BackfillTask: task}, nil
 }
 
-// upRepeatsDefault reports whether `up` yields what the column's default
-// does for a row that has no value yet: the default as written, or
-// COALESCE(<column>, <default>). A cast is not looked through: it can
-// change the value.
+// upRepeatsDefault reports whether `up` is the column's default as written,
+// so that it yields what the default does for a row with no value yet.
 func (o *OpAddColumn) upRepeatsDefault() bool {
-	if !o.Column.HasDefault() {
-		return false
-	}
-	normalize := func(e string) string {
-		e = strings.TrimSpace(e)
-		for strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") {
-			e = strings.TrimSpace(e[1 : len(e)-1])
-		}
-		return e
-	}
-	want := normalize(*o.Column.Default)
-	up := normalize(o.Up)
-	if up == want {
-		return true
-	}
-	m := coalesceOfColumn.FindStringSubmatch(up)
-	if m == nil {
-		return false
-	}
-	// An unquoted identifier folds to lower case; a quoted one is exact.
-	named := strings.ToLower(m[1])
-	if strings.HasPrefix(m[1], `"`) {
-		named = strings.Trim(m[1], `"`)
-	}
-	return named == o.Column.Name && normalize(m[2]) == want
+	return o.Column.HasDefault() && strings.TrimSpace(o.Up) == strings.TrimSpace(*o.Column.Default)
 }
-
-var coalesceOfColumn = regexp.MustCompile(`(?is)^coalesce\(\s*("[^"]+"|[a-z_][a-z0-9_]*)\s*,(.*)\)$`)
 
 func toSchemaColumn(c Column) *schema.Column {
 	tmpColumn := &schema.Column{

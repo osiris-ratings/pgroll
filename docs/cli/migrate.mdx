@@ -52,7 +52,7 @@ $ pgroll complete
 $ pgroll migrate examples/
 ```
 
-The refusal does not apply with `--complete`, with version schemas disabled, to a table created since the last `pgroll complete`, to an `up` that is the column's `default` as written or `COALESCE(<column>, <default>)`, or to a migration that also holds an operation that waits for `pgroll complete` (a column or table drop or rename, an `alter_column`): its trigger stays until then.
+The refusal does not apply with `--complete`, with version schemas disabled, to a table created since the last `pgroll complete` (unless the latest applied migration has a version schema applications may run on), to an `up` that is the column's `default` as written, or to a migration that also holds an operation that waits for `pgroll complete` (a column or table drop or rename, an `alter_column`): its trigger stays until then.
 
 ## An Open Train
 
@@ -68,7 +68,7 @@ $ pgroll migrate examples/ --leaf-unpinned
 
 Neither command refuses with `--complete`, which pins nothing.
 
-`pgroll materialize --migrations` refuses in the same state: the triggers would follow the schema it projects and rewrite what applications on the latest migration's schema write. Contract first, materialize without `--migrations`, or pass `--leaf-unpinned` when no application is pinned to that schema.
+`pgroll migrate`, `pgroll start` and `pgroll materialize` also refuse to point the triggers of applied, uncontracted migrations at another version schema while the one they follow exists: applications writing through that schema would have their writes rewritten as the previous revision's. Run `pgroll complete` first, or pass `--leaf-unpinned` when no application is pinned to that schema.
 
 ## Existing Database Schema
 

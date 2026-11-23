@@ -51,8 +51,17 @@ func startCmd() *cobra.Command {
 				return nil
 			}
 
-			if !complete && !leafUnpinned {
-				if err := refuseOnOpenTrain(ctx, m); err != nil {
+			if !complete {
+				if err := refuseOnOpenTrain(ctx, m, leafUnpinned); err != nil {
+					return err
+				}
+			}
+			if !complete && !leafUnpinned && m.UseVersionSchema() {
+				migration, err := migrations.ReadMigration(os.DirFS(filepath.Dir(fileName)), filepath.Base(fileName))
+				if err != nil {
+					return err
+				}
+				if err := refuseMovingAPinnedTarget(ctx, m, migration.VersionSchemaName()); err != nil {
 					return err
 				}
 			}

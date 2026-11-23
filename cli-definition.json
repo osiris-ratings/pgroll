@@ -196,7 +196,7 @@
       "flags": [
         {
           "name": "leaf-unpinned",
-          "description": "with --migrations, project past an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
+          "description": "point the triggers of applied, uncontracted migrations at the materialized schema although the version schema they follow exists; only when no workload is pinned to that schema",
           "default": "false"
         },
         {
