@@ -21,7 +21,7 @@ import (
 )
 
 func migrateCmd() *cobra.Command {
-	var complete, expectOne bool
+	var complete, expectOne, leafUnpinned bool
 	var batchSize int
 	var batchDelay time.Duration
 	var toMigration string
@@ -227,6 +227,14 @@ func migrateCmd() *cobra.Command {
 				return nil
 			}
 
+			// With --complete nothing is pinned, and the run contracts the
+			// open train along with its own.
+			if !complete && !leafUnpinned {
+				if err := refuseOnOpenTrain(ctx, m); err != nil {
+					return err
+				}
+			}
+
 			// In 'expect one' mode, abort if there is more than one unapplied migration
 			if expectOne && len(rawMigs) > 1 {
 				return fmt.Errorf("expected one migration to apply but found %d", len(rawMigs))
@@ -302,6 +310,21 @@ func migrateCmd() *cobra.Command {
 			// handed to every Start in the batch.
 			satisfiedDeps := AsStartOption(roll.WithSatisfiedDependencies(resolution.Excluded))
 
+			// Pods pin the previous deployment's schema or the last
+			// migration's, never an intermediate's, so every trigger in the
+			// train tells the revisions apart by the last one. With
+			// --complete nothing is pinned and the triggers go inline.
+			final := migs[len(migs)-1]
+			rolling := !complete && m.UseVersionSchema()
+			trainOpts := []migrationOption{satisfiedDeps}
+			if rolling {
+				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
+			}
+			if rolling {
+				if err := refuseEarlyCompleteOfAFill(migs); err != nil {
+					return err
+				}
+			}
 			for _, mig := range migs[:len(migs)-1] {
 				completeOpt := AsCompleteOption(roll.WithSkipSchemaDrop())
 				if mig.CompleteMustBeDeferred() {
@@ -309,9 +332,10 @@ func migrateCmd() *cobra.Command {
 				}
 				if err := runMigration(
 					ctx, m, mig, true, backfillConfig,
-					AsStartOption(roll.WithoutVersionSchema()),
-					satisfiedDeps,
-					completeOpt,
+					append([]migrationOption{
+						AsStartOption(roll.WithoutVersionSchema()),
+						completeOpt,
+					}, trainOpts...)...,
 				); err != nil {
 					return fmt.Errorf("failed to run migration file %q: %w", mig.Name, err)
 				}
@@ -328,7 +352,7 @@ func migrateCmd() *cobra.Command {
 			// schema and a later `pgroll complete` contracts the deployment.
 			// Until that contraction, the whole batch is losslessly
 			// revertible via `pgroll revert`.
-			if err := runMigration(ctx, m, migs[len(migs)-1], complete, backfillConfig, satisfiedDeps); err != nil {
+			if err := runMigration(ctx, m, final, complete, backfillConfig, trainOpts...); err != nil {
 				return err
 			}
 
@@ -355,6 +379,7 @@ func migrateCmd() *cobra.Command {
 	migrateCmd.Flags().DurationVar(&batchDelay, "backfill-batch-delay", backfill.DefaultDelay, "Duration of delay between batch backfills (eg. 1s, 1000ms)")
 	migrateCmd.Flags().BoolVar(&expectOne, "expect-one", false, "Abort if there is more than one migration to be applied")
 	migrateCmd.Flags().BoolVarP(&complete, "complete", "c", false, "complete the final migration rather than leaving it active")
+	migrateCmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, leafUnpinnedUsage)
 	migrateCmd.Flags().StringVar(&toMigration, "to", "", "apply migrations only up to (and including) this one; already applied is a no-op")
 
 	return migrateCmd
@@ -777,4 +802,63 @@ func interruptedMessage(ctx context.Context, m *roll.Roll, active string) string
 			base,
 		)
 	}
+}
+
+const leafUnpinnedUsage = "start on top of an applied, uncontracted train whose leaf has a version schema; " +
+	"only when no workload is pinned to that schema"
+
+// refuseOnOpenTrain refuses to start a migration on top of a train that is
+// applied and not contracted while its leaf's version schema exists. A fleet
+// on that schema is a third revision beside the previous deployment's and
+// the new train's, and the open train's triggers tell only two apart.
+func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
+	// A migration in progress has its own refusal, further on.
+	active, err := m.State().IsActiveMigrationPeriod(ctx, m.Schema())
+	if err != nil {
+		return fmt.Errorf("unable to determine active migration period: %w", err)
+	}
+	if active {
+		return nil
+	}
+	leaf, err := m.ReopenedTrainLeaf(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to check for an open train: %w", err)
+	}
+	if leaf == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"cannot start on top of an open train: migration %[1]q is applied and not contracted, nothing "+
+			"is in progress, and its version schema %[2]q exists. If the fleet runs on that schema (a "+
+			"bounded `pgroll revert` leaves this), run `pgroll complete` to contract the train first, or "+
+			"`pgroll revert` to undo it. If no workload is pinned to that schema (`pgroll materialize` "+
+			"after an interrupted `pgroll migrate` leaves this), re-run with --leaf-unpinned",
+		leaf, roll.VersionedSchemaName(m.Schema(), leaf),
+	)
+}
+
+// refuseEarlyCompleteOfAFill refuses a run that would complete, before its
+// last migration, an add column whose `up` fills the column for the
+// previous revision's writes. Completing it drops the trigger that does the
+// filling, and the previous revision keeps writing until `pgroll complete`.
+// Nothing has been applied when it refuses.
+func refuseEarlyCompleteOfAFill(migs []*migrations.Migration) error {
+	for _, mig := range migs[:len(migs)-1] {
+		if mig.CompleteMustBeDeferred() {
+			continue // waits for `pgroll complete`, its trigger with it
+		}
+		fill := mig.FillOfPreviousRevisionWrites()
+		if fill == nil {
+			continue
+		}
+		return fmt.Errorf(
+			"migration %[1]q adds column %[2]q to %[3]q with an `up` that fills it for writes of the "+
+				"previous revision, and %[4]d more migration(s) follow it in this run. Completing it "+
+				"before `pgroll complete` would stop the filling while the previous revision still "+
+				"writes. Apply up to it first (`pgroll migrate --to %[1]s`), finish that deployment "+
+				"with `pgroll complete`, then run again. With no previous revision running, use --complete",
+			mig.Name, fill.Column.Name, fill.Table, len(migs)-1-slices.Index(migs, mig),
+		)
+	}
+	return nil
 }

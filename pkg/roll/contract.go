@@ -39,6 +39,12 @@ func (m *Roll) FinishContraction(ctx context.Context, opts ...ContractOption) (_
 		opt(&o)
 	}
 
+	defer func() {
+		if err == nil {
+			err = m.dropTrainTargetIfUnused(ctx)
+		}
+	}()
+
 	queued, err := m.state.DeferredCompletes(ctx, m.schema)
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to query deferred completes: %w", err)

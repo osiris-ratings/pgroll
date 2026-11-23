@@ -215,14 +215,15 @@ func TestBuildTrigger(t *testing.T) {
 		{
 			name: "trigger",
 			config: triggerConfig{
-				Name:      "triggerName",
-				TableName: "reviews",
+				Name:        "functionName",
+				TriggerName: "triggerName",
+				TableName:   "reviews",
 			},
 			expected: `CREATE OR REPLACE TRIGGER "triggerName"
     BEFORE UPDATE OR INSERT
     ON "reviews"
     FOR EACH ROW
-    EXECUTE PROCEDURE "triggerName"();
+    EXECUTE PROCEDURE "functionName"();
 `,
 		},
 	}
@@ -236,4 +237,48 @@ func TestBuildTrigger(t *testing.T) {
 			assert.Equal(t, tc.expected, sql)
 		})
 	}
+}
+
+func TestBuildFunctionFollowingATrainTarget(t *testing.T) {
+	t.Parallel()
+
+	for direction, comparison := range map[TriggerDirection]string{
+		TriggerDirectionUp:   `IF search_path != "my_app"."_pgroll_train_target"() THEN`,
+		TriggerDirectionDown: `IF search_path = "my_app"."_pgroll_train_target"() THEN`,
+	} {
+		sql, err := buildFunction(triggerConfig{
+			Name:                "functionName",
+			Direction:           direction,
+			Columns:             map[string]*schema.Column{"x": {Name: "x"}},
+			SchemaName:          "my_app",
+			LatestSchema:        "my_app_01_migration",
+			TargetFunction:      TrainTargetFunction,
+			TableName:           "w",
+			PhysicalColumn:      "y",
+			NeedsBackfillColumn: NeedsBackfillColumnName("abc"),
+			SQL:                 []string{"(x + 1)"},
+		})
+		assert.NoError(t, err)
+		assert.Contains(t, sql, comparison)
+		assert.NotContains(t, sql, "my_app_01_migration")
+	}
+}
+
+func TestOrderedTriggerName(t *testing.T) {
+	t.Parallel()
+
+	up := func(position, index int) string {
+		return OrderedTriggerName(TriggerDirectionUp, position, index, "f")
+	}
+	down := func(position, index int) string {
+		return OrderedTriggerName(TriggerDirectionDown, position, index, "f")
+	}
+
+	assert.Less(t, up(1, 0), up(2, 0), "an earlier migration's up trigger fires first")
+	assert.Less(t, up(9, 0), up(10, 0))
+	assert.Less(t, up(1, 0), up(1, 1), "one migration's triggers keep their order")
+	assert.Greater(t, down(1, 0), down(2, 0), "a later migration's down trigger fires first")
+	assert.Less(t, up(9999, 999), down(9999, 0), "every up trigger fires before any down trigger")
+	assert.NotEqual(t, OrderedTriggerName(TriggerDirectionUp, 1, 0, "f"), OrderedTriggerName(TriggerDirectionUp, 1, 0, "g"))
+	assert.LessOrEqual(t, len(up(123456, 123456)), 63)
 }

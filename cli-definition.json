@@ -242,6 +242,11 @@
           "default": "false"
         },
         {
+          "name": "leaf-unpinned",
+          "description": "start on top of an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
+          "default": "false"
+        },
+        {
           "name": "to",
           "description": "apply migrations only up to (and including) this one; already applied is a no-op",
           "default": ""
@@ -444,6 +449,11 @@
           "name": "complete",
           "shorthand": "c",
           "description": "Mark the migration as complete",
+          "default": "false"
+        },
+        {
+          "name": "leaf-unpinned",
+          "description": "start on top of an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
           "default": "false"
         },
         {

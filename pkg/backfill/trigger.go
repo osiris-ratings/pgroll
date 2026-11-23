@@ -5,7 +5,9 @@ package backfill
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"text/template"
 
@@ -24,13 +26,18 @@ const (
 )
 
 type triggerConfig struct {
-	Name                string
-	Direction           TriggerDirection
-	Columns             map[string]*schema.Column
-	SchemaName          string
-	TableName           string
-	PhysicalColumn      string
-	LatestSchema        string
+	// Name is the trigger function's name; TriggerName the trigger's.
+	Name           string
+	TriggerName    string
+	Direction      TriggerDirection
+	Columns        map[string]*schema.Column
+	SchemaName     string
+	TableName      string
+	PhysicalColumn string
+	LatestSchema   string
+	// TargetFunction, when set, names the function the trigger asks for
+	// the latest schema instead of comparing against LatestSchema.
+	TargetFunction      string
 	SQL                 []string
 	NeedsBackfillColumn string
 	// MigrationScope is the per-migration suffix used when naming the
@@ -134,4 +141,25 @@ func TriggerFunctionName(scope, tableName, columnName string) string {
 // underlying function share an identifier shape.
 func TriggerName(scope, tableName, columnName string) string {
 	return TriggerFunctionName(scope, tableName, columnName)
+}
+
+// TrainTargetFunction is the function, in the migrated schema, that returns
+// the version schema a train's new revision pins. Every trigger of the train
+// reads it, so redefining it re-keys them all at once.
+const TrainTargetFunction = "_pgroll_train_target"
+
+// OrderedTriggerName returns the name of the trigger that runs the function
+// functionName. Postgres fires a table's triggers in name order, so `up`
+// triggers sort by ascending position and `down` triggers by descending:
+// a write crosses a train's migrations in the order its revision needs.
+// index orders the triggers of one migration among themselves.
+func OrderedTriggerName(direction TriggerDirection, position, index int, functionName string) string {
+	const last = 9999
+	position = min(max(position, 0), last)
+	key := fmt.Sprintf("a%04d", position)
+	if direction == TriggerDirectionDown {
+		key = fmt.Sprintf("z%04d", last-position)
+	}
+	sum := sha256.Sum256([]byte(functionName))
+	return fmt.Sprintf("_pgroll_trigger_%s_%03d_%s", key, min(max(index, 0), 999), hex.EncodeToString(sum[:8]))
 }

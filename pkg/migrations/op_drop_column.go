@@ -19,21 +19,6 @@ func (o *OpDropColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 	l.LogOperationStart(o)
 	scope := s.MigrationScope
 
-	var task *backfill.Task
-	if o.Down != "" {
-		task = backfill.NewTask(
-			nil,
-			backfill.OperationTrigger{
-				Name:           backfill.TriggerName(scope, o.Table, o.Column),
-				Direction:      backfill.TriggerDirectionDown,
-				Columns:        s.GetTable(o.Table).Columns,
-				TableName:      s.GetTable(o.Table).Name,
-				PhysicalColumn: o.Column,
-				SQL:            o.Down,
-			},
-		)
-	}
-
 	table := s.GetTable(o.Table)
 	if table == nil {
 		return nil, TableDoesNotExistError{Name: o.Table}
@@ -41,6 +26,23 @@ func (o *OpDropColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schem
 	column := table.GetColumn(o.Column)
 	if column == nil {
 		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column}
+	}
+
+	var task *backfill.Task
+	if o.Down != "" {
+		task = backfill.NewTask(
+			nil,
+			backfill.OperationTrigger{
+				Name:      backfill.TriggerName(scope, o.Table, o.Column),
+				Direction: backfill.TriggerDirectionDown,
+				Columns:   table.Columns,
+				TableName: table.Name,
+				// The column's physical name: an earlier migration of the
+				// train may have renamed it, or be about to.
+				PhysicalColumn: column.Name,
+				SQL:            o.Down,
+			},
+		)
 	}
 
 	s.GetTable(o.Table).RemoveColumn(o.Column)

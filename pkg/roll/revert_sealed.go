@@ -316,11 +316,16 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 	// forward one — except the final Complete is NOT deferred: a revert is
 	// not a deployment to keep revertible, it must finish (drain its own
 	// deferred queue) so the prune below leaves no queued work behind.
+	//
+	// The revisions pin the current schema or the restored one, which the
+	// last inverse projects, so the inverse train's triggers key on that.
+	last := plan.Inverses[len(plan.Inverses)-1]
+	last.VersionSchema = plan.BoundaryVersionSchema
+	target := WithTrainTarget(last)
 	for i, inv := range plan.Inverses {
 		final := i == len(plan.Inverses)-1
 		if final {
-			inv.VersionSchema = plan.BoundaryVersionSchema
-			if err := m.Start(ctx, inv, cfg); err != nil {
+			if err := m.Start(ctx, inv, cfg, target); err != nil {
 				return nil, fmt.Errorf("unable to start inverse migration %q: %w", inv.Name, err)
 			}
 			if o.expandOnly {
@@ -335,7 +340,7 @@ func (m *Roll) RevertSealed(ctx context.Context, to string, cfg *backfill.Config
 			}
 			continue
 		}
-		if err := m.Start(ctx, inv, cfg, WithoutVersionSchema()); err != nil {
+		if err := m.Start(ctx, inv, cfg, WithoutVersionSchema(), target); err != nil {
 			return nil, fmt.Errorf("unable to start inverse migration %q: %w", inv.Name, err)
 		}
 		completeOpt := WithSkipSchemaDrop()

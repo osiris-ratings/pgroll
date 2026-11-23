@@ -323,6 +323,23 @@ func (m *Migration) CompleteMustBeDeferred() bool {
 	return false
 }
 
+// FillOfPreviousRevisionWrites returns the migration's first add column
+// whose `up` fills the column for the previous revision's writes, or nil.
+// An `up` that only repeats the column's default is not one: the default
+// fills those writes once the column completes.
+func (m *Migration) FillOfPreviousRevisionWrites() *OpAddColumn {
+	for _, op := range m.Operations {
+		add, ok := op.(*OpAddColumn)
+		if !ok || add.Up == "" {
+			continue
+		}
+		if !add.Column.HasDefault() || add.Up != *add.Column.Default {
+			return add
+		}
+	}
+	return nil
+}
+
 // CompleteRunsRawSQL reports whether this migration's Complete runs
 // onComplete raw SQL.
 //

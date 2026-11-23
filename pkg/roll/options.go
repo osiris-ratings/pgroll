@@ -207,6 +207,10 @@ type startOptions struct {
 	// depends_on names to treat as satisfied despite being absent from
 	// history; see WithSatisfiedDependencies.
 	satisfiedDependencies map[string]struct{}
+
+	// The last migration of the train this Start belongs to; see
+	// WithTrainTarget.
+	trainTarget *migrations.Migration
 }
 
 // StartOption is a functional option for the Start method.
@@ -219,6 +223,17 @@ type StartOption func(*startOptions)
 // view dependencies that block destructive operations later in the batch.
 func WithoutVersionSchema() StartOption {
 	return func(o *startOptions) { o.skipVersionSchema = true }
+}
+
+// WithTrainTarget names the last migration of the train this Start belongs
+// to. Pods only ever pin the previous deployment's version schema or the
+// train's last one, so an earlier migration's triggers tell the two
+// revisions apart by the last migration's schema, not their own, which is
+// never projected. Pass it to the last migration's Start too: a train
+// resumed with a different last migration then re-keys the triggers the
+// first attempt installed.
+func WithTrainTarget(final *migrations.Migration) StartOption {
+	return func(o *startOptions) { o.trainTarget = final }
 }
 
 // WithSatisfiedDependencies declares depends_on names to treat as already met
