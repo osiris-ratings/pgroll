@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2-baselayer.28] - 2026-11-23
+
 ### Changed
 
 - **A baseline folds in a set of migrations, not a point in apply order.**
