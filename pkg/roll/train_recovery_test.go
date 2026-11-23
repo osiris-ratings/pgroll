@@ -719,7 +719,7 @@ func TestTrainRecoveryMaterializeAfterAContractionStoppedPartWay(t *testing.T) {
 				if err != nil {
 					merr = fmt.Errorf("read schema: %w", err)
 				} else {
-					merr = mig.Materialize(ctx, "03_comment", sc, roll.WithNewRevisionPinned())
+					merr = mig.Materialize(ctx, "03_comment", sc, roll.WithNewRevisionPinned(), roll.WithUnprojectableTablesAsTheyAre())
 				}
 				other := r8Str(db, `SELECT n FROM public_03_comment.other WHERE id = 1`)
 				u := r8Str(db, `SELECT to_jsonb(t)::text FROM public_03_comment.u t WHERE id = 1`)

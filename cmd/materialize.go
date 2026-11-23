@@ -20,7 +20,7 @@ import (
 func materializeCmd() *cobra.Command {
 	var migrationsDir string
 	var versionOverride string
-	var yes bool
+	var yes, leafUnpinned bool
 
 	cmd := &cobra.Command{
 		Use:   "materialize",
@@ -63,7 +63,7 @@ func materializeCmd() *cobra.Command {
 			// --version projects the tables as they are, for the previous
 			// revision.
 			readSchema := m.SchemaWithDeferred
-			materializeOpts := []roll.MaterializeOption{roll.WithNewRevisionPinned()}
+			materializeOpts := []roll.MaterializeOption{roll.WithNewRevisionPinned(), roll.WithUnprojectableTablesAsTheyAre()}
 			if versionOverride != "" && migrationsDir == "" {
 				leaf, err := m.LeafVersionSchema(ctx)
 				if err != nil {
@@ -104,6 +104,17 @@ func materializeCmd() *cobra.Command {
 					}
 				}
 			}
+			if len(parsedMigs) > 0 {
+				// The schema is one no applied migration projected, so a
+				// table it cannot build is an error, and an open train's
+				// triggers may only follow it when nothing runs on the leaf.
+				materializeOpts = []roll.MaterializeOption{roll.WithNewRevisionPinned()}
+				if !leafUnpinned {
+					if err := refuseFastForwardOverOpenTrain(ctx, m); err != nil {
+						return err
+					}
+				}
+			}
 
 			version, err := resolveMaterializeVersion(ctx, m, parsedMigs, versionOverride)
 			if err != nil {
@@ -134,8 +145,29 @@ func materializeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&migrationsDir, "migrations", "", "Optional directory of migration files; unapplied migrations are replayed in memory before projecting views")
 	cmd.Flags().StringVar(&versionOverride, "version", "", "Override the version name (default: derived from --migrations or pgroll state)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
+	cmd.Flags().BoolVar(&leafUnpinned, "leaf-unpinned", false, "with --migrations, project past an applied, uncontracted train whose leaf has a version schema; "+
+		"only when no workload is pinned to that schema")
 
 	return cmd
+}
+
+// refuseFastForwardOverOpenTrain refuses to project a schema past the leaf
+// of an applied, uncontracted train whose leaf has a version schema. The
+// train's triggers would follow the new schema and treat a fleet on the
+// leaf's as the previous revision, rewriting what it writes.
+func refuseFastForwardOverOpenTrain(ctx context.Context, m *roll.Roll) error {
+	leaf, _, err := openTrainLeaf(ctx, m)
+	if err != nil || leaf == "" {
+		return err
+	}
+	return fmt.Errorf(
+		"cannot project unapplied migrations past the triggers of an applied one: trigger functions "+
+			"are installed and version schema %[1]q, of migration %[2]q, exists. They would follow the "+
+			"new schema and rewrite the writes of a fleet on %[1]q. Run `pgroll complete` to contract "+
+			"first, or `pgroll materialize` without --migrations to re-project %[1]q. If no workload "+
+			"is pinned to that schema, re-run with --leaf-unpinned",
+		roll.VersionedSchemaName(m.Schema(), leaf), leaf,
+	)
 }
 
 // materializeActive re-projects the active migration's version schema. It

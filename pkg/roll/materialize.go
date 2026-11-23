@@ -47,7 +47,10 @@ func (m *Roll) SchemaWithDeferred(ctx context.Context) (*schema.Schema, error) {
 // MaterializeOption is a functional option for Materialize.
 type MaterializeOption func(*materializeOptions)
 
-type materializeOptions struct{ pinnedByNewRevision bool }
+type materializeOptions struct {
+	pinnedByNewRevision bool
+	tablesAsTheyAre     bool
+}
 
 // WithNewRevisionPinned says the materialized schema is the one the new
 // revision pins, projected with what the migrations waiting for a
@@ -56,6 +59,16 @@ type materializeOptions struct{ pinnedByNewRevision bool }
 // session on that schema is.
 func WithNewRevisionPinned() MaterializeOption {
 	return func(o *materializeOptions) { o.pinnedByNewRevision = true }
+}
+
+// WithUnprojectableTablesAsTheyAre projects a table the schema snapshot
+// cannot describe as it is, the way a contraction restores its live views
+// (see restoreLiveViews). A contraction that stopped between a migration's
+// last statement and the clearing of its flag leaves such a table. It is
+// not for a snapshot fast-forwarded through unapplied migrations: there a
+// table that cannot be built is an error.
+func WithUnprojectableTablesAsTheyAre() MaterializeOption {
+	return func(o *materializeOptions) { o.tablesAsTheyAre = true }
 }
 
 func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schema, opts ...MaterializeOption) error {
@@ -75,13 +88,9 @@ func (m *Roll) Materialize(ctx context.Context, version string, sc *schema.Schem
 
 	mig := &migrations.Migration{Name: version}
 	if err := m.ensureViews(ctx, sc, mig); err != nil {
-		if !o.pinnedByNewRevision {
+		if !o.tablesAsTheyAre {
 			return fmt.Errorf("materialize: %w", err)
 		}
-		// A contraction that stopped between a migration's last statement
-		// and the clearing of its flag leaves a table the projection cannot
-		// describe. Such a table is projected as it is, the way a contraction
-		// restores its live views (see restoreLiveViews).
 		if err := m.ensureViewsFallingBack(ctx, sc, mig); err != nil {
 			return fmt.Errorf("materialize: %w", err)
 		}

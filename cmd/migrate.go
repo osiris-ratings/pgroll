@@ -321,7 +321,15 @@ func migrateCmd() *cobra.Command {
 				trainOpts = append(trainOpts, AsStartOption(roll.WithTrainTarget(final)))
 			}
 			if rolling {
-				if err := refuseEarlyCompleteOfAFill(migs); err != nil {
+				unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema())
+				if err != nil {
+					return fmt.Errorf("unable to read the uncontracted migrations: %w", err)
+				}
+				uncontracted := make([]*migrations.Migration, 0, len(unsealed))
+				for _, rec := range slices.Backward(unsealed) {
+					uncontracted = append(uncontracted, rec.Migration)
+				}
+				if err := refuseEarlyCompleteOfAFill(uncontracted, migs); err != nil {
 					return err
 				}
 			}
@@ -820,12 +828,19 @@ func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
 	if active {
 		return nil
 	}
-	leaf, err := m.ReopenedTrainLeaf(ctx)
-	if err != nil {
-		return fmt.Errorf("unable to check for an open train: %w", err)
+	leaf, contracted, err := openTrainLeaf(ctx, m)
+	if err != nil || leaf == "" {
+		return err
 	}
-	if leaf == "" {
-		return nil
+	if contracted {
+		return fmt.Errorf(
+			"cannot start beside the triggers of an earlier migration: every migration is contracted, "+
+				"yet trigger functions are installed and version schema %[1]q exists. Run `pgroll "+
+				"complete` to finish a contraction that stopped part-way. If it finds nothing to finish, "+
+				"the triggers belong to a migration removed from history (`pgroll prune`): drop them, "+
+				"or re-run with --leaf-unpinned if no workload is pinned to %[1]q",
+			roll.VersionedSchemaName(m.Schema(), leaf),
+		)
 	}
 	return fmt.Errorf(
 		"cannot start on top of an open train: migration %[1]q is applied and not contracted, nothing "+
@@ -837,21 +852,56 @@ func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
 	)
 }
 
+// openTrainLeaf returns the leaf whose version schema exists while trigger
+// functions are installed, and whether every migration is contracted all
+// the same.
+func openTrainLeaf(ctx context.Context, m *roll.Roll) (leaf string, contracted bool, err error) {
+	leaf, err = m.ReopenedTrainLeaf(ctx)
+	if err != nil || leaf == "" {
+		if err != nil {
+			err = fmt.Errorf("unable to check for an open train: %w", err)
+		}
+		return "", false, err
+	}
+	unsealed, err := m.State().UnsealedMigrations(ctx, m.Schema())
+	if err != nil {
+		return "", false, fmt.Errorf("unable to read the uncontracted migrations: %w", err)
+	}
+	return leaf, len(unsealed) == 0, nil
+}
+
 // refuseEarlyCompleteOfAFill refuses a run that would complete, before its
 // last migration, an add column whose `up` fills the column for the
 // previous revision's writes. Completing it drops the trigger that does the
 // filling, and the previous revision keeps writing until `pgroll complete`.
-// A table the run itself creates has no previous revision writing it.
-// Nothing has been applied when it refuses.
-func refuseEarlyCompleteOfAFill(migs []*migrations.Migration) error {
+// A table created since the last contraction, by this run or by one of the
+// uncontracted migrations, has no previous revision writing it. Nothing has
+// been applied when it refuses.
+func refuseEarlyCompleteOfAFill(uncontracted, migs []*migrations.Migration) error {
 	created := map[string]bool{}
-	for i, mig := range migs[:len(migs)-1] {
-		var fill *migrations.OpAddColumn
+	track := func(mig *migrations.Migration) {
 		for _, op := range mig.Operations {
-			if create, ok := op.(*migrations.OpCreateTable); ok {
-				created[create.Name] = true
+			switch op := op.(type) {
+			case *migrations.OpCreateTable:
+				created[op.Name] = true
+			case *migrations.OpDropTable:
+				delete(created, op.Name)
+			case *migrations.OpRenameTable:
+				wasCreated := created[op.From]
+				delete(created, op.From)
+				delete(created, op.To)
+				if wasCreated {
+					created[op.To] = true
+				}
 			}
 		}
+	}
+	for _, mig := range uncontracted {
+		track(mig)
+	}
+	for i, mig := range migs[:len(migs)-1] {
+		track(mig)
+		var fill *migrations.OpAddColumn
 		for _, add := range mig.FillsOfPreviousRevisionWrites() {
 			if !created[add.Table] {
 				fill = add

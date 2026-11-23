@@ -127,8 +127,9 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 }
 
 // upRepeatsDefault reports whether `up` yields what the column's default
-// does for a row that has no value yet: the default itself, with or without
-// a cast, or COALESCE(<column>, <default>).
+// does for a row that has no value yet: the default as written, or
+// COALESCE(<column>, <default>). A cast is not looked through: it can
+// change the value.
 func (o *OpAddColumn) upRepeatsDefault() bool {
 	if !o.Column.HasDefault() {
 		return false
@@ -138,23 +139,26 @@ func (o *OpAddColumn) upRepeatsDefault() bool {
 		for strings.HasPrefix(e, "(") && strings.HasSuffix(e, ")") {
 			e = strings.TrimSpace(e[1 : len(e)-1])
 		}
-		return castSuffix.ReplaceAllString(e, "")
+		return e
 	}
 	want := normalize(*o.Column.Default)
 	up := normalize(o.Up)
 	if up == want {
 		return true
 	}
-	if m := coalesceOfColumn.FindStringSubmatch(up); m != nil && strings.EqualFold(strings.Trim(m[1], `"`), o.Column.Name) {
-		return normalize(m[2]) == want
+	m := coalesceOfColumn.FindStringSubmatch(up)
+	if m == nil {
+		return false
 	}
-	return false
+	// An unquoted identifier folds to lower case; a quoted one is exact.
+	named := strings.ToLower(m[1])
+	if strings.HasPrefix(m[1], `"`) {
+		named = strings.Trim(m[1], `"`)
+	}
+	return named == o.Column.Name && normalize(m[2]) == want
 }
 
-var (
-	castSuffix       = regexp.MustCompile(`(?i)(::\s*[a-z_][a-z0-9_.]*(\s*\[\s*\])*)+$`)
-	coalesceOfColumn = regexp.MustCompile(`(?is)^coalesce\(\s*("?[a-z_][a-z0-9_]*"?)\s*,(.*)\)$`)
-)
+var coalesceOfColumn = regexp.MustCompile(`(?is)^coalesce\(\s*("[^"]+"|[a-z_][a-z0-9_]*)\s*,(.*)\)$`)
 
 func toSchemaColumn(c Column) *schema.Column {
 	tmpColumn := &schema.Column{

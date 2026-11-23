@@ -416,3 +416,108 @@ func TestMigrateCompleteAppliesAFillBeforeTheLastMigration(t *testing.T) {
 			require.Equal(t, 3, n)
 		})
 }
+
+// materializeTrainFixture applies 00_base, starts and defers 01_one of a
+// train that then stops, and leaves 02_two unapplied.
+func materializeTrainFixture(t *testing.T, fn func(m *roll.Roll, db *sql.DB, materialize func(args ...string) error)) {
+	t.Helper()
+	testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+		func(m *roll.Roll, connStr string, db *sql.DB) {
+			ctx := context.Background()
+			viper.Set("PG_URL", connStr)
+			viper.Set("SCHEMA", "public")
+			viper.Set("STATE_SCHEMA", "pgroll")
+			viper.Set("LOCK_TIMEOUT", 500)
+			viper.Set("USE_VERSION_SCHEMA", true)
+			t.Cleanup(viper.Reset)
+
+			dir := t.TempDir()
+			write := func(name, body string) {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name+".yaml"), []byte(body), 0o600))
+			}
+			write("00_base", "operations:\n  - sql:\n      up: CREATE TABLE u (id integer PRIMARY KEY, v integer)\n      down: DROP TABLE u\n")
+			c := migrateCmd()
+			c.SetArgs([]string{dir, "--complete"})
+			c.SilenceUsage, c.SilenceErrors = true, true
+			require.NoError(t, c.ExecuteContext(ctx))
+
+			write("01_one", checkOnV)
+			write("02_two", "operations:\n  - sql:\n      up: COMMENT ON TABLE u IS 'two'\n      down: COMMENT ON TABLE u IS 'one'\n")
+			one, err := migrations.ReadMigration(os.DirFS(dir), "01_one.yaml")
+			require.NoError(t, err)
+			two, err := migrations.ReadMigration(os.DirFS(dir), "02_two.yaml")
+			require.NoError(t, err)
+			require.NoError(t, m.Start(ctx, one, backfill.NewConfig(), roll.WithoutVersionSchema(), roll.WithTrainTarget(two)))
+			require.NoError(t, m.Complete(ctx, roll.WithDeferComplete()))
+
+			fn(m, db, func(args ...string) error {
+				c := materializeCmd()
+				c.SetArgs(append([]string{"--migrations", dir, "--yes"}, args...))
+				c.SilenceUsage, c.SilenceErrors = true, true
+				return c.ExecuteContext(ctx)
+			})
+		})
+}
+
+func trainTarget(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var target string
+	require.NoError(t, db.QueryRow(`SELECT public._pgroll_train_target()`).Scan(&target))
+	return target
+}
+
+// A fleet on the leaf of an open train keeps its writes: materialize does
+// not move the train's triggers past it unless told nothing runs there.
+func TestMaterializeDoesNotFastForwardPastAnOpenTrainsPinnedLeaf(t *testing.T) {
+	materializeTrainFixture(t, func(m *roll.Roll, db *sql.DB, materialize func(args ...string) error) {
+		ctx := context.Background()
+		sc, err := m.SchemaWithDeferred(ctx)
+		require.NoError(t, err)
+		require.NoError(t, m.Materialize(ctx, "01_one", sc, roll.WithNewRevisionPinned()))
+		require.Equal(t, "public_01_one", trainTarget(t, db))
+
+		require.ErrorContains(t, materialize(), "--leaf-unpinned")
+		require.Equal(t, "public_01_one", trainTarget(t, db))
+
+		require.NoError(t, materialize("--leaf-unpinned"))
+		require.Equal(t, "public_02_two", trainTarget(t, db))
+	})
+}
+
+// After an interrupted migrate no schema is pinned by the new revision yet,
+// so the fast-forwarded one is, and the train's triggers follow it.
+func TestMaterializeFastForwardsAnInterruptedTrain(t *testing.T) {
+	materializeTrainFixture(t, func(_ *roll.Roll, db *sql.DB, materialize func(args ...string) error) {
+		require.NoError(t, materialize())
+		require.Equal(t, "public_02_two", trainTarget(t, db))
+	})
+}
+
+// A fast-forwarded schema that cannot be built is an error, not a view of
+// the table as it is.
+func TestMaterializeFastForwardFailsOnATableItCannotProject(t *testing.T) {
+	testutils.WithMigratorAndConnStrToContainer(t, []roll.Option{roll.WithLockTimeoutMs(500)},
+		func(_ *roll.Roll, connStr string, _ *sql.DB) {
+			ctx := context.Background()
+			viper.Set("PG_URL", connStr)
+			viper.Set("SCHEMA", "public")
+			viper.Set("STATE_SCHEMA", "pgroll")
+			viper.Set("LOCK_TIMEOUT", 500)
+			viper.Set("USE_VERSION_SCHEMA", true)
+			t.Cleanup(viper.Reset)
+
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "00_base.yaml"),
+				[]byte("operations:\n  - sql:\n      up: CREATE TABLE u (id integer PRIMARY KEY, v integer)\n      down: DROP TABLE u\n"), 0o600))
+			c := migrateCmd()
+			c.SetArgs([]string{dir, "--complete"})
+			c.SilenceUsage, c.SilenceErrors = true, true
+			require.NoError(t, c.ExecuteContext(ctx))
+
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "01_one.yaml"), []byte(checkOnV), 0o600))
+			mc := materializeCmd()
+			mc.SetArgs([]string{"--migrations", dir, "--yes"})
+			mc.SilenceUsage, mc.SilenceErrors = true, true
+			require.Error(t, mc.ExecuteContext(ctx))
+		})
+}

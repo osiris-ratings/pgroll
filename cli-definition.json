@@ -195,6 +195,11 @@
       "example": "",
       "flags": [
         {
+          "name": "leaf-unpinned",
+          "description": "with --migrations, project past an applied, uncontracted train whose leaf has a version schema; only when no workload is pinned to that schema",
+          "default": "false"
+        },
+        {
           "name": "migrations",
           "description": "Optional directory of migration files; unapplied migrations are replayed in memory before projecting views",
           "default": ""
