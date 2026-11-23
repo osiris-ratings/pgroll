@@ -148,9 +148,17 @@ func (o *OpAddColumn) Start(ctx context.Context, l Logger, conn db.DB, s *schema
 		}
 	}
 	// Replayed over a schema read after Start, the column keeps the default
-	// and comment it has by now: a later migration may have changed them.
+	// and comment it has by now, and a NOT NULL it has gained: a later
+	// migration may have changed them.
 	if existing := table.Columns[o.Column.Name]; started == o.Column.Name && existing != nil && !existing.Deleted && existing.Name == started {
-		tmpColumn.Default, tmpColumn.Comment = existing.Default, existing.Comment
+		tmpColumn.Comment = existing.Comment
+		// A default that repeats `up` is set only at Complete.
+		if !o.Column.HasDefault() || o.Up != *o.Column.Default {
+			tmpColumn.Default = existing.Default
+		}
+		if !existing.Nullable {
+			tmpColumn.Nullable = false
+		}
 	}
 	table.AddColumn(o.Column.Name, tmpColumn)
 
@@ -179,24 +187,16 @@ func (o *OpAddColumn) startedName(s *schema.Schema, table *schema.Table) string 
 	if !s.OwnNamedColumns {
 		return temporary
 	}
+	stored := schema.StoredIdentifier(temporary)
 	// Replayed over a schema read after Start: the column is there, and a
 	// column with the temporary name is a later operation's duplicate of it.
 	if own := table.Columns[o.Column.Name]; own != nil && !own.Deleted && own.Name == o.Column.Name {
 		return o.Column.Name
 	}
 	for _, column := range table.Columns {
-		if column.Name == o.Column.Name || column.Name == temporary {
+		if column.Name == o.Column.Name || column.Name == stored {
 			return temporary
 		}
-	}
-	return o.Column.Name
-}
-
-// startedNameAt returns the name the column has in a schema read from the
-// database between Start and Complete.
-func (o *OpAddColumn) startedNameAt(table *schema.Table, scope string) string {
-	if temporary := TemporaryName(scope, o.Column.Name); table.PhysicalColumn(temporary) != nil {
-		return temporary
 	}
 	return o.Column.Name
 }
@@ -251,43 +251,41 @@ func (o *OpAddColumn) Complete(l Logger, conn db.DB, s *schema.Schema) ([]DBActi
 
 	// A column that waited for the contraction may have had its pending
 	// constraints settled since Start: by a later migration that replaced
-	// the column with a copy, or by a Complete that stopped part-way.
-	settled := func(exists bool) bool { return o.Column.Name == o.startedNameAt(table, scope) && !exists }
-
-	_, notNullPending := table.CheckConstraints[NotNullConstraintName(o.Column.Name)]
-	if !o.Column.IsNullable() && o.Column.Default == nil && !settled(notNullPending) {
-		dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
+	// the column with a copy, or by a Complete that stopped part-way. Each
+	// step asks the catalog when it runs.
+	notNullPending := constraintPresent(conn, table.Name, NotNullConstraintName(o.Column.Name))
+	if !o.Column.IsNullable() && o.Column.Default == nil {
+		dbActions = append(dbActions, onlyWhen(notNullPending,
+			upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...))
 	}
 
-	if o.Column.Check != nil && !settled(table.ConstraintExists(o.Column.Check.Name)) {
-		dbActions = append(dbActions, NewValidateConstraintAction(conn, table.Name, o.Column.Check.Name))
+	if o.Column.Check != nil {
+		dbActions = append(dbActions, newValidateColumnCheckAction(conn, table.Name, o.Column.Name, o.Column.Check.Name))
 	}
 
-	_, uniquePending := table.Indexes[UniqueIndexName(o.Column.Name)]
-	if o.Column.Unique && !settled(uniquePending) {
-		dbActions = append(dbActions, NewAddConstraintUsingUniqueIndex(conn,
-			table.Name,
-			o.Column.Name,
-			UniqueIndexName(o.Column.Name)))
+	if o.Column.Unique {
+		dbActions = append(dbActions, onlyWhen(indexPresent(conn, UniqueIndexName(o.Column.Name)),
+			NewAddConstraintUsingUniqueIndex(conn,
+				table.Name,
+				o.Column.Name,
+				UniqueIndexName(o.Column.Name))))
 	}
 
-	// If the column has a DEFAULT that could not be set using the fast-path
-	// optimization, set it here.
-	column := table.PhysicalColumn(TemporaryName(scope, o.Column.Name))
-	if column == nil {
-		column = table.PhysicalColumn(o.Column.Name)
-	}
-	if column == nil {
-		return nil, ColumnDoesNotExistError{Table: o.Table, Name: o.Column.Name}
-	}
 	// Only an `up` that repeats the default leaves the default for here; a
 	// default missing otherwise was dropped since Start, and stays dropped.
-	if o.Column.HasDefault() && column.Default == nil && o.Up == *o.Column.Default {
-		dbActions = append(dbActions, NewSetDefaultValueAction(conn, table.Name, o.Column.Name, *o.Column.Default))
+	if o.Column.HasDefault() && o.Up == *o.Column.Default {
+		column := table.PhysicalColumn(TemporaryName(scope, o.Column.Name))
+		if column == nil {
+			column = table.PhysicalColumn(o.Column.Name)
+		}
+		if column == nil || column.Default == nil {
+			dbActions = append(dbActions, NewSetDefaultValueAction(conn, table.Name, o.Column.Name, *o.Column.Default))
 
-		// Validate the `NOT NULL` constraint on the column if necessary
-		if !o.Column.IsNullable() {
-			dbActions = append(dbActions, upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...)
+			// Validate the `NOT NULL` constraint on the column if necessary
+			if !o.Column.IsNullable() {
+				dbActions = append(dbActions, onlyWhen(notNullPending,
+					upgradeNotNullConstraintToNotNullAttribute(conn, table.Name, o.Column.Name)...))
+			}
 		}
 	}
 

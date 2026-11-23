@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"unicode/utf8"
 )
 
 // XXX we create a view of the schema with the minimum required for us to
@@ -309,9 +310,24 @@ func (t *Table) GetColumn(name string) *Column {
 	return c
 }
 
+// StoredIdentifier returns name as Postgres stores it: cut to 63 bytes, at a
+// character boundary.
+func StoredIdentifier(name string) string {
+	const maxBytes = 63
+	if len(name) <= maxBytes {
+		return name
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut]
+}
+
 // PhysicalColumn returns the column with the given physical name, whatever
 // name it is keyed under, or nil.
 func (t *Table) PhysicalColumn(name string) *Column {
+	name = StoredIdentifier(name)
 	for _, c := range t.Columns {
 		if c.Name == name && !c.Deleted {
 			return c

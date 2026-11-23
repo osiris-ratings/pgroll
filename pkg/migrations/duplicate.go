@@ -183,7 +183,7 @@ func (d *duplicator) Execute(ctx context.Context) error {
 	withoutChecks := slices.Clone(d.withoutConstraint)
 	for _, c := range d.columns {
 		if !c.column.Nullable {
-			withoutChecks = append(withoutChecks, NotNullConstraintName(c.column.Name))
+			withoutChecks = append(withoutChecks, postgresIdentifier(NotNullConstraintName(c.column.Name)))
 		}
 	}
 	for _, sql := range d.stmtBuilder.duplicateCheckConstraints(withoutChecks, colNames...) {

@@ -809,6 +809,14 @@ const leafUnpinnedUsage = "start on top of an applied, uncontracted train whose 
 // on that schema is a third revision beside the previous deployment's and
 // the new train's, and the open train's triggers tell only two apart.
 func refuseOnOpenTrain(ctx context.Context, m *roll.Roll) error {
+	// A migration in progress has its own refusal, further on.
+	active, err := m.State().IsActiveMigrationPeriod(ctx, m.Schema())
+	if err != nil {
+		return fmt.Errorf("unable to determine active migration period: %w", err)
+	}
+	if active {
+		return nil
+	}
 	leaf, err := m.ReopenedTrainLeaf(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to check for an open train: %w", err)
