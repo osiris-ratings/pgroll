@@ -252,3 +252,20 @@ func TestMigrateRefusesBesideTheTriggersOfAPrunedMigration(t *testing.T) {
 		require.ErrorContains(t, e.migrate("--leaf-unpinned"), "pgroll prune", "no flag starts beside triggers nothing owns")
 	})
 }
+
+// A trigger function no trigger calls, left on a contracted database, does
+// not stop a deploy.
+func TestMigrateIgnoresATriggerFunctionNoTriggerCalls(t *testing.T) {
+	guardWith(t, func(e *guardEnv) {
+		e.sqlMig("00_base", "CREATE TABLE u (id integer PRIMARY KEY, v integer)", "DROP TABLE u")
+		require.NoError(t, e.migrate("--complete"))
+		e.sqlMig("01_one", "COMMENT ON TABLE u IS 'one'", "COMMENT ON TABLE u IS NULL")
+		require.NoError(t, e.migrate())
+		require.NoError(t, e.m.Complete(e.ctx))
+
+		require.NoError(t, e.execAs("public", `CREATE FUNCTION public._pgroll_trigger_u_old_deadbeef() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'`))
+
+		e.sqlMig("02_two", "COMMENT ON TABLE u IS 'two'", "COMMENT ON TABLE u IS NULL")
+		require.NoError(t, e.migrate())
+	})
+}

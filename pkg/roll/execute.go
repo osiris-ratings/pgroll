@@ -816,10 +816,13 @@ func (m *Roll) refuseBesideUnorderedTriggers(ctx context.Context) error {
 // hasTriggerFunctions reports whether any migration's trigger function is
 // installed in the schema.
 func (m *Roll) hasTriggerFunctions(ctx context.Context) (bool, error) {
+	// A function no trigger calls cannot fire, whoever left it behind.
 	return m.queryBool(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%')`,
+			SELECT 1 FROM pg_trigger t
+			JOIN pg_proc p ON p.oid = t.tgfoid
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = $1 AND p.proname LIKE '\_pgroll\_trigger\_%' AND NOT t.tgisinternal)`,
 		m.schema)
 }
 
