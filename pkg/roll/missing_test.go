@@ -14,6 +14,7 @@ import (
 	"github.com/xataio/pgroll/pkg/backfill"
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/roll"
+	"github.com/xataio/pgroll/pkg/state"
 )
 
 func TestMissingMigrations(t *testing.T) {
@@ -243,12 +244,13 @@ func TestMissingMigrations(t *testing.T) {
 			err = m.Complete(ctx)
 			require.NoError(t, err)
 
-			// Create a baseline migration
-			err = m.CreateBaseline(ctx, "01_initial_version")
+			// Create a baseline migration. It folds in the migrations named
+			// at or before it, so it sorts after the one already applied.
+			err = m.CreateBaseline(ctx, "02_initial_version")
 			require.NoError(t, err)
 
 			// Apply another migration to the target database
-			err = m.Start(ctx, exampleMig(t, "02_migration_2"), backfill.NewConfig())
+			err = m.Start(ctx, exampleMig(t, "03_migration_3"), backfill.NewConfig())
 			require.NoError(t, err)
 			err = m.Complete(ctx)
 			require.NoError(t, err)
@@ -263,7 +265,24 @@ func TestMissingMigrations(t *testing.T) {
 			// Assert that the missing migration is the one that was applied after the baseline
 			mig, err := migrations.ParseMigration(migs[0])
 			require.NoError(t, err)
-			require.Equal(t, exampleMig(t, "02_migration_2"), mig)
+			require.Equal(t, exampleMig(t, "03_migration_3"), mig)
+		})
+	})
+
+	t.Run("a baseline cannot be named before a migration already applied", func(t *testing.T) {
+		testutils.WithMigratorAndConnectionToContainer(t, func(m *roll.Roll, _ *sql.DB) {
+			ctx := context.Background()
+
+			err := m.Start(ctx, exampleMig(t, "01_migration_1"), backfill.NewConfig())
+			require.NoError(t, err)
+			err = m.Complete(ctx)
+			require.NoError(t, err)
+
+			// 01_migration_1 would stay visible above this name, and its
+			// file would be reported missing on every run.
+			err = m.CreateBaseline(ctx, "01_initial_version")
+			require.ErrorIs(t, err, state.ErrBaselineSortsBelowHistory)
+			require.ErrorContains(t, err, "01_migration_1")
 		})
 	})
 }

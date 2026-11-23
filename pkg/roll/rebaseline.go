@@ -3,10 +3,13 @@
 package roll
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"slices"
+	"strings"
 
 	"github.com/xataio/pgroll/pkg/migrations"
 	"github.com/xataio/pgroll/pkg/state"
@@ -51,6 +54,10 @@ type RebaselineResult struct {
 	// DBBaseline is the database's latest baseline before this run, empty if
 	// none existed.
 	DBBaseline string
+	// FoldSetDeclared is true when the directory lists the migrations its
+	// baseline folds in, so the database was (or would be) checked against
+	// that set and not against the order it applied them in.
+	FoldSetDeclared bool
 	// Notes carries advisory findings (e.g. a '{}' resulting_schema on the
 	// anchor row).
 	Notes []string
@@ -97,6 +104,120 @@ func FindBaselineMigration(dir fs.FS) (*migrations.RawMigration, error) {
 	return marked, nil
 }
 
+// FoldsFileExt is the extension of the file that lists the migrations a
+// baseline folds in. It sits beside the baseline migration and shares its
+// name: `<baseline>.folds`.
+const FoldsFileExt = ".folds"
+
+// FoldedMigration is one entry of a baseline's fold set: a migration whose
+// file a history truncation deleted, and the targets it was routed to.
+type FoldedMigration struct {
+	Name string
+	// Targets is empty for a migration that declared none; such a migration
+	// is required of every database.
+	Targets []string
+}
+
+// ReadFoldSet reads the fold set declared beside the baseline migration, or
+// returns nil when the directory declares none.
+//
+// The file is plain text, one migration per line: its name, then optionally
+// its targets, comma-separated. Blank lines and lines starting with `#` are
+// ignored. The set is cumulative: it lists everything folded since the
+// oldest baseline a database may still be on, not only what the latest
+// truncation deleted. It is its own file, not a field of the migration, because only
+// rebaseline reads it and a migration file is parsed strictly by every
+// command.
+//
+//	# Migrations folded into 20260829130000_validate_address_requests_address_key_fk
+//	20260709224955_enrich_pep_entities app,etl
+//	20260710120000_add_widgets app
+func ReadFoldSet(dir fs.FS, baselineName string) ([]FoldedMigration, error) {
+	file := baselineName + FoldsFileExt
+	// A fold set named for anything else is a leftover or a typo. Ignoring
+	// it would quietly select the audit for a directory that declares none.
+	all, err := fs.Glob(dir, "*"+FoldsFileExt)
+	if err != nil {
+		return nil, fmt.Errorf("reading directory: %w", err)
+	}
+	for _, other := range all {
+		if other != file {
+			return nil, fmt.Errorf("%w: fold set %q does not belong to the baseline %q; "+
+				"a directory holds one fold set, named %q",
+				ErrRebaselineRefused, other, baselineName, file)
+		}
+	}
+	f, err := dir.Open(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("opening fold set %q: %w", file, err)
+	}
+	defer f.Close()
+
+	// Non-nil even when the file lists nothing: a declared empty set is a
+	// different statement from no declaration.
+	folds := []FoldedMigration{}
+	seen := map[string]struct{}{}
+	scanner := bufio.NewScanner(f)
+	for line := 1; scanner.Scan(); line++ {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if len(fields) > 2 {
+			return nil, fmt.Errorf("%w: %s line %d: expected a migration name and an optional "+
+				"comma-separated target list", ErrRebaselineRefused, file, line)
+		}
+		entry := FoldedMigration{Name: fields[0]}
+		if entry.Name > baselineName {
+			return nil, fmt.Errorf("%w: %s line %d: %q sorts after the baseline; a baseline "+
+				"folds in only migrations at or before its own name",
+				ErrRebaselineRefused, file, line, entry.Name)
+		}
+		if _, dup := seen[entry.Name]; dup {
+			return nil, fmt.Errorf("%w: %s line %d: %q is listed twice",
+				ErrRebaselineRefused, file, line, entry.Name)
+		}
+		seen[entry.Name] = struct{}{}
+		if len(fields) == 2 {
+			for _, target := range strings.Split(fields[1], ",") {
+				if target == "" {
+					return nil, fmt.Errorf("%w: %s line %d: empty target in %q",
+						ErrRebaselineRefused, file, line, fields[1])
+				}
+				entry.Targets = append(entry.Targets, target)
+			}
+		}
+		folds = append(folds, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading fold set %q: %w", file, err)
+	}
+	return folds, nil
+}
+
+// foldSetFor narrows a directory's fold set to what one database is held to.
+// With no target every entry is required: that is single-database mode,
+// where the database applies every migration.
+func foldSetFor(folds []FoldedMigration, target string) *state.FoldSet {
+	if folds == nil {
+		return nil
+	}
+	set := &state.FoldSet{
+		All:      make([]string, 0, len(folds)),
+		Required: make([]string, 0, len(folds)),
+	}
+	for _, f := range folds {
+		set.All = append(set.All, f.Name)
+		if target == "" || len(f.Targets) == 0 || slices.Contains(f.Targets, target) {
+			set.Required = append(set.Required, f.Name)
+		}
+	}
+	return set
+}
+
 // Rebaseline reconciles the database's baseline with the directory's marked
 // baseline. It is the deploy-time companion of migration-history truncation:
 // after old migration files are deleted and the anchor file is rewritten as a
@@ -104,6 +225,12 @@ func FindBaselineMigration(dir fs.FS) (*migrations.RawMigration, error) {
 // migration adopts the truncated directory by having that row converted to a
 // baseline in place (state.ConvertMigrationToBaseline has the full safety
 // contract).
+//
+// When the directory declares a fold set (ReadFoldSet), the database is
+// checked against it: it must have applied every folded migration its target
+// selects, and nothing at or below the anchor that the set does not name.
+// The order it applied them in does not matter. A directory without one is
+// adopted only by a database that applied its migrations in name order.
 //
 // Idempotent and safe to run unconditionally before `pgroll plan` /
 // `pgroll migrate`:
@@ -128,7 +255,12 @@ func (m *Roll) Rebaseline(ctx context.Context, dir fs.FS, checkOnly bool) (*Reba
 		return nil, err
 	}
 
-	result := &RebaselineResult{BaselineName: marked.Name}
+	folds, err := ReadFoldSet(dir, marked.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &RebaselineResult{BaselineName: marked.Name, FoldSetDeclared: folds != nil}
 
 	latest, err := m.state.LatestMigration(ctx, m.schema)
 	if err != nil {
@@ -173,7 +305,7 @@ func (m *Roll) Rebaseline(ctx context.Context, dir fs.FS, checkOnly bool) (*Reba
 			ErrRebaselineRefused, marked.Name, m.schema)
 	}
 
-	convRes, err := m.state.ConvertMigrationToBaseline(ctx, m.schema, marked.Name, checkOnly)
+	convRes, err := m.state.ConvertMigrationToBaseline(ctx, m.schema, marked.Name, foldSetFor(folds, m.target), checkOnly)
 	if err != nil {
 		if errors.Is(err, state.ErrRebaselineRefused) {
 			return nil, fmt.Errorf("%w: %w", ErrRebaselineRefused, err)

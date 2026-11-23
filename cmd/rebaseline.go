@@ -23,9 +23,9 @@ func rebaselineCmd() *cobra.Command {
 		Long: "Rebaseline reconciles this database's baseline with the directory's: it finds\n" +
 			"the migration marked `baseline: true` and, when this database applied that\n" +
 			"migration as an ordinary migration, converts its history row to a baseline in\n" +
-			"place (UPDATE migration_type = 'baseline', nothing else). The row keeps its\n" +
-			"original created_at, so the baseline lands exactly where the migration was\n" +
-			"applied — history at or before it is hidden, not deleted.\n\n" +
+			"place (UPDATE migration_type = 'baseline', nothing else). The baseline folds in\n" +
+			"every migration whose name sorts at or before its own: their history rows are\n" +
+			"hidden, not deleted, and their files are ignored.\n\n" +
 			"This is the deploy-time companion of migration-history truncation: after old\n" +
 			"migration files are deleted and the anchor file is rewritten as a marked\n" +
 			"baseline, run `pgroll rebaseline <dir>` before `pgroll plan` or\n" +
@@ -37,13 +37,18 @@ func rebaselineCmd() *cobra.Command {
 			"missing the anchor entirely is a hard error (exit 2): it must catch up from a\n" +
 			"pre-truncation checkout or be rebuilt — running `pgroll migrate` there would\n" +
 			"execute the baseline's full schema snapshot.\n\n" +
-			"The conversion refuses unless the history is safely shaped: the anchor row is\n" +
-			"done, sealed, and contracted; nothing is in progress; nothing at or below the\n" +
-			"anchor is unsealed or awaiting a deferred complete; no later baseline exists;\n" +
-			"and filename order agrees with apply order across the anchor boundary.\n\n" +
-			"--target is accepted for wrapper symmetry but has no effect: which database is\n" +
-			"rebaselined is chosen by --postgres-url, and the anchor lookup is\n" +
-			"target-independent (history validation is deliberately unfiltered).\n\n" +
+			"The conversion refuses unless the anchor row is done, sealed, and contracted,\n" +
+			"nothing is in progress, and no baseline sorts after the anchor. The folded\n" +
+			"migrations are then checked in one of two ways.\n\n" +
+			"When `<baseline>.folds` sits beside the baseline file, it lists the folded\n" +
+			"migrations, one per line: a name, then optionally its comma-separated targets.\n" +
+			"The database must have applied and contracted every listed migration that\n" +
+			"--target selects (all of them with no --target), and must hold no row at or\n" +
+			"below the anchor that the list does not name. The order it applied them in\n" +
+			"does not matter. Pass the same --target the database migrates with: a host\n" +
+			"that receives only some targets never applied the others' migrations.\n\n" +
+			"Without that file, the database must have applied its migrations in filename\n" +
+			"order across the anchor, and --target has no effect.\n\n" +
 			"Exit codes: 0 — converged (converted, or nothing to do); 2 — refusal (missing\n" +
 			"or misplaced baseline marker, absent anchor row, or a failed safety audit);\n" +
 			"3 — with --check, a conversion is pending; 1 — unexpected error.",
@@ -53,10 +58,6 @@ func rebaselineCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			dir := args[0]
-
-			if flags.Target() != "" {
-				fmt.Printf("Note: --target %q has no effect on rebaseline; the target database is chosen by --postgres-url.\n", flags.Target())
-			}
 
 			info, err := os.Stat(dir)
 			if err != nil {
@@ -104,7 +105,7 @@ func rebaselineCmd() *cobra.Command {
 
 			if !yes {
 				ok, _ := pterm.DefaultInteractiveConfirm.Show(fmt.Sprintf(
-					"Convert %q to this database's baseline, hiding all history at or before it?",
+					"Convert %q to this database's baseline, hiding every migration named at or before it?",
 					res.BaselineName,
 				))
 				if !ok {
@@ -168,6 +169,16 @@ func printRebaselineStatus(dir, schema string, res *roll.RebaselineResult) {
 
 	if res.DBBaseline != "" && res.Outcome == roll.RebaselinePending {
 		fmt.Printf("    %s%s\n", pterm.FgGray.Sprint("Replaces        "), res.DBBaseline)
+	}
+	if res.Outcome == roll.RebaselinePending || res.Outcome == roll.RebaselineConverted {
+		audit := "apply order (the directory declares no fold set)"
+		if res.FoldSetDeclared {
+			audit = "fold set"
+			if target := flags.Target(); target != "" {
+				audit += fmt.Sprintf(" · target %s", target)
+			}
+		}
+		fmt.Printf("    %s%s\n", pterm.FgGray.Sprint("Audited by      "), audit)
 	}
 	for _, note := range res.Notes {
 		fmt.Printf("    %s %s\n", pterm.FgYellow.Sprint("⚠"), note)

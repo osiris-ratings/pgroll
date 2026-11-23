@@ -551,6 +551,10 @@ func (s *State) CreateBaseline(ctx context.Context, schemaName, baselineVersion 
 		return fmt.Errorf("cannot create baseline while a migration is in progress")
 	}
 
+	if err := s.refuseBaselineBelowHistory(ctx, schemaName, baselineVersion); err != nil {
+		return err
+	}
+
 	// Read the current schema
 	schema, err := s.ReadSchema(ctx, schemaName)
 	if err != nil {
@@ -588,6 +592,40 @@ func (s *State) CreateBaseline(ctx context.Context, schemaName, baselineVersion 
 	}
 
 	return nil
+}
+
+// refuseBaselineBelowHistory errors when a new baseline named `name` would
+// leave applied migrations outside it. A baseline folds in the migrations
+// named at or before it (see SchemaHistory), so one recorded on top of
+// existing history has to sort after all of it; otherwise the rows above its
+// name stay visible and `migrate` demands their files.
+func (s *State) refuseBaselineBelowHistory(ctx context.Context, schemaName, name string) error {
+	rows, err := s.pgConn.QueryContext(ctx, fmt.Sprintf(`SELECT m.name FROM %s.migrations m
+		WHERE m.schema = $1 AND m.migration_type <> 'inferred'
+		AND m.name COLLATE "C" > $2 COLLATE "C"
+		ORDER BY m.name COLLATE "C" DESC LIMIT 3`, pq.QuoteIdentifier(s.schema)), schemaName, name)
+	if err != nil {
+		return fmt.Errorf("checking history above baseline %q: %w", name, err)
+	}
+	defer rows.Close()
+
+	var above []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return fmt.Errorf("checking history above baseline %q: %w", name, err)
+		}
+		above = append(above, n)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("checking history above baseline %q: %w", name, err)
+	}
+	if len(above) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q sorts before %s; a baseline folds in the migrations named at "+
+		"or before it, so name it to sort after every migration already applied",
+		ErrBaselineSortsBelowHistory, name, strings.Join(above, ", "))
 }
 
 // MigrationExists reports whether a migration with the given name is already
@@ -634,6 +672,12 @@ func (s *State) Stamp(
 	parent *string,
 	migrationType string,
 ) error {
+	if migrationType == "baseline" {
+		if err := s.refuseBaselineBelowHistory(ctx, schemaName, name); err != nil {
+			return err
+		}
+	}
+
 	parentClause := fmt.Sprintf("%s.latest_migration($1)", pq.QuoteIdentifier(s.schema))
 	args := []any{schemaName, name, migration}
 	if parent != nil {

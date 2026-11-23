@@ -170,14 +170,29 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	if err != nil {
 		return nil, fmt.Errorf("reading schema history: %w", err)
 	}
+	// The floor is the newest row the baseline folds in. Rows applied before
+	// it cannot be reverted (see state.BaselineFloor), so only the rows above
+	// it are candidates for the revert leg.
+	floor, err := m.state.BaselineFloor(ctx, m.schema)
+	if err != nil {
+		return nil, fmt.Errorf("reading the baseline floor: %w", err)
+	}
 	dbNames := make([]string, len(history))
 	dbSet := make(map[string]struct{}, len(history))
 	versionSchemaByName := make(map[string]string, len(history))
+	firstAboveFloor := 0
 	for i, h := range history {
 		dbNames[i] = h.Migration.Name
 		dbSet[h.Migration.Name] = struct{}{}
 		versionSchemaByName[h.Migration.Name] = rawVersionSchemaName(h.Migration)
+		if floor != nil && !h.CreatedAt.After(floor.CreatedAt) {
+			firstAboveFloor = i + 1
+		}
 	}
+	// The leaf is folded when the last migration this database applied sorts
+	// at or before the baseline. Its file is gone by design, so it stands
+	// for the baseline in every comparison below.
+	leafFolded := floor != nil && dbLatest != nil && *dbLatest == floor.Name
 
 	baseline, err := m.state.LatestBaseline(ctx, m.schema)
 	if err != nil {
@@ -221,7 +236,7 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	if res.DBLatest != nil && res.LocalLatest != nil {
 		_, dbLeafLocal := localSet[*res.DBLatest]
 		_, localLeafDB := dbSet[*res.LocalLatest]
-		res.Diverged = !dbLeafLocal && !localLeafDB
+		res.Diverged = !dbLeafLocal && !localLeafDB && !leafFolded
 	}
 
 	// Explicit target: revert-only. The target must already be applied — a
@@ -229,10 +244,11 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	// sealed planner accepts).
 	if o.to != "" {
 		_, inHistory := dbSet[o.to]
-		if !inHistory && o.to != baselineName {
+		toFloor := o.to == baselineName || (floor != nil && o.to == floor.Name)
+		if !inHistory && !toFloor {
 			return nil, fmt.Errorf("--to target %q not found in database history", o.to)
 		}
-		suffix := dbNames
+		suffix := dbNames[firstAboveFloor:]
 		for i, n := range dbNames {
 			if n == o.to {
 				suffix = dbNames[i+1:]
@@ -240,7 +256,7 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 			}
 		}
 		m.fillRevertLeg(ctx, res, o.to, suffix, versionSchemaByName)
-		res.InSync = inSync(res, status.Status, m.target != "")
+		res.InSync = inSync(res, status.Status, m.target != "" || leafFolded)
 		return res, nil
 	}
 
@@ -266,12 +282,15 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 
 	// Convergence target: the newest database migration (walking down from the
 	// leaf) that still exists locally. Everything above it is absent locally
-	// and forms the revert suffix. When no database migration exists locally,
-	// the convergence point is the baseline (revert everything since it).
+	// and forms the revert suffix. The walk stops at the floor: when no
+	// migration above it exists locally, the convergence point is the
+	// baseline (revert everything applied since the floor). A migration
+	// absent locally beneath the floor cannot be reverted and is reported as
+	// interleaved below.
 	to := ""
 	toFound := false
 	toIdx := -1
-	for i := len(dbNames) - 1; i >= 0; i-- {
+	for i := len(dbNames) - 1; i >= firstAboveFloor; i-- {
 		if _, ok := localSet[dbNames[i]]; ok {
 			to = dbNames[i]
 			toFound = true
@@ -284,7 +303,7 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 	if toFound {
 		revertSuffix = dbNames[toIdx+1:]
 	} else {
-		revertSuffix = dbNames
+		revertSuffix = dbNames[firstAboveFloor:]
 	}
 
 	// Interleaved history: database migrations absent locally that sit at or
@@ -330,7 +349,7 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 		res.Blocked = BlockedView{Count: len(interleaved), Reason: &reason, Migrations: interleaved}
 	}
 
-	res.InSync = inSync(res, status.Status, m.target != "")
+	res.InSync = inSync(res, status.Status, m.target != "" || leafFolded)
 	return res, nil
 }
 
@@ -338,18 +357,20 @@ func (m *Roll) Plan(ctx context.Context, dir fs.FS, opts ...PlanOption) (*PlanRe
 // deployment is contracted (Complete) and there is nothing to apply, revert,
 // or unblock. Leaf equality alone is insufficient — a checkout migration
 // older than the shared leaf can still be unapplied.
-func inSync(res *PlanResult, status MigrationStatus, targeted bool) bool {
+func inSync(res *PlanResult, status MigrationStatus, leafOutsideDirectory bool) bool {
 	if status != CompleteMigrationStatus ||
 		res.Apply.Count != 0 || res.Revert.Count != 0 || res.Blocked.Count != 0 {
 		return false
 	}
-	if targeted {
-		// Under a --target the database leaf may be a migration this target
+	if leafOutsideDirectory {
+		// The database leaf may legitimately be a migration the directory
+		// does not offer this run. Under a --target it may be one this target
 		// does not select — on a host that inherited another target's history
-		// it usually is — so leaf equality is not a convergence signal and
+		// it usually is. And it may be folded into the baseline, its file
+		// deleted. Either way leaf equality is not a convergence signal and
 		// would report a fully converged database as permanently out of sync.
-		// The three empty legs already establish that this target's slice of
-		// the directory is fully applied and nothing extraneous is present.
+		// The three empty legs already establish that the directory is fully
+		// applied and nothing extraneous is present.
 		return true
 	}
 	return res.DBLatest != nil && res.LocalLatest != nil && *res.DBLatest == *res.LocalLatest
@@ -407,6 +428,12 @@ func (m *Roll) PreviewRevert(ctx context.Context, opts ...RevertOption) (*Revert
 // lossless window leg with an inversion leg when `to` has been contracted —
 // exactly as `revert --to` composes them, but plan-only.
 func (m *Roll) previewRevertTo(ctx context.Context, to string, versionSchemaByName map[string]string) (*RevertView, error) {
+	// Naming the baseline means the floor: report the row that will actually
+	// be the leaf, and the schema apps repin to.
+	to, err := m.revertBoundary(ctx, to)
+	if err != nil {
+		return nil, err
+	}
 	plan, err := m.RevertPlan(ctx, WithRevertTo(to))
 	switch {
 	case err == nil:

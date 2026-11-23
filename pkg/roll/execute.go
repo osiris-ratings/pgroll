@@ -244,6 +244,21 @@ func (m *Roll) Start(ctx context.Context, migration *migrations.Migration, cfg *
 		}
 	}
 
+	// A baseline folds in every migration named at or before it, so one
+	// started under such a name would be hidden the moment it was recorded,
+	// and would put every migration already applied beneath the revert
+	// floor. Inverse migrations are exempt: they are never folded.
+	if migration.RevertOf == "" {
+		baseline, err := m.state.LatestBaselineName(ctx, m.schema)
+		if err != nil {
+			return fmt.Errorf("failed to read the baseline: %w", err)
+		}
+		if baseline != "" && migration.Name <= baseline {
+			return fmt.Errorf("%w: %q sorts at or before the baseline %q",
+				ErrMigrationBelowBaseline, migration.Name, baseline)
+		}
+	}
+
 	// Fail early if we have existing schema without migration history
 	hasExistingSchema, err := m.state.HasExistingSchemaWithoutHistory(ctx, m.schema)
 	if err != nil {
@@ -747,7 +762,8 @@ func (m *Roll) PinnedTrainTarget(ctx context.Context) (string, error) {
 	// The name comes back only when a schema of that name exists.
 	rows, err := m.pgConn.QueryContext(ctx, fmt.Sprintf(
 		"SELECT nspname FROM pg_namespace WHERE nspname = %s.%s()",
-		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction)))
+		pq.QuoteIdentifier(m.schema), pq.QuoteIdentifier(backfill.TrainTargetFunction),
+	))
 	if err != nil {
 		return "", fmt.Errorf("unable to read the train's target: %w", err)
 	}
@@ -810,7 +826,8 @@ func (m *Roll) refuseBesideUnorderedTriggers(ctx context.Context) error {
 		"%w: %s. Finish the deployment that installed it with `pgroll complete`, or undo it with "+
 			"`pgroll revert`, before starting a migration with this build; a train that stopped "+
 			"part-way is resumed with the build that started it",
-		ErrUnorderedTriggers, found.String)
+		ErrUnorderedTriggers, found.String,
+	)
 }
 
 // hasTriggerFunctions reports whether any migration's trigger function is
